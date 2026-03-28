@@ -4,6 +4,7 @@
 #include <string>
 #include <cstring>
 
+using namespace hfile;
 using namespace hfile::bloom;
 
 static std::vector<uint8_t> make_key(const std::string& s) {

@@ -59,8 +59,6 @@ public:
         const std::string&          value_column,
         KVCallback                  callback);
 
-private:
-    /// Serialize an Arrow scalar value to bytes (Big-Endian for numerics).
     static std::vector<uint8_t> serialize_scalar(
         const ::arrow::Array& arr, int64_t row);
 };

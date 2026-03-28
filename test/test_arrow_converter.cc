@@ -5,6 +5,7 @@
 #include <arrow/api.h>
 #include <arrow/builder.h>
 #include <arrow/record_batch.h>
+#include <arrow/testing/gtest_util.h>
 #include <arrow/type.h>
 
 #include <vector>
@@ -78,11 +79,9 @@ TEST(ArrowConverter, WideTableBasic) {
     cfg.column_family   = "cf";
     cfg.default_timestamp = 9999999LL;
 
-    std::vector<KeyValue> out_kvs;
-    std::vector<std::vector<uint8_t>> storage;  // keep data alive
+    std::vector<OwnedKeyValue> out_kvs;
 
     auto cb = [&](const KeyValue& kv) -> Status {
-        // Copy the KV to verify outside the callback
         OwnedKeyValue o;
         o.row.assign(kv.row.begin(), kv.row.end());
         o.family.assign(kv.family.begin(), kv.family.end());
@@ -90,8 +89,7 @@ TEST(ArrowConverter, WideTableBasic) {
         o.timestamp = kv.timestamp;
         o.key_type  = kv.key_type;
         o.value.assign(kv.value.begin(), kv.value.end());
-        storage.push_back(o.row);
-        out_kvs.push_back(o.as_view());
+        out_kvs.push_back(std::move(o));
         return Status::OK();
     };
 

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "checksum/crc32c.h"
+#include <hfile/types.h>
 #include <vector>
 #include <numeric>
 

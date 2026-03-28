@@ -4,17 +4,17 @@
 
 **性能目标**：写入吞吐量 ≥ Java `HFile.Writer` 的 3 倍。
 
----
+***
 
 ## 平台支持
 
-| 平台 | 编译器 | 支持级别 | 说明 |
-|------|--------|----------|------|
-| Linux x86-64 | GCC 12+ | ✅ **完整支持** | 所有功能，含 io_uring、SSE4.2 |
-| Linux x86-64 | Clang 16+ | ✅ **完整支持** | 同上 |
-| macOS x86-64/arm64 | Apple Clang 15+ | ✅ **完整支持** | 除 io_uring（Apple Silicon 含 CRC32C 硬件指令） |
-| Windows x86-64 | Clang 17+（`clang-cl`） | ✅ **核心功能** | 见下方说明 |
-| Windows x86-64 | MSVC 2022 | ⚠️ **需验证** | `__builtin_*` 需替换为 MSVC 等价物 |
+| 平台                 | 编译器                   | 支持级别       | 说明                                       |
+| ------------------ | --------------------- | ---------- | ---------------------------------------- |
+| Linux x86-64       | GCC 12+               | ✅ **完整支持** | 所有功能，含 io\_uring、SSE4.2                  |
+| Linux x86-64       | Clang 16+             | ✅ **完整支持** | 同上                                       |
+| macOS x86-64/arm64 | Apple Clang 15+       | ✅ **完整支持** | 除 io\_uring（Apple Silicon 含 CRC32C 硬件指令） |
+| Windows x86-64     | Clang 17+（`clang-cl`） | ✅ **核心功能** | 见下方说明                                    |
+| Windows x86-64     | MSVC 2022             | ⚠️ **需验证** | `__builtin_*` 需替换为 MSVC 等价物              |
 
 ### Windows + Clang 支持说明
 
@@ -22,10 +22,10 @@
 
 以下功能在 Windows 上**自动禁用**（CMake 自动检测，无需手动配置）：
 
-| 功能 | 原因 | 影响 |
-|------|------|------|
-| `IoUringWriter` | Linux 内核专有 API | 仅影响可选的异步 I/O 后端；`BufferedFileWriter` 在所有平台可用 |
-| `HdfsWriter` | `libhdfs3` 无官方 Windows 构建 | 仅影响直写 HDFS；本地文件写入不受影响 |
+| 功能              | 原因                        | 影响                                           |
+| --------------- | ------------------------- | -------------------------------------------- |
+| `IoUringWriter` | Linux 内核专有 API            | 仅影响可选的异步 I/O 后端；`BufferedFileWriter` 在所有平台可用 |
+| `HdfsWriter`    | `libhdfs3` 无官方 Windows 构建 | 仅影响直写 HDFS；本地文件写入不受影响                        |
 
 以下特性在 Windows Clang 上**完全支持**：
 
@@ -35,7 +35,7 @@
 - `std::filesystem`（C++20 标准，Windows 完全支持）
 - Arrow C++ 15+、Protobuf、LZ4、ZSTD、Snappy（均有官方 Windows 构建）
 
----
+***
 
 ## 快速开始
 
@@ -80,7 +80,7 @@ cmake --build build
 cd build && ctest --output-on-failure
 ```
 
----
+***
 
 ## API 快速示例
 
@@ -132,7 +132,7 @@ auto [result, s] = bulk->finish();
 // 之后通过 BulkLoadHFilesTool 加载到 HBase
 ```
 
----
+***
 
 ## 模块架构
 
@@ -157,7 +157,7 @@ bench/                  微基准 + 端到端基准
 tools/                  Java 验证工具 + Python HTML 报告生成器
 ```
 
----
+***
 
 ## HBase 兼容性约束
 
@@ -172,7 +172,7 @@ tools/                  Java 验证工具 + Python HTML 报告生成器
 7. 文件内 KV **严格有序**：Row↑ → Family↑ → Qualifier↑ → Timestamp↓ → Type↓
 8. 所有多字节整数均为 **Big-Endian**
 
----
+***
 
 ## 许可证
 

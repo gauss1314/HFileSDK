@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "block/none_encoder.h"
 #include "block/fast_diff_encoder.h"
 #include <hfile/types.h>
 #include <vector>

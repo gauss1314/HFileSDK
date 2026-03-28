@@ -10,6 +10,7 @@
 #include <hfile/types.h>
 #include <chrono>
 #include <cstring>
+#include <string_view>
 #include <stdexcept>
 
 namespace hfile {
@@ -20,6 +21,7 @@ namespace arrow_convert {
 std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
         const ::arrow::Array& arr, int64_t row) {
     using namespace ::arrow;
+    using ::arrow::internal::checked_cast;
 
     if (arr.IsNull(row)) return {};
 
@@ -79,8 +81,7 @@ std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
     }
     case Type::STRING:
     case Type::LARGE_STRING: {
-        // Zero-copy: return span of Arrow buffer
-        ::arrow::util::string_view sv;
+        std::string_view sv;
         if (arr.type_id() == Type::STRING)
             sv = checked_cast<const StringArray&>(arr).GetView(row);
         else
@@ -90,7 +91,7 @@ std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
     }
     case Type::BINARY:
     case Type::LARGE_BINARY: {
-        ::arrow::util::string_view sv;
+        std::string_view sv;
         if (arr.type_id() == Type::BINARY)
             sv = checked_cast<const BinaryArray&>(arr).GetView(row);
         else
