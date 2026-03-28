@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.hfile</groupId>
+  <artifactId>hfilesdk-java</artifactId>
+  <version>4.0.0</version>
+  <packaging>jar</packaging>
+  <description>
+    Java JNI bridge for HFileSDK v4.
+    Wraps the C++ libhfilesdk.so to allow Java processes to convert
+    Arrow IPC Stream files to HFile v3 via JNI.
+  </description>
+
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+  </properties>
+
+  <!-- No runtime dependencies — JNI bridge only.
+       The .so is loaded via System.loadLibrary("hfilesdk"). -->
+
+  <build>
+    <plugins>
+      <!-- Generate JNI headers during compile phase.
+           Run: mvn compile  → produces target/generated-sources/headers/com_hfile_HFileSDK.h
+           Copy that header into src/jni/ for the C++ side to include. -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.12.1</version>
+        <configuration>
+          <compilerArgs>
+            <!-- Generate JNI .h files alongside compilation -->
+            <arg>-h</arg>
+            <arg>${project.build.directory}/jni-headers</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <!-- Plain jar (no shading needed — this is a thin bridge with no deps) -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-jar-plugin</artifactId>
+        <version>3.3.0</version>
+        <configuration>
+          <archive>
+            <manifest>
+              <mainClass>com.hfile.HFileSDK</mainClass>
+            </manifest>
+          </archive>
+          <finalName>hfilesdk-java-${project.version}</finalName>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>
