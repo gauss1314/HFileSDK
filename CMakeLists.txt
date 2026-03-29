@@ -43,6 +43,7 @@ option(HFILE_ENABLE_ASAN       "Enable AddressSanitizer" OFF)
 option(HFILE_ENABLE_UBSAN      "Enable UndefinedBehaviorSanitizer" OFF)
 option(HFILE_ENABLE_JEMALLOC   "Use jemalloc as memory allocator" OFF)
 option(HFILE_ENABLE_COVERAGE   "Enable llvm-cov coverage instrumentation" OFF)
+option(HFILE_ENABLE_JAVA_TESTS "Build JNI shared library and run Java integration tests" ON)
 
 # ─── Compiler flags ────────────────────────────────────────────────────────────
 if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT HFILE_ENABLE_COVERAGE)
@@ -132,6 +133,15 @@ find_package(Arrow REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(ZLIB REQUIRED)
 find_package(Threads REQUIRED)
+
+if(HFILE_ENABLE_JAVA_TESTS)
+  find_package(JNI)
+  find_program(HFILE_MAVEN_EXECUTABLE NAMES mvn mvn.cmd)
+  if(NOT JNI_FOUND OR NOT HFILE_MAVEN_EXECUTABLE)
+    message(WARNING "Java JNI tests disabled: JNI headers or Maven not found")
+    set(HFILE_ENABLE_JAVA_TESTS OFF)
+  endif()
+endif()
 
 find_library(ZSTD_LIB zstd REQUIRED)
 find_library(LZ4_LIB lz4 REQUIRED)
@@ -230,6 +240,7 @@ if(HFILE_ENABLE_HDFS)
 endif()
 
 add_library(hfile STATIC ${HFILE_SOURCES})
+set_target_properties(hfile PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(hfile
   PUBLIC
@@ -268,6 +279,26 @@ endif()
 
 if(HFILE_ENABLE_JEMALLOC AND JEMALLOC_LIB)
   target_link_libraries(hfile PRIVATE ${JEMALLOC_LIB})
+endif()
+
+if(HFILE_ENABLE_JAVA_TESTS)
+  get_filename_component(ZSTD_LIB_DIR ${ZSTD_LIB} DIRECTORY)
+  get_filename_component(LZ4_LIB_DIR ${LZ4_LIB} DIRECTORY)
+  get_filename_component(SNAPPY_LIB_DIR ${SNAPPY_LIB} DIRECTORY)
+  add_library(hfilesdk SHARED src/jni/hfile_jni.cc)
+  set_target_properties(hfilesdk PROPERTIES
+    OUTPUT_NAME hfilesdk
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+    BUILD_RPATH "$<TARGET_FILE_DIR:Arrow::arrow_shared>;$<TARGET_FILE_DIR:protobuf::libprotobuf>;$<TARGET_FILE_DIR:ZLIB::ZLIB>;${ZSTD_LIB_DIR};${LZ4_LIB_DIR};${SNAPPY_LIB_DIR}")
+  target_link_libraries(hfilesdk PRIVATE hfile)
+  if(TARGET JNI::JNI)
+    target_link_libraries(hfilesdk PRIVATE JNI::JNI)
+  endif()
+  target_include_directories(hfilesdk PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}
+    ${JNI_INCLUDE_DIRS})
 endif()
 
 add_executable(hfile_chaos tools/hfile-chaos/main.cc)
@@ -350,9 +381,28 @@ add_test(
     --verify-no-corrupt-files
 )
 
+if(HFILE_ENABLE_JAVA_TESTS)
+  add_test(
+    NAME test_java_jni_integration
+    COMMAND ${CMAKE_COMMAND} -E env
+      HFILESDK_NATIVE_DIR=$<TARGET_FILE_DIR:hfilesdk>
+      HFILESDK_NATIVE_LIB=$<TARGET_FILE:hfilesdk>
+      HFILESDK_BUILD_DIR=${CMAKE_BINARY_DIR}
+      ${HFILE_MAVEN_EXECUTABLE} -q test
+  )
+  set_tests_properties(test_java_jni_integration PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/java)
+endif()
+
 if(HFILE_ENABLE_COVERAGE)
   set(HFILE_COVERAGE_TARGETS ${HFILE_TEST_TARGETS} hfile_chaos)
-  set(HFILE_COVERAGE_OBJECT_TARGETS hfile hfile_chaos test_jni_json_utils)
+  set(HFILE_COVERAGE_OBJECT_TARGETS hfile hfile_chaos)
+  if(HFILE_ENABLE_JAVA_TESTS)
+    list(APPEND HFILE_COVERAGE_TARGETS hfilesdk)
+    list(APPEND HFILE_COVERAGE_OBJECT_TARGETS hfilesdk)
+  else()
+    list(APPEND HFILE_COVERAGE_OBJECT_TARGETS test_jni_json_utils)
+  endif()
   set(HFILE_COVERAGE_OBJECT_LINES "")
   foreach(TGT IN LISTS HFILE_COVERAGE_OBJECT_TARGETS)
     string(APPEND HFILE_COVERAGE_OBJECT_LINES "  \"$<TARGET_FILE:${TGT}>\"\n")
@@ -410,6 +460,7 @@ message(STATUS "  jemalloc:    ${HFILE_ENABLE_JEMALLOC}")
 message(STATUS "  ASan:        ${HFILE_ENABLE_ASAN}")
 message(STATUS "  UBSan:       ${HFILE_ENABLE_UBSAN}")
 message(STATUS "  Coverage:    ${HFILE_ENABLE_COVERAGE}")
+message(STATUS "  Java tests:  ${HFILE_ENABLE_JAVA_TESTS}")
 if(HFILE_ENABLE_COVERAGE)
   message(STATUS "  llvm-cov:    ${HFILE_LLVM_COV_EXECUTABLE}")
   message(STATUS "  llvm-profdata: ${HFILE_LLVM_PROFDATA_EXECUTABLE}")

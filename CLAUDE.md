@@ -217,7 +217,7 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 ### 当前测试矩阵
 
 - 完整测试说明见 `@TESTING.md`
-- 当前已纳入 `ctest` 的目标数为 **23**
+- 当前已纳入 `ctest` 的目标数为 **24**
 - 当前已支持 `llvm-cov` 覆盖率报表输出
 - `build-coverage/artifacts/coverage-html/` 约定为 CI HTML 产物目录
 - 自动化覆盖已包含：
@@ -227,6 +227,7 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
   - Arrow/convert：WideTable、TallTable、RawKV、坏 stream、非法 row key rule、进度回调
   - BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
   - I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos`
+  - Java JNI：`configure()` 非法 JSON、空路径、非法 row key rule、Java 生成 Arrow 并经 JNI 完成转换
 
 ---
 

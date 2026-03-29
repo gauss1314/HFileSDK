@@ -772,7 +772,7 @@ HFileSDK/
 | 测试层次 | 覆盖范围 | 工具 | 数量 |
 |---------|---------|------|------|
 | 单元/回归测试 | 编码、压缩、元数据、Writer、Arrow、BulkLoad、I/O、CFGrouper 与历史缺陷回归 | Google Test + 自定义框架 | 21 文件 |
-| `ctest` 目标 | 单元、集成、自定义测试与 chaos 故障注入入口 | GTest + 自定义测试 + `hfile-chaos` | 23 个 |
+| `ctest` 目标 | 单元、集成、自定义测试、chaos 与 Java JNI 入口 | GTest + 自定义测试 + `hfile-chaos` + Maven JNI 集成测试 | 24 个 |
 | 覆盖率报表 | 自动执行测试并输出文本/HTML 覆盖率报告，并约定 CI 产物目录 | `llvm-cov` + `llvm-profdata` + `hfile_coverage` / `hfile_coverage_ci` | 已实现 |
 | 独立集成测试 | `convert()`、BulkLoad、多批次统计、RawKV/TallTable 等跨模块交互 | 同上 | 已纳入 `ctest` |
 | 格式验证 | HFile 文件可被 HBase 原生 Reader 读取 | `hfile-verify` (Java) | 手动 |
@@ -788,6 +788,7 @@ HFileSDK/
 - Arrow 与转换编排：WideTable / TallTable / RawKV、坏 stream、非法 row key rule、空 row key 过滤、进度回调
 - BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
 - I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos` 掉电/磁盘满模拟
+- Java JNI：`configure()` 非法 JSON、空路径、非法 row key rule、Java→JNI→HFile 本地转换闭环
 
 ### 10.2 调试辅助
 

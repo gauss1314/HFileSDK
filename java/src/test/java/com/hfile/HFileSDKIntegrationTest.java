@@ -1,0 +1,113 @@
+package com.hfile;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+import java.io.IOException;
+import java.nio.channels.Channels;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.util.List;
+
+import org.apache.arrow.memory.BufferAllocator;
+import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+
+public class HFileSDKIntegrationTest {
+
+    @Test
+    void convertWritesReadableSortedHFile(@TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");
+        writeArrowStream(arrowPath, List.of("row2", "row1"), List.of("value2", "value1"));
+
+        HFileSDK sdk = new HFileSDK();
+        int configureRc = sdk.configure("""
+            {
+              "compression":"none",
+              "column_family":"cf",
+              "data_block_encoding":"NONE"
+            }
+            """);
+        assertEquals(HFileSDK.OK, configureRc);
+
+        int rc = sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "ID,0,false,0");
+        assertEquals(HFileSDK.OK, rc);
+
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"error_code\":0"));
+        assertTrue(lastResult.contains("\"kv_written_count\":4"));
+        assertTrue(lastResult.contains("\"arrow_rows_read\":2"));
+        assertTrue(Files.exists(hfilePath));
+        assertTrue(Files.size(hfilePath) > 0);
+    }
+
+    @Test
+    void configureRejectsInvalidJson() {
+        HFileSDK sdk = new HFileSDK();
+        int rc = sdk.configure("{\"compression\":\"bogus\"}");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, rc);
+    }
+
+    @Test
+    void convertReportsInvalidRule(@TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");
+        writeArrowStream(arrowPath, List.of("row1"), List.of("value1"));
+
+        HFileSDK sdk = new HFileSDK();
+        int rc = sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "bad_rule");
+        assertEquals(HFileSDK.INVALID_ROW_KEY_RULE, rc);
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"error_code\":4"));
+        assertTrue(lastResult.contains("rowKeyRule"));
+    }
+
+    @Test
+    void convertRejectsEmptyPaths() {
+        HFileSDK sdk = new HFileSDK();
+        int rc = sdk.convert("", "", "test_table", "ID,0,false,0");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, rc);
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"error_code\":1"));
+        assertTrue(lastResult.contains("must not be null/empty"));
+    }
+
+    private static void writeArrowStream(java.nio.file.Path path,
+                                         List<String> ids,
+                                         List<String> values) throws IOException {
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VarCharVector idVector = new VarCharVector("id", allocator);
+             VarCharVector valueVector = new VarCharVector("value", allocator)) {
+            idVector.allocateNew(ids.size() * 16, ids.size());
+            valueVector.allocateNew(values.size() * 32, values.size());
+            for (int i = 0; i < ids.size(); ++i) {
+                idVector.setSafe(i, ids.get(i).getBytes(StandardCharsets.UTF_8));
+                valueVector.setSafe(i, values.get(i).getBytes(StandardCharsets.UTF_8));
+            }
+            idVector.setValueCount(ids.size());
+            valueVector.setValueCount(values.size());
+            try (VectorSchemaRoot root = new VectorSchemaRoot(List.of(idVector, valueVector));
+                 ArrowStreamWriter writer = new ArrowStreamWriter(
+                     root, null, Channels.newChannel(Files.newOutputStream(path)))) {
+                root.setRowCount(ids.size());
+                writer.start();
+                writer.writeBatch();
+                writer.end();
+            }
+        }
+    }
+
+}

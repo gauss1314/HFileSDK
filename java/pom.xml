@@ -19,10 +19,36 @@
     <maven.compiler.source>21</maven.compiler.source>
     <maven.compiler.target>21</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <arrow.version>16.1.0</arrow.version>
+    <junit.version>5.10.2</junit.version>
   </properties>
 
-  <!-- No runtime dependencies — JNI bridge only.
-       The .so is loaded via System.loadLibrary("hfilesdk"). -->
+  <dependencies>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-vector</artifactId>
+      <version>${arrow.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-core</artifactId>
+      <version>${arrow.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-memory-unsafe</artifactId>
+      <version>${arrow.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
 
   <build>
     <plugins>
@@ -54,6 +80,20 @@
             </manifest>
           </archive>
           <finalName>hfilesdk-java-${project.version}</finalName>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <useModulePath>false</useModulePath>
+          <argLine>-Djava.library.path=${env.HFILESDK_NATIVE_DIR} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+          <systemPropertyVariables>
+            <hfilesdk.native.dir>${env.HFILESDK_NATIVE_DIR}</hfilesdk.native.dir>
+            <hfilesdk.native.lib>${env.HFILESDK_NATIVE_LIB}</hfilesdk.native.lib>
+            <hfilesdk.build.dir>${env.HFILESDK_BUILD_DIR}</hfilesdk.build.dir>
+          </systemPropertyVariables>
         </configuration>
       </plugin>
     </plugins>
