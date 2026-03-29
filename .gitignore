@@ -22,5 +22,6 @@ target
 
 .DS_Store
 .trae/
-build
+build/
+build-*/
 .conda-hfilesdk

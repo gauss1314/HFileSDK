@@ -773,6 +773,7 @@ HFileSDK/
 |---------|---------|------|------|
 | 单元/回归测试 | 编码、压缩、元数据、Writer、Arrow、BulkLoad、I/O、CFGrouper 与历史缺陷回归 | Google Test + 自定义框架 | 21 文件 |
 | `ctest` 目标 | 单元、集成、自定义测试与 chaos 故障注入入口 | GTest + 自定义测试 + `hfile-chaos` | 23 个 |
+| 覆盖率报表 | 自动执行测试并输出文本/HTML 覆盖率报告，并约定 CI 产物目录 | `llvm-cov` + `llvm-profdata` + `hfile_coverage` / `hfile_coverage_ci` | 已实现 |
 | 独立集成测试 | `convert()`、BulkLoad、多批次统计、RawKV/TallTable 等跨模块交互 | 同上 | 已纳入 `ctest` |
 | 格式验证 | HFile 文件可被 HBase 原生 Reader 读取 | `hfile-verify` (Java) | 手动 |
 | Bulk Load 验证 | 完整链路 + HBase Scan 数据完整性 | `hfile-bulkload-verify` (Java) | 手动 |

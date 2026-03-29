@@ -57,6 +57,14 @@ cmake --build build -j$(nproc)
 # 运行全部测试
 cd build && ctest --output-on-failure
 
+# 生成 llvm-cov 覆盖率报表
+cmake -B build-coverage -DCMAKE_BUILD_TYPE=Release -DHFILE_ENABLE_COVERAGE=ON
+cmake --build build-coverage -j$(nproc)
+cmake --build build-coverage --target hfile_coverage
+
+# 或直接使用本地脚本
+bash scripts/coverage.sh
+
 # 运行单个测试
 ./build/test_prefix_encoder
 ./build/test_row_key_builder
@@ -210,6 +218,8 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 
 - 完整测试说明见 `@TESTING.md`
 - 当前已纳入 `ctest` 的目标数为 **23**
+- 当前已支持 `llvm-cov` 覆盖率报表输出
+- `build-coverage/artifacts/coverage-html/` 约定为 CI HTML 产物目录
 - 自动化覆盖已包含：
   - 编码与序列化：CRC32C、KV 编码、None/Prefix/Diff/FastDiff、VarInt 边界
   - 格式与元数据：Bloom、Index、FileInfo、Trailer

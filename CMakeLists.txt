@@ -21,9 +21,10 @@ endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND MSVC)
   set(HFILE_COMPILER_CLANG_CL ON)
   message(STATUS "Compiler: Clang-cl")
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+       CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
   set(HFILE_COMPILER_CLANG ON)
-  message(STATUS "Compiler: Clang")
+  message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID}")
 elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(HFILE_COMPILER_GCC ON)
   message(STATUS "Compiler: GCC")
@@ -41,9 +42,10 @@ option(HFILE_ENABLE_HDFS       "Enable HDFS I/O via libhdfs3 (Linux/macOS only)"
 option(HFILE_ENABLE_ASAN       "Enable AddressSanitizer" OFF)
 option(HFILE_ENABLE_UBSAN      "Enable UndefinedBehaviorSanitizer" OFF)
 option(HFILE_ENABLE_JEMALLOC   "Use jemalloc as memory allocator" OFF)
+option(HFILE_ENABLE_COVERAGE   "Enable llvm-cov coverage instrumentation" OFF)
 
 # ─── Compiler flags ────────────────────────────────────────────────────────────
-if(CMAKE_BUILD_TYPE STREQUAL "Release")
+if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT HFILE_ENABLE_COVERAGE)
   if(HFILE_COMPILER_MSVC)
     # MSVC / Clang-cl
     add_compile_options(/O2 /GL)
@@ -69,6 +71,45 @@ endif()
 if(HFILE_ENABLE_UBSAN AND NOT HFILE_PLATFORM_WINDOWS)
   add_compile_options(-fsanitize=undefined)
   add_link_options(-fsanitize=undefined)
+endif()
+
+if(HFILE_ENABLE_COVERAGE)
+  if(HFILE_PLATFORM_WINDOWS)
+    message(FATAL_ERROR "HFILE_ENABLE_COVERAGE is supported on macOS/Linux only")
+  endif()
+  if(NOT HFILE_COMPILER_CLANG)
+    message(FATAL_ERROR "HFILE_ENABLE_COVERAGE requires Clang or AppleClang")
+  endif()
+  find_program(HFILE_LLVM_COV_EXECUTABLE NAMES llvm-cov)
+  find_program(HFILE_LLVM_PROFDATA_EXECUTABLE NAMES llvm-profdata)
+  if(APPLE AND (NOT HFILE_LLVM_COV_EXECUTABLE OR NOT HFILE_LLVM_PROFDATA_EXECUTABLE))
+    execute_process(
+      COMMAND xcrun --find llvm-cov
+      OUTPUT_VARIABLE HFILE_XCRUN_LLVM_COV
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    execute_process(
+      COMMAND xcrun --find llvm-profdata
+      OUTPUT_VARIABLE HFILE_XCRUN_LLVM_PROFDATA
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+      ERROR_QUIET
+    )
+    if(NOT HFILE_LLVM_COV_EXECUTABLE AND HFILE_XCRUN_LLVM_COV)
+      set(HFILE_LLVM_COV_EXECUTABLE "${HFILE_XCRUN_LLVM_COV}")
+    endif()
+    if(NOT HFILE_LLVM_PROFDATA_EXECUTABLE AND HFILE_XCRUN_LLVM_PROFDATA)
+      set(HFILE_LLVM_PROFDATA_EXECUTABLE "${HFILE_XCRUN_LLVM_PROFDATA}")
+    endif()
+  endif()
+  if(NOT HFILE_LLVM_COV_EXECUTABLE)
+    message(FATAL_ERROR "llvm-cov not found")
+  endif()
+  if(NOT HFILE_LLVM_PROFDATA_EXECUTABLE)
+    message(FATAL_ERROR "llvm-profdata not found")
+  endif()
+  add_compile_options(-O0 -g -fprofile-instr-generate -fcoverage-mapping)
+  add_link_options(-fprofile-instr-generate -fcoverage-mapping)
 endif()
 
 # Enable BlockPool double-release / ownership checks in Debug builds.
@@ -239,6 +280,7 @@ target_include_directories(hfile_chaos PRIVATE
 # Tests
 enable_testing()
 find_package(GTest REQUIRED)
+set(HFILE_TEST_TARGETS)
 
 set(GTEST_SOURCES
   test/test_crc32c.cc
@@ -270,6 +312,7 @@ foreach(TEST_SRC ${GTEST_SOURCES})
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_BINARY_DIR})
   add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+  list(APPEND HFILE_TEST_TARGETS ${TEST_NAME})
 endforeach()
 
 set(CUSTOM_TEST_SOURCES
@@ -286,6 +329,7 @@ foreach(TEST_SRC ${CUSTOM_TEST_SOURCES})
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_BINARY_DIR})
   add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+  list(APPEND HFILE_TEST_TARGETS ${TEST_NAME})
 endforeach()
 
 add_test(
@@ -305,6 +349,33 @@ add_test(
     --output-dir ${CMAKE_BINARY_DIR}/chaos/disk
     --verify-no-corrupt-files
 )
+
+if(HFILE_ENABLE_COVERAGE)
+  set(HFILE_COVERAGE_TARGETS ${HFILE_TEST_TARGETS} hfile_chaos)
+  set(HFILE_COVERAGE_OBJECT_TARGETS hfile hfile_chaos test_jni_json_utils)
+  set(HFILE_COVERAGE_OBJECT_LINES "")
+  foreach(TGT IN LISTS HFILE_COVERAGE_OBJECT_TARGETS)
+    string(APPEND HFILE_COVERAGE_OBJECT_LINES "  \"$<TARGET_FILE:${TGT}>\"\n")
+  endforeach()
+  file(GENERATE
+    OUTPUT "${CMAKE_BINARY_DIR}/hfile_coverage_targets.cmake"
+    CONTENT "set(HFILE_COVERAGE_OBJECTS\n${HFILE_COVERAGE_OBJECT_LINES})\n")
+  configure_file(
+    "${CMAKE_SOURCE_DIR}/cmake/llvm_cov_report.cmake.in"
+    "${CMAKE_BINARY_DIR}/llvm_cov_report.cmake"
+    @ONLY)
+  add_custom_target(hfile_coverage
+    COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_BINARY_DIR}/llvm_cov_report.cmake"
+    DEPENDS ${HFILE_COVERAGE_TARGETS}
+    USES_TERMINAL)
+  add_custom_target(hfile_coverage_ci
+    COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_BINARY_DIR}/llvm_cov_report.cmake"
+    DEPENDS ${HFILE_COVERAGE_TARGETS}
+    USES_TERMINAL)
+  add_custom_target(hfile_coverage_clean
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_BINARY_DIR}/coverage"
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_BINARY_DIR}/artifacts")
+endif()
 
 # Benchmarks
 if(HFILE_ENABLE_BENCHMARKS)
@@ -338,3 +409,8 @@ message(STATUS "  Benchmarks:  ${HFILE_ENABLE_BENCHMARKS}")
 message(STATUS "  jemalloc:    ${HFILE_ENABLE_JEMALLOC}")
 message(STATUS "  ASan:        ${HFILE_ENABLE_ASAN}")
 message(STATUS "  UBSan:       ${HFILE_ENABLE_UBSAN}")
+message(STATUS "  Coverage:    ${HFILE_ENABLE_COVERAGE}")
+if(HFILE_ENABLE_COVERAGE)
+  message(STATUS "  llvm-cov:    ${HFILE_LLVM_COV_EXECUTABLE}")
+  message(STATUS "  llvm-profdata: ${HFILE_LLVM_PROFDATA_EXECUTABLE}")
+endif()

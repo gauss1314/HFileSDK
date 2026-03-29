@@ -13,6 +13,39 @@ cmake --build build -j8
 cd build && ctest --output-on-failure
 ```
 
+## 覆盖率报表
+
+当前仓库已接入基于 Clang/AppleClang 的 `llvm-cov` 覆盖率流程。
+
+```bash
+cmake -B build-coverage \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DHFILE_ENABLE_COVERAGE=ON
+cmake --build build-coverage -j8
+cmake --build build-coverage --target hfile_coverage
+```
+
+或直接使用本地脚本：
+
+```bash
+bash scripts/coverage.sh
+```
+
+生成结果：
+
+- 文本摘要：`build-coverage/coverage/summary.txt`
+- HTML 报表：`build-coverage/coverage/html/index.html`
+- CI 产物目录：`build-coverage/artifacts/`
+- CI HTML 产物目录：`build-coverage/artifacts/coverage-html/`
+- CI 摘要产物：`build-coverage/artifacts/coverage-summary.txt`
+
+说明：
+
+- `hfile_coverage` 会自动运行 `ctest`、收集 `.profraw`、合并为 `.profdata`，并生成文本与 HTML 报表
+- `hfile_coverage_ci` 与 `hfile_coverage` 共享同一套生成逻辑，但额外约定 `build-coverage/artifacts/` 作为 CI 上传目录
+- 覆盖率模式会关闭默认 Release 优化，并额外注入 `-O0 -g -fprofile-instr-generate -fcoverage-mapping`
+- 当前覆盖率流程面向 macOS/Linux 的 Clang 或 AppleClang 工具链
+
 ## 覆盖矩阵
 
 ### 编码与序列化
@@ -96,12 +129,12 @@ cd build && ctest --output-on-failure
 ## 当前边界
 
 - 当前文档中的“全覆盖”指当前 macOS 生效构建配置下，主要功能模块、关键异常路径和重要资源边界均已有自动化回归保护
-- 当前仓库尚未接入覆盖率统计工具，因此这里不表示 100% 行覆盖率或分支覆盖率
+- 当前已接入 `llvm-cov` 报表流程，但这里仍不表示 100% 行覆盖率或分支覆盖率
 - `io_uring` 与 `HDFS` 后端属于条件编译路径，当前 macOS 构建未启用，因此未进入当前 `ctest` 矩阵
 - Java/JNI 端到端调用链尚未单独纳入自动化测试；当前覆盖重点在 C++ JNI 配置解析层
 
 ## 建议的后续增强
 
-- 接入 `llvm-cov` 或 `lcov` 输出覆盖率报表
 - 在 Linux CI 中增加 `io_uring` 与 `HDFS` 条件矩阵
+- 将 `hfile_coverage` 纳入 CI 并保存 HTML 报表产物
 - 为 Java 层补充 JNI 端到端集成测试
