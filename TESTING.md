@@ -24,10 +24,17 @@ bash scripts/build.sh
 bash scripts/test.sh -- -R test_arrow_converter
 ```
 
+Windows + MSYS2 Clang 下对应入口：
+
+```bat
+scripts\build.bat
+scripts\test.bat
+```
+
 ## 覆盖率报表
 
 当前仓库已接入基于 Clang 工具链的 `llvm-cov` 覆盖率流程；在 macOS、Linux 以及 Windows + MSYS2 Clang 环境下，只要 `llvm-cov` / `llvm-profdata` 可用，都可以走同一套覆盖率目标。
-在 Windows + MSYS2 Clang 环境下，建议通过 `scripts\coverage.bat` 进入，它会转调 `coverage.sh`；脚本会在配置前检查 `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata`，并提示 `MSYSTEM=CLANG64` 等推荐前置条件。
+在 Windows + MSYS2 Clang 环境下，统一通过 `scripts\coverage.bat` 进入，它会转调 `coverage.sh`；脚本会在配置前检查 `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata`，并提示 `MSYSTEM=CLANG64` 等推荐前置条件。
 
 ```bash
 cmake -B build-coverage \
@@ -43,6 +50,12 @@ cmake --build build-coverage --target hfile_coverage
 bash scripts/coverage.sh
 ```
 
+Windows + MSYS2 Clang 下对应入口：
+
+```bat
+scripts\coverage.bat
+```
+
 生成结果：
 
 - 文本摘要：`build-coverage/coverage/summary.txt`
@@ -56,7 +69,7 @@ bash scripts/coverage.sh
 - `hfile_coverage` 会自动运行 `ctest`、收集 `.profraw`、合并为 `.profdata`，并生成文本与 HTML 报表
 - `hfile_coverage_ci` 与 `hfile_coverage` 共享同一套生成逻辑，但额外约定 `build-coverage/artifacts/` 作为 CI 上传目录
 - 覆盖率模式会关闭默认 Release 优化，并额外注入 `-O0 -g -fprofile-instr-generate -fcoverage-mapping`
-- 当前覆盖率流程面向 macOS/Linux 的 Clang 或 AppleClang 工具链
+- 当前覆盖率流程面向 Clang 工具链；macOS/Linux 可直接使用，Windows 需要通过 MSYS2 Clang 环境提供 `bash`、`cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata`
 
 ## 覆盖矩阵
 

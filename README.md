@@ -13,12 +13,11 @@
 | Linux x86-64       | GCC 12+               | ✅ **完整支持** | 所有功能，含 io\_uring、SSE4.2                  |
 | Linux x86-64       | Clang 16+             | ✅ **完整支持** | 同上                                       |
 | macOS x86-64/arm64 | Apple Clang 15+       | ✅ **完整支持** | 除 io\_uring（Apple Silicon 含 CRC32C 硬件指令） |
-| Windows x86-64     | Clang 17+（`clang-cl`） | ✅ **核心功能** | 见下方说明                                    |
-| Windows x86-64     | MSVC 2022             | ⚠️ **需验证** | `__builtin_*` 需替换为 MSVC 等价物              |
+| Windows x86-64     | Clang 17+（MSYS2 `clang/clang++`） | ✅ **核心功能** | 通过 `scripts/*.bat` 进入 MSYS2 脚本工作流 |
 
-### Windows + Clang 支持说明
+### Windows + MSYS2 Clang 支持说明
 
-核心编码、压缩、索引、Bloom Filter 等模块**完全跨平台**，可在 Windows + Clang 上直接编译。
+核心编码、压缩、索引、Bloom Filter 等模块**完全跨平台**，当前 Windows 路径统一约定为 **MSYS2 + clang/clang++ + .bat/.sh**。
 
 以下功能在 Windows 上**自动禁用**（CMake 自动检测，无需手动配置）：
 
@@ -27,11 +26,11 @@
 | `IoUringWriter` | Linux 内核专有 API            | 仅影响可选的异步 I/O 后端；`BufferedFileWriter` 在所有平台可用 |
 | `HdfsWriter`    | `libhdfs3` 无官方 Windows 构建 | 仅影响直写 HDFS；本地文件写入不受影响                        |
 
-以下特性在 Windows Clang 上**完全支持**：
+以下特性在 Windows + MSYS2 Clang 上**完全支持**：
 
-- SSE4.2 CRC32C 硬件加速（`nmmintrin.h` 在 MSVC/Clang-cl 中可用）
+- SSE4.2 CRC32C 硬件加速（`nmmintrin.h` 在 Clang 中可用）
 - SIMD 前缀扫描（`_mm_cmpeq_epi8` 等）
-- `__builtin_ctz`、`__builtin_expect`（Clang-cl 完全支持）
+- `__builtin_ctz`、`__builtin_expect`（Clang 完全支持）
 - `std::filesystem`（C++20 标准，Windows 完全支持）
 - Arrow C++ 15+、Protobuf、LZ4、ZSTD、Snappy（均有官方 Windows 构建）
 
@@ -55,28 +54,23 @@ bash scripts/build.sh -DCMAKE_CXX_FLAGS="-O3 -march=native"
 bash scripts/test.sh
 ```
 
-### Windows（Clang + vcpkg）
+### Windows（MSYS2 Clang + 脚本入口）
 
-```powershell
-# 1. 安装依赖（通过 vcpkg）
-vcpkg install arrow:x64-windows protobuf:x64-windows `
-              lz4:x64-windows zstd:x64-windows snappy:x64-windows `
-              zlib:x64-windows gtest:x64-windows
+Windows 下当前只维护 **MSYS2 内的 Clang/LLVM 工具链** 这一路径，仓库提供对应的脚本入口：
 
-# 2. 配置（使用 Clang-cl）
-cmake -B build -G "Ninja" `
-      -DCMAKE_BUILD_TYPE=Release `
-      -DCMAKE_CXX_COMPILER=clang-cl `
-      -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-      -DHFILE_ENABLE_IO_URING=OFF `
-      -DHFILE_ENABLE_HDFS=OFF
-
-# 3. 编译
-cmake --build build
-
-# 4. 测试
-cd build && ctest --output-on-failure
+```bat
+scripts\build.bat
+scripts\test.bat
+scripts\coverage.bat
+scripts\bench-runner.bat --skip-hbase --skip-java --iterations 1
 ```
+
+命令顺序与 Linux / macOS 侧保持一致：**build → test → coverage → bench-runner**。这些 `.bat` 会转调 `scripts/*.sh`，并自动查找 MSYS2 `bash.exe`。推荐前提：
+
+- `MSYSTEM=CLANG64`
+- `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata` 在该 MSYS2 环境中可见
+- Arrow 依赖可通过 `CMAKE_PREFIX_PATH` 或 `Arrow_DIR` 被 CMake 发现
+- 更完整的脚本参数与平台说明见 [scripts/README.md](file:///Users/gauss/workspace/github_project/HFileSDK/scripts/README.md)
 
 ***
 

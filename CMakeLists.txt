@@ -17,11 +17,8 @@ else()
   message(STATUS "Platform: Linux")
 endif()
 
-# Detect Clang-cl (Clang targeting MSVC ABI on Windows)
-if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND MSVC)
-  set(HFILE_COMPILER_CLANG_CL ON)
-  message(STATUS "Compiler: Clang-cl")
-elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+# Detect compiler family
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
        CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
   set(HFILE_COMPILER_CLANG ON)
   message(STATUS "Compiler: ${CMAKE_CXX_COMPILER_ID}")
@@ -31,6 +28,10 @@ elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 elseif(MSVC)
   set(HFILE_COMPILER_MSVC ON)
   message(STATUS "Compiler: MSVC")
+endif()
+
+if(HFILE_PLATFORM_WINDOWS AND NOT HFILE_COMPILER_CLANG)
+  message(FATAL_ERROR "Windows builds are supported only via MSYS2 clang/clang++ and the scripts/*.bat -> scripts/*.sh workflow")
 endif()
 
 # ─── Options ──────────────────────────────────────────────────────────────────
@@ -48,20 +49,14 @@ set(HFILE_COVERAGE_CTEST_ARGS "" CACHE STRING "Extra ctest arguments used by cov
 
 # ─── Compiler flags ────────────────────────────────────────────────────────────
 if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT HFILE_ENABLE_COVERAGE)
-  if(HFILE_COMPILER_MSVC)
-    # MSVC / Clang-cl
-    add_compile_options(/O2 /GL)
-    add_link_options(/LTCG)
-  elseif(HFILE_COMPILER_CLANG_CL)
-    add_compile_options(/O2 -march=native)
-    add_link_options(/LTCG)
-  else()
-    # GCC / Clang on Linux or macOS
+  if(HFILE_COMPILER_GCC OR HFILE_COMPILER_CLANG)
     add_compile_options(-O3 -march=native)
     if(NOT APPLE)   # Apple's ld64 does not support -flto in the same way
       add_compile_options(-flto)
       add_link_options(-flto)
     endif()
+  else()
+    message(FATAL_ERROR "Unsupported compiler for Release configuration")
   endif()
 endif()
 
@@ -116,8 +111,7 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
   add_compile_definitions(HFILE_DEBUG_POOL)
 endif()
 
-# Windows: suppress MSVC-style warnings when using Clang-cl, and define
-# standard macros that the C library omits without this flag.
+# Windows: define standard macros that the C library omits without this flag.
 if(HFILE_PLATFORM_WINDOWS)
   add_compile_definitions(
     _CRT_SECURE_NO_WARNINGS    # silence fopen deprecation

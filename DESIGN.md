@@ -756,14 +756,14 @@ submit_active() 协议：
 | Linux x86-64 | GCC 12+ | ✅ 完整 | ✅ | ✅ |
 | Linux x86-64 | Clang 16+ | ✅ 完整 | ✅ | ✅ |
 | macOS x86-64/ARM | Apple Clang 15+ | ✅ 完整 | ❌ | ✅ |
-| Windows x86-64 | Clang 17+ (clang-cl) | ✅ 核心功能 | ❌ | ❌ |
-| Windows x86-64 | MSVC 2022 | ⚠️ 需验证 | ❌ | ❌ |
+| Windows x86-64 | Clang 17+（MSYS2 clang/clang++） | ✅ 核心功能 | ❌ | ❌ |
 
 **Windows 注意事项**：
 - CMake 自动检测平台，Windows 上 `io_uring` 和 `HDFS` 选项自动关闭
+- Windows 构建入口统一约定为 `MSYS2 + clang/clang++ + scripts/*.bat -> scripts/*.sh`
 - `BufferedFileWriter` 使用标准 C `FILE*`，Windows 完全支持
-- SSE4.2 intrinsics 在 Clang-cl 中可用
-- `__builtin_ctz`、`__builtin_expect` 在 Clang-cl 中可用
+- SSE4.2 intrinsics 在 Clang 中可用
+- `__builtin_ctz`、`__builtin_expect` 在 Clang 中可用
 - Debug 构建需定义 `_CRT_SECURE_NO_WARNINGS` 和 `NOMINMAX`（CMake 已处理）
 
 ---
@@ -772,7 +772,7 @@ submit_active() 协议：
 
 ```
 HFileSDK/
-├── CMakeLists.txt           平台感知构建（Linux/macOS/Windows + GCC/Clang/MSVC）
+├── CMakeLists.txt           平台感知构建（Linux/macOS/Windows + GCC/Clang）
 ├── CLAUDE.md                Claude Code 开发指引
 ├── DESIGN.md                本文件
 ├── README.md                用户文档（含 Windows 构建步骤）

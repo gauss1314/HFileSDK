@@ -34,8 +34,7 @@ public:
 ///
 /// Platform support:
 ///   Linux / macOS   — FILE* backed by POSIX fd; fsync via fileno() optional.
-///   Windows (MSVC)  — FILE* backed by Win32 HANDLE; fully supported.
-///   Windows (Clang) — identical to MSVC path; supported.
+///   Windows (MSYS2 Clang) — FILE* backed by the active C runtime handle; supported.
 class BufferedFileWriter final : public BlockWriter {
 public:
     explicit BufferedFileWriter(const std::string& path,
