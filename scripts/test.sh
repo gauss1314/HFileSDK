@@ -69,6 +69,50 @@ has_cmake_arg_prefix() {
   return 1
 }
 
+require_command() {
+  local cmd="$1"
+  local hint="$2"
+  if command -v "${cmd}" >/dev/null 2>&1; then
+    return 0
+  fi
+  echo "Missing required command: ${cmd}" >&2
+  if [[ -n "${hint}" ]]; then
+    echo "${hint}" >&2
+  fi
+  exit 1
+}
+
+print_windows_msys2_hints() {
+  if [[ "${PLATFORM}" == MINGW* || "${PLATFORM}" == MSYS* || "${PLATFORM}" == CYGWIN* ]]; then
+    echo "==> Windows/MSYS2 mode detected"
+    echo "    MSYSTEM=${MSYSTEM:-<unset>}"
+    if [[ -z "${MSYSTEM:-}" ]]; then
+      echo "    Hint: start from an MSYS2 Clang shell, or set MSYSTEM=CLANG64 before running test.bat" >&2
+    fi
+  fi
+}
+
+preflight_test_env() {
+  print_windows_msys2_hints
+  require_command cmake "Install CMake or ensure it is visible in the active shell PATH."
+  require_command ctest "Install CMake with ctest support or ensure ctest is visible in the active shell PATH."
+  if [[ -z "${CMAKE_CXX_COMPILER:-}" ]]; then
+    if command -v clang++ >/dev/null 2>&1; then
+      :
+    elif command -v clang >/dev/null 2>&1; then
+      :
+    else
+      echo "Missing required compiler: clang/clang++" >&2
+      echo "Hint: install the MSYS2 Clang toolchain and launch the script from the matching shell." >&2
+      exit 1
+    fi
+  fi
+  if [[ -z "${Arrow_DIR:-}" && ! -d "${LOCAL_PREFIX}/lib/cmake/Arrow" && -z "${CMAKE_PREFIX_PATH:-}" ]]; then
+    echo "Warning: Arrow_DIR/CMAKE_PREFIX_PATH not set and no local prefix found at ${LOCAL_PREFIX}." >&2
+    echo "         CMake may still succeed if Arrow is installed in a default prefix visible to this environment." >&2
+  fi
+}
+
 JOBS="${JOBS:-$(detect_jobs)}"
 
 PREFIX_PATH_VALUE="${CMAKE_PREFIX_PATH:-}"
@@ -76,8 +120,10 @@ PREFIX_PATH_VALUE="$(append_prefix_path "${PREFIX_PATH_VALUE}" "${LOCAL_PREFIX}"
 if [[ -n "${PREFIX_PATH_VALUE}" ]]; then
   CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=${PREFIX_PATH_VALUE}")
 fi
-if [[ -d "${LOCAL_PREFIX}/lib/cmake/Arrow" ]]; then
-  CMAKE_ARGS+=("-DArrow_DIR=${Arrow_DIR:-${LOCAL_PREFIX}/lib/cmake/Arrow}")
+if [[ -n "${Arrow_DIR:-}" ]]; then
+  CMAKE_ARGS+=("-DArrow_DIR=${Arrow_DIR}")
+elif [[ -d "${LOCAL_PREFIX}/lib/cmake/Arrow" ]]; then
+  CMAKE_ARGS+=("-DArrow_DIR=${LOCAL_PREFIX}/lib/cmake/Arrow")
 fi
 
 if [[ $# -gt 0 ]]; then
@@ -100,6 +146,8 @@ fi
 if ! has_cmake_arg_prefix "-DHFILE_ENABLE_BENCHMARKS=" "${CMAKE_ARGS[@]}"; then
   CMAKE_ARGS+=("-DHFILE_ENABLE_BENCHMARKS=OFF")
 fi
+
+preflight_test_env
 
 CONFIGURE_CMD=(
   cmake

@@ -76,14 +76,11 @@ if(HFILE_ENABLE_UBSAN AND NOT HFILE_PLATFORM_WINDOWS)
 endif()
 
 if(HFILE_ENABLE_COVERAGE)
-  if(HFILE_PLATFORM_WINDOWS)
-    message(FATAL_ERROR "HFILE_ENABLE_COVERAGE is supported on macOS/Linux only")
-  endif()
   if(NOT HFILE_COMPILER_CLANG)
     message(FATAL_ERROR "HFILE_ENABLE_COVERAGE requires Clang or AppleClang")
   endif()
-  find_program(HFILE_LLVM_COV_EXECUTABLE NAMES llvm-cov)
-  find_program(HFILE_LLVM_PROFDATA_EXECUTABLE NAMES llvm-profdata)
+  find_program(HFILE_LLVM_COV_EXECUTABLE NAMES llvm-cov llvm-cov.exe)
+  find_program(HFILE_LLVM_PROFDATA_EXECUTABLE NAMES llvm-profdata llvm-profdata.exe)
   if(APPLE AND (NOT HFILE_LLVM_COV_EXECUTABLE OR NOT HFILE_LLVM_PROFDATA_EXECUTABLE))
     execute_process(
       COMMAND xcrun --find llvm-cov

@@ -26,7 +26,8 @@ bash scripts/test.sh -- -R test_arrow_converter
 
 ## 覆盖率报表
 
-当前仓库已接入基于 Clang/AppleClang 的 `llvm-cov` 覆盖率流程。
+当前仓库已接入基于 Clang 工具链的 `llvm-cov` 覆盖率流程；在 macOS、Linux 以及 Windows + MSYS2 Clang 环境下，只要 `llvm-cov` / `llvm-profdata` 可用，都可以走同一套覆盖率目标。
+在 Windows + MSYS2 Clang 环境下，建议通过 `scripts\coverage.bat` 进入，它会转调 `coverage.sh`；脚本会在配置前检查 `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata`，并提示 `MSYSTEM=CLANG64` 等推荐前置条件。
 
 ```bash
 cmake -B build-coverage \
