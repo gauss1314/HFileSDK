@@ -197,9 +197,11 @@ endif()
 
 # Generate protobuf sources
 set(PROTO_DIR ${CMAKE_SOURCE_DIR}/proto)
-set(PROTO_FILE ${PROTO_DIR}/hfile_trailer.proto)
+set(PROTO_FILES
+  ${PROTO_DIR}/hfile_trailer.proto
+  ${PROTO_DIR}/hfile_file_info.proto)
 
-protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILE})
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS ${PROTO_FILES})
 message(STATUS "Protobuf generated: ${PROTO_SRCS} ${PROTO_HDRS}")
 
 # Library sources
@@ -392,6 +394,16 @@ if(HFILE_ENABLE_JAVA_TESTS)
   )
   set_tests_properties(test_java_jni_integration PROPERTIES
     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/java)
+  add_test(
+    NAME test_java_hbase_reader_verify
+    COMMAND ${CMAKE_COMMAND}
+      -DHFILE_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+      -DHFILE_BUILD_DIR=${CMAKE_BINARY_DIR}
+      -DHFILE_MAVEN_EXECUTABLE=${HFILE_MAVEN_EXECUTABLE}
+      -DHFILE_NATIVE_DIR=$<TARGET_FILE_DIR:hfilesdk>
+      -DHFILE_NATIVE_LIB=$<TARGET_FILE:hfilesdk>
+      -P ${CMAKE_SOURCE_DIR}/cmake/run_java_hbase_verify.cmake
+  )
 endif()
 
 if(HFILE_ENABLE_COVERAGE)

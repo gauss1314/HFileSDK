@@ -1,4 +1,5 @@
 #include "block_index_writer.h"
+#include "checksum/crc32c.h"
 #include <hfile/types.h>
 #include <cassert>
 #include <cstring>
@@ -23,13 +24,16 @@ void BlockIndexWriter::add_entry(std::span<const uint8_t> first_key,
 // Each index entry:   offset(8B BE) + dataSize(4B BE) + keyLen(4B BE) + key
 
 void BlockIndexWriter::write_entry(const IndexEntry& e, std::vector<uint8_t>& buf) {
-    const size_t entry_size = 8 + 4 + 4 + e.first_key.size();
+    uint8_t key_len_buf[10];
+    int key_len_size = encode_writable_vint(
+        key_len_buf, static_cast<int64_t>(e.first_key.size()));
+    const size_t entry_size = 8 + 4 + static_cast<size_t>(key_len_size) + e.first_key.size();
     size_t off = buf.size();
     buf.resize(off + entry_size);
     uint8_t* p = buf.data() + off;
     write_be64(p, static_cast<uint64_t>(e.offset));           p += 8;
     write_be32(p, static_cast<uint32_t>(e.data_size));         p += 4;
-    write_be32(p, static_cast<uint32_t>(e.first_key.size()));  p += 4;
+    std::memcpy(p, key_len_buf, key_len_size);                 p += key_len_size;
     std::memcpy(p, e.first_key.data(), e.first_key.size());
 }
 
@@ -43,38 +47,59 @@ size_t BlockIndexWriter::write_intermediate_block(
         int64_t prev_block_offset,
         std::vector<uint8_t>& buf) {
 
-    // Compute payload size (entries only, no block header)
-    size_t payload = 4;  // entry count (4B)
-    for (const auto* e : entries)
-        payload += 8 + 4 + 4 + e->first_key.size();
+    std::vector<uint32_t> secondary_offsets;
+    secondary_offsets.reserve(entries.size() + 1);
+    uint32_t entry_offset = 0;
+    secondary_offsets.push_back(entry_offset);
+    for (const auto* e : entries) {
+        entry_offset += static_cast<uint32_t>(8 + 4 + e->first_key.size());
+        secondary_offsets.push_back(entry_offset);
+    }
+
+    size_t payload = 4 + secondary_offsets.size() * 4 + entry_offset;
+
+    size_t on_disk_data_with_header = kBlockHeaderSize + payload;
+    size_t n_chunks = (on_disk_data_with_header + kBytesPerChecksum - 1) / kBytesPerChecksum;
+    std::vector<uint8_t> checksum_buf(n_chunks * 4);
 
     // Write block header
     const size_t start = buf.size();
-    buf.resize(start + kBlockHeaderSize + payload);
+    buf.resize(start + kBlockHeaderSize + payload + checksum_buf.size());
     uint8_t* p = buf.data() + start;
 
     std::memcpy(p, kIntermedIdxMagic.data(), 8); p += 8;
-    write_be32(p, static_cast<uint32_t>(payload)); p += 4;  // compressedSz
+    write_be32(p, static_cast<uint32_t>(payload + checksum_buf.size())); p += 4;
     write_be32(p, static_cast<uint32_t>(payload)); p += 4;  // uncompressedSz
     write_be64(p, static_cast<uint64_t>(prev_block_offset)); p += 8;
     *p++ = kChecksumTypeCRC32C;
     write_be32(p, kBytesPerChecksum); p += 4;
-    write_be32(p, static_cast<uint32_t>(payload)); p += 4;  // onDiskDataSz
+    write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
 
     // Write entry count
     write_be32(p, static_cast<uint32_t>(entries.size())); p += 4;
 
-    // Write entries
+    for (uint32_t mark : secondary_offsets) {
+        write_be32(p, mark);
+        p += 4;
+    }
+
     for (const auto* e : entries) {
         write_be64(p, static_cast<uint64_t>(e->offset));           p += 8;
         write_be32(p, static_cast<uint32_t>(e->data_size));         p += 4;
-        write_be32(p, static_cast<uint32_t>(e->first_key.size()));  p += 4;
         std::memcpy(p, e->first_key.data(), e->first_key.size());
         p += e->first_key.size();
     }
 
+    checksum::compute_hfile_checksums(
+        buf.data() + start,
+        kBlockHeaderSize + payload,
+        kBytesPerChecksum,
+        checksum_buf.data());
+    std::memcpy(buf.data() + start + kBlockHeaderSize + payload,
+                checksum_buf.data(), checksum_buf.size());
+
     assert(static_cast<size_t>(p - (buf.data() + start)) == kBlockHeaderSize + payload);
-    return kBlockHeaderSize + payload;
+    return kBlockHeaderSize + payload + checksum_buf.size();
 }
 
 // ─── finish ───────────────────────────────────────────────────────────────────
@@ -89,10 +114,6 @@ IndexWriteResult BlockIndexWriter::finish(int64_t              intermed_start_of
     if (entries_.size() <= max_per_block_) {
         result.num_levels = 1;
 
-        // root payload: count(4B) + entries
-        root_out.resize(root_out.size() + 4);
-        write_be32(root_out.data() + root_out.size() - 4,
-                   static_cast<uint32_t>(entries_.size()));
         for (const auto& e : entries_)
             write_entry(e, root_out);
 
@@ -139,11 +160,6 @@ IndexWriteResult BlockIndexWriter::finish(int64_t              intermed_start_of
         i                    = chunk_end;
     }
 
-    // Write root payload: count(4B) + root_entries
-    size_t root_start = root_out.size();
-    root_out.resize(root_start + 4);
-    write_be32(root_out.data() + root_start,
-               static_cast<uint32_t>(root_entries.size()));
     for (const auto& re : root_entries)
         write_entry(re, root_out);
 

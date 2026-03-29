@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
@@ -14,6 +15,7 @@ import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -30,7 +32,9 @@ public class HFileSDKIntegrationTest {
             {
               "compression":"none",
               "column_family":"cf",
-              "data_block_encoding":"NONE"
+              "data_block_encoding":"NONE",
+              "bloom_type":"none",
+              "include_mvcc":0
             }
             """);
         assertEquals(HFileSDK.OK, configureRc);
@@ -85,7 +89,48 @@ public class HFileSDKIntegrationTest {
         assertTrue(lastResult.contains("must not be null/empty"));
     }
 
-    private static void writeArrowStream(java.nio.file.Path path,
+    @Test
+    void convertWritesReaderValidationFixture() throws Exception {
+        String arrowPathValue = System.getProperty("hfilesdk.e2e.arrowPath");
+        String hfilePathValue = System.getProperty("hfilesdk.e2e.hfilePath");
+        Assumptions.assumeTrue(arrowPathValue != null && !arrowPathValue.isBlank());
+        Assumptions.assumeTrue(hfilePathValue != null && !hfilePathValue.isBlank());
+
+        Path arrowPath = Path.of(arrowPathValue);
+        Path hfilePath = Path.of(hfilePathValue);
+        Files.createDirectories(arrowPath.getParent());
+        Files.createDirectories(hfilePath.getParent());
+        Files.deleteIfExists(arrowPath);
+        Files.deleteIfExists(hfilePath);
+
+        writeArrowStream(arrowPath, List.of("row2", "row1"), List.of("value2", "value1"));
+
+        HFileSDK sdk = new HFileSDK();
+        int configureRc = sdk.configure("""
+            {
+              "compression":"none",
+              "column_family":"cf",
+              "data_block_encoding":"NONE",
+              "bloom_type":"none",
+              "include_mvcc":0
+            }
+            """);
+        assertEquals(HFileSDK.OK, configureRc);
+
+        int rc = sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "ID,0,false,0");
+        assertEquals(HFileSDK.OK, rc);
+
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"error_code\":0"));
+        assertTrue(lastResult.contains("\"kv_written_count\":4"));
+        assertTrue(Files.exists(hfilePath));
+    }
+
+    private static void writeArrowStream(Path path,
                                          List<String> ids,
                                          List<String> values) throws IOException {
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);

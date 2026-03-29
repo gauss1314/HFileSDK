@@ -83,14 +83,13 @@ TEST(HFileWriter, TrailerVersionsAtEndOfFile) {
     ASSERT_TRUE(fin.ok()) << fin.message();
 
     auto data = read_file(path);
-    ASSERT_GE(data.size(), 12u);
-
-    // Last 12 bytes: pb_offset(4) + major(4) + minor(4)
-    const uint8_t* tail = data.data() + data.size() - 12;
-    uint32_t major = read_be32(tail + 4);
-    uint32_t minor = read_be32(tail + 8);
-    EXPECT_EQ(major, kHFileMajorVersion);   // 3
-    EXPECT_EQ(minor, kHFileMinorVersion);   // 3
+    ASSERT_GE(data.size(), kTrailerFixedSize);
+    size_t trailer_off = data.size() - kTrailerFixedSize;
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(data.data() + trailer_off), 8), "TRABLK\"$");
+    uint32_t version = read_be32(data.data() + data.size() - kTrailerVersionSize);
+    EXPECT_EQ(version,
+              (static_cast<uint32_t>(kHFileMinorVersion) << 24) |
+              static_cast<uint32_t>(kHFileMajorVersion));
 
     fs::remove(path);
 }

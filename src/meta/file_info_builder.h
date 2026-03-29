@@ -2,6 +2,7 @@
 
 #include <hfile/types.h>
 #include <hfile/status.h>
+#include "hfile_file_info.pb.h"
 #include <map>
 #include <string>
 #include <vector>
@@ -81,24 +82,30 @@ public:
     }
 
     /// Serialize the FileInfo block into `out`.
-    /// Format: [numEntries(4B BE)] + sorted([keyLen(2B) + key + valueLen(4B) + value] …)
+    /// Format: [PBUF magic][delimited FileInfoProto]
     void finish(std::vector<uint8_t>& out) const {
-        size_t off = out.size();
-        // Reserve space for entry count (4B)
-        out.resize(off + 4);
+        static constexpr uint8_t kPBMagic[] = {'P','B','U','F'};
 
-        uint32_t count = 0;
+        pb::FileInfoProto proto;
         for (const auto& [k, v] : entries_) {
-            size_t entry_off = out.size();
-            out.resize(entry_off + 2 + k.size() + 4 + v.size());
-            uint8_t* p = out.data() + entry_off;
-            write_be16(p, static_cast<uint16_t>(k.size()));  p += 2;
-            std::memcpy(p, k.data(), k.size());               p += k.size();
-            write_be32(p, static_cast<uint32_t>(v.size()));   p += 4;
-            std::memcpy(p, v.data(), v.size());
-            ++count;
+            auto* entry = proto.add_map_entry();
+            entry->set_first(k);
+            entry->set_second(v.data(), v.size());
         }
-        write_be32(out.data() + off, count);
+
+        std::string pb_bytes;
+        proto.SerializeToString(&pb_bytes);
+        uint8_t varint_buf[10];
+        int varint_len = encode_varint64(varint_buf, pb_bytes.size());
+
+        size_t off = out.size();
+        out.resize(off + sizeof(kPBMagic) + static_cast<size_t>(varint_len) + pb_bytes.size());
+        uint8_t* p = out.data() + off;
+        std::memcpy(p, kPBMagic, sizeof(kPBMagic));
+        p += sizeof(kPBMagic);
+        std::memcpy(p, varint_buf, varint_len);
+        p += varint_len;
+        std::memcpy(p, pb_bytes.data(), pb_bytes.size());
     }
 
 private:

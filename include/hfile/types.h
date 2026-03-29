@@ -93,11 +93,77 @@ inline int decode_varint64(const uint8_t* src, uint64_t& out) noexcept {
     return -1;
 }
 
+inline int writable_vint_size(int64_t v) noexcept {
+    if (v >= -112 && v <= 127)
+        return 1;
+    int size = 1;
+    uint64_t x;
+    if (v < 0) {
+        x = static_cast<uint64_t>(~v);
+    } else {
+        x = static_cast<uint64_t>(v);
+    }
+    while (x != 0) {
+        x >>= 8;
+        ++size;
+    }
+    return size;
+}
+
+inline int encode_writable_vint(uint8_t* dst, int64_t v) noexcept {
+    if (v >= -112 && v <= 127) {
+        dst[0] = static_cast<uint8_t>(static_cast<int8_t>(v));
+        return 1;
+    }
+
+    int8_t prefix = -112;
+    uint64_t x;
+    if (v < 0) {
+        x = static_cast<uint64_t>(~v);
+        prefix = -120;
+    } else {
+        x = static_cast<uint64_t>(v);
+    }
+
+    uint64_t tmp = x;
+    while (tmp != 0) {
+        tmp >>= 8;
+        --prefix;
+    }
+
+    int total = 1 + (prefix < -120 ? -(prefix + 120) : -(prefix + 112));
+    dst[0] = static_cast<uint8_t>(prefix);
+    for (int i = 1; i < total; ++i) {
+        int shift = (total - i - 1) * 8;
+        dst[i] = static_cast<uint8_t>((x >> shift) & 0xFFu);
+    }
+    return total;
+}
+
+inline int decode_writable_vint(const uint8_t* src, int64_t& out) noexcept {
+    int8_t first = static_cast<int8_t>(src[0]);
+    if (first >= -112) {
+        out = first;
+        return 1;
+    }
+
+    int total = first < -120 ? -119 - first : -111 - first;
+    uint64_t value = 0;
+    for (int i = 1; i < total; ++i) {
+        value = (value << 8) | static_cast<uint64_t>(src[i]);
+    }
+    if (first < -120)
+        value = ~value;
+    out = static_cast<int64_t>(value);
+    return total;
+}
+
 // ─── HFile v3 Block-Type Magic Strings ───────────────────────────────────────
 
 inline constexpr size_t kBlockMagicSize = 8;
 
-inline constexpr std::array<uint8_t, 8> kDataBlockMagic   = {'D','A','T','A','B','L','K','2'};
+inline constexpr std::array<uint8_t, 8> kDataBlockMagic   = {'D','A','T','A','B','L','K','*'};
+inline constexpr std::array<uint8_t, 8> kEncodedDataBlockMagic = {'D','A','T','A','B','L','K','E'};
 inline constexpr std::array<uint8_t, 8> kLeafIndexMagic   = {'I','D','X','L','E','A','F','2'};
 inline constexpr std::array<uint8_t, 8> kRootIndexMagic   = {'I','D','X','R','O','O','T','2'};
 inline constexpr std::array<uint8_t, 8> kIntermedIdxMagic = {'I','D','X','I','N','T','E','2'};
@@ -105,6 +171,7 @@ inline constexpr std::array<uint8_t, 8> kMetaBlockMagic   = {'M','E','T','A','B'
 inline constexpr std::array<uint8_t, 8> kFileInfoMagic    = {'F','I','L','E','I','N','F','2'};
 inline constexpr std::array<uint8_t, 8> kBloomChunkMagic  = {'B','L','M','F','B','L','K','2'};
 inline constexpr std::array<uint8_t, 8> kBloomMetaMagic   = {'B','L','M','F','M','E','T','2'};
+inline constexpr std::array<uint8_t, 8> kTrailerBlockMagic = {'T','R','A','B','L','K','"','$'};
 
 // ─── Block Header size ────────────────────────────────────────────────────────
 // 8 (magic) + 4 (compSz) + 4 (uncompSz) + 8 (prevBlockOffset)
@@ -119,8 +186,8 @@ inline constexpr uint32_t kBytesPerChecksum   = 512;
 inline constexpr uint32_t kHFileMajorVersion = 3;
 inline constexpr uint32_t kHFileMinorVersion = 3;
 
-// Trailer tail size: PB-offset(4) + major(4) + minor(4)
-inline constexpr size_t kTrailerTailSize = 12;
+inline constexpr size_t kTrailerVersionSize = 4;
+inline constexpr size_t kTrailerFixedSize = 4096;
 
 // ─── Default block size ──────────────────────────────────────────────────────
 inline constexpr size_t kDefaultBlockSize = 64 * 1024;  // 64 KB
@@ -192,6 +259,7 @@ struct KeyValue {
     std::span<const uint8_t> tags{};
     // MVCC / MemstoreTS (always 0 for Bulk Load)
     uint64_t                 memstore_ts{0};
+    bool                     has_memstore_ts{false};
 
     /// Total serialized key length (HBase internal key format)
     uint32_t key_length() const noexcept {
@@ -201,13 +269,13 @@ struct KeyValue {
 
     /// Total serialized cell length on disk (v3 with tags + MVCC)
     size_t encoded_size() const noexcept {
-        uint8_t mvcc_buf[10];
-        int mvcc_len = encode_varint64(mvcc_buf, memstore_ts);
         return 4 + 4                          // keyLen + valueLen
              + key_length()                   // key
              + value.size()                   // value
              + 2 + tags.size()                // tagsLen + tags  (v3)
-             + static_cast<size_t>(mvcc_len); // MVCC varint
+             + (has_memstore_ts
+                    ? static_cast<size_t>(writable_vint_size(static_cast<int64_t>(memstore_ts)))
+                    : 0);                     // optional MVCC vint
     }
 };
 
@@ -221,6 +289,7 @@ struct OwnedKeyValue {
     std::vector<uint8_t> value;
     std::vector<uint8_t> tags;
     uint64_t             memstore_ts{0};
+    bool                 has_memstore_ts{false};
 
     KeyValue as_view() const noexcept {
         return KeyValue{
@@ -232,6 +301,7 @@ struct OwnedKeyValue {
             .value      = {value.data(),     value.size()},
             .tags       = {tags.data(),      tags.size()},
             .memstore_ts = memstore_ts,
+            .has_memstore_ts = has_memstore_ts,
         };
     }
 };

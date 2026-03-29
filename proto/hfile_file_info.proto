@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package hfile.pb;
+
+message BytesBytesPair {
+  bytes first = 1;
+  bytes second = 2;
+}
+
+message FileInfoProto {
+  repeated BytesBytesPair map_entry = 1;
+}

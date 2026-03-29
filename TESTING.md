@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-- 当前已纳入 `ctest` 的测试目标共 **24** 个
+- 当前已纳入 `ctest` 的测试目标共 **25** 个
 - 测试源码文件共 **22** 个（C++ 21 个 + Java JNI 集成测试 1 个）
-- 覆盖范围包含：编码、压缩、元数据、Writer、Arrow 转换、BulkLoad、基础 I/O、故障注入、Java JNI 端到端
+- 覆盖范围包含：编码、压缩、元数据、Writer、Arrow 转换、BulkLoad、基础 I/O、故障注入、Java JNI 端到端、HBase Reader 黑盒校验
 
 ## 运行方式
 
@@ -131,16 +131,17 @@ bash scripts/coverage.sh
 | 模块 | 已覆盖场景 | 对应用例 |
 |---|---|---|
 | HFileSDK Java JNI | `configure()` 非法 JSON、空路径错误、非法 row key rule、Java 生成 Arrow 文件并经 JNI 完成真实转换 | `test_java_jni_integration` |
+| HBase Reader 黑盒校验 | Java/JNI 生成固定 fixture，再用 HBase 原生 Reader 校验 major version、entry count、compression、encoding、row 顺序 | `test_java_hbase_reader_verify` |
 
 ## 当前边界
 
 - 当前文档中的“全覆盖”指当前 macOS 生效构建配置下，主要功能模块、关键异常路径和重要资源边界均已有自动化回归保护
 - 当前已接入 `llvm-cov` 报表流程，但这里仍不表示 100% 行覆盖率或分支覆盖率
 - `io_uring` 与 `HDFS` 后端属于条件编译路径，当前 macOS 构建未启用，因此未进入当前 `ctest` 矩阵
-- Java/JNI 端到端已纳入自动化测试，但当前验证重点仍是本地文件转换闭环，不包含 Java 侧 HBase 集群集成链路
+- Java/JNI 端到端与 HBase Reader 黑盒校验已纳入自动化测试，但当前仍不包含 Java 侧 HBase 集群集成链路
 
 ## 建议的后续增强
 
 - 在 Linux CI 中增加 `io_uring` 与 `HDFS` 条件矩阵
 - 将 `hfile_coverage` 纳入 CI 并保存 HTML 报表产物
-- 为 Java 侧补充基于 HBase Reader 的更强产物校验
+- 在 Linux CI 中补一组真实 HBase Scan / BulkLoad 集成验证

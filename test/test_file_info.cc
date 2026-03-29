@@ -25,12 +25,8 @@ TEST(FileInfoBuilder, AllMandatoryFields) {
     std::vector<uint8_t> out;
     fib.finish(out);
 
-    // Must have at least the count field (4B) + some entries
-    EXPECT_GE(out.size(), 4u);
-
-    // First 4 bytes = entry count (big-endian)
-    uint32_t count = read_be32(out.data());
-    EXPECT_GE(count, 9u);  // at least 9 mandatory fields
+    ASSERT_GE(out.size(), 5u);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
 }
 
 TEST(FileInfoBuilder, EncodingNames) {
@@ -49,7 +45,8 @@ TEST(FileInfoBuilder, EncodingNames) {
 
         std::vector<uint8_t> out;
         fib.finish(out);
-        EXPECT_GE(out.size(), 4u);
+        EXPECT_GE(out.size(), 5u);
+        EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
     }
 }
 

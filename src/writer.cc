@@ -82,6 +82,7 @@ static OwnedKeyValue sanitize_owned_kv(const KeyValue& kv, const WriterOptions& 
     if (opts.include_tags)
         out.tags.assign(kv.tags.begin(), kv.tags.end());
     out.memstore_ts = opts.include_mvcc ? kv.memstore_ts : 0;
+    out.has_memstore_ts = opts.include_mvcc && kv.memstore_ts > 0;
     return out;
 }
 
@@ -92,6 +93,17 @@ static size_t estimate_owned_kv_bytes(const OwnedKeyValue& kv) noexcept {
          + kv.qualifier.size()
          + kv.value.size()
          + kv.tags.size();
+}
+
+static uint32_t hbase_compression_codec(Compression c) noexcept {
+    switch (c) {
+        case Compression::None:   return 2;
+        case Compression::GZip:   return 1;
+        case Compression::Snappy: return 3;
+        case Compression::LZ4:    return 4;
+        case Compression::Zstd:   return 6;
+        default:                  return 2;
+    }
 }
 
 // ─── Internal implementation class ───────────────────────────────────────────
@@ -256,6 +268,9 @@ public:
         // Write root index block
         HFILE_RETURN_IF_ERROR(
             write_raw_block(kRootIndexMagic, {root_buf.data(), root_buf.size()}));
+        std::vector<uint8_t> empty_meta_root(16, 0);
+        HFILE_RETURN_IF_ERROR(
+            write_raw_block(kRootIndexMagic, {empty_meta_root.data(), empty_meta_root.size()}));
 
         // 2. Bloom filter meta blocks
         std::vector<uint8_t> bloom_meta_buf;
@@ -304,15 +319,7 @@ private:
         auto raw = encoder_->finish_block();
         if (raw.empty()) { encoder_->reset(); return Status::OK(); }
 
-        // Register in block index
         int64_t block_offset = writer_->position();
-        if (first_data_block_offset_ < 0)
-            first_data_block_offset_ = block_offset;
-        last_data_block_offset_ = block_offset;
-
-        index_writer_.add_entry(encoder_->first_key(),
-                                 block_offset,
-                                 static_cast<int32_t>(raw.size()));
 
         // Notify bloom filter of chunk boundary
         bloom_->finish_chunk();
@@ -327,7 +334,7 @@ private:
         if (opts_.compression == Compression::None) compressed = raw;
 
         HFILE_RETURN_IF_ERROR(
-            write_data_block(raw.size(), compressed));
+            write_data_block(raw.size(), compressed, encoder_->first_key(), block_offset));
 
         total_uncompressed_bytes_ += raw.size();
         ++data_block_count_;
@@ -342,30 +349,47 @@ private:
 
     // ── Write a data block with header + checksums ─────────────────────────────
     Status write_data_block(size_t uncompressed_size,
-                             std::span<const uint8_t> compressed_data) {
-        // Compute checksums for the compressed data
-        size_t n_chunks = (compressed_data.size() + opts_.bytes_per_checksum - 1)
+                             std::span<const uint8_t> compressed_data,
+                             std::span<const uint8_t> first_key,
+                             int64_t block_offset) {
+        uint32_t on_disk_data_with_header =
+            static_cast<uint32_t>(kBlockHeaderSize + compressed_data.size());
+        size_t n_chunks = (on_disk_data_with_header + opts_.bytes_per_checksum - 1)
                           / opts_.bytes_per_checksum;
         std::vector<uint8_t> checksum_buf(n_chunks * 4);
-        checksum::compute_hfile_checksums(
-            compressed_data.data(), compressed_data.size(),
-            opts_.bytes_per_checksum, checksum_buf.data());
 
         // Build block header (33 bytes)
         uint8_t hdr[kBlockHeaderSize];
         uint8_t* p = hdr;
-        std::memcpy(p, kDataBlockMagic.data(), 8); p += 8;
-        // Compressed size = data + checksums (on-disk)
-        uint32_t on_disk_data_sz = static_cast<uint32_t>(
+        const auto& magic = opts_.data_block_encoding == Encoding::None
+            ? kDataBlockMagic
+            : kEncodedDataBlockMagic;
+        std::memcpy(p, magic.data(), 8); p += 8;
+        uint32_t on_disk_size_without_header = static_cast<uint32_t>(
             compressed_data.size() + checksum_buf.size());
-        write_be32(p, static_cast<uint32_t>(compressed_data.size())); p += 4;  // compSz
+        write_be32(p, on_disk_size_without_header);                    p += 4;
         write_be32(p, static_cast<uint32_t>(uncompressed_size));       p += 4;  // uncompSz
         write_be64(p, static_cast<uint64_t>(prev_block_offset_));      p += 8;  // prevOffset
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, opts_.bytes_per_checksum);                        p += 4;
-        write_be32(p, on_disk_data_sz);                                 p += 4;
+        write_be32(p, on_disk_data_with_header);                        p += 4;
+
+        std::vector<uint8_t> checksummed_block;
+        checksummed_block.reserve(kBlockHeaderSize + compressed_data.size());
+        checksummed_block.insert(checksummed_block.end(), hdr, hdr + kBlockHeaderSize);
+        checksummed_block.insert(checksummed_block.end(),
+                                 compressed_data.begin(), compressed_data.end());
+        checksum::compute_hfile_checksums(
+            checksummed_block.data(), checksummed_block.size(),
+            opts_.bytes_per_checksum, checksum_buf.data());
 
         prev_block_offset_ = writer_->position();
+        if (first_data_block_offset_ < 0)
+            first_data_block_offset_ = block_offset;
+        last_data_block_offset_ = block_offset;
+        index_writer_.add_entry(first_key,
+                                block_offset,
+                                static_cast<int32_t>(kBlockHeaderSize + on_disk_size_without_header));
 
         HFILE_RETURN_IF_ERROR(writer_->write({hdr, kBlockHeaderSize}));
         HFILE_RETURN_IF_ERROR(writer_->write(compressed_data));
@@ -376,19 +400,35 @@ private:
     // ── Write any raw block (index, meta, etc.) with header ───────────────────
     Status write_raw_block(const std::array<uint8_t, 8>& magic,
                             std::span<const uint8_t> data) {
+        uint32_t on_disk_data_with_header =
+            static_cast<uint32_t>(kBlockHeaderSize + data.size());
+        size_t n_chunks = (on_disk_data_with_header + opts_.bytes_per_checksum - 1)
+                        / opts_.bytes_per_checksum;
+        std::vector<uint8_t> checksum_buf(n_chunks * 4);
+
         uint8_t hdr[kBlockHeaderSize];
         uint8_t* p = hdr;
         std::memcpy(p, magic.data(), 8); p += 8;
-        write_be32(p, static_cast<uint32_t>(data.size())); p += 4;
+        uint32_t on_disk_size_without_header = static_cast<uint32_t>(data.size() + checksum_buf.size());
+        write_be32(p, on_disk_size_without_header); p += 4;
         write_be32(p, static_cast<uint32_t>(data.size())); p += 4;
         write_be64(p, static_cast<uint64_t>(prev_block_offset_)); p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, opts_.bytes_per_checksum); p += 4;
-        write_be32(p, static_cast<uint32_t>(data.size())); p += 4;
+        write_be32(p, on_disk_data_with_header); p += 4;
+
+        std::vector<uint8_t> checksummed_block;
+        checksummed_block.reserve(kBlockHeaderSize + data.size());
+        checksummed_block.insert(checksummed_block.end(), hdr, hdr + kBlockHeaderSize);
+        checksummed_block.insert(checksummed_block.end(), data.begin(), data.end());
+        checksum::compute_hfile_checksums(
+            checksummed_block.data(), checksummed_block.size(),
+            opts_.bytes_per_checksum, checksum_buf.data());
 
         prev_block_offset_ = writer_->position();
         HFILE_RETURN_IF_ERROR(writer_->write({hdr, kBlockHeaderSize}));
         HFILE_RETURN_IF_ERROR(writer_->write(data));
+        HFILE_RETURN_IF_ERROR(writer_->write({checksum_buf.data(), checksum_buf.size()}));
         return Status::OK();
     }
 
@@ -403,8 +443,10 @@ private:
         fib.set_avg_value_len(entry_count_ > 0
             ? static_cast<uint32_t>(total_value_bytes_ / entry_count_) : 0);
         fib.set_max_tags_len(max_tags_len_);
-        fib.set_key_value_version(1);      // includes MemstoreTS
-        fib.set_max_memstore_ts(max_memstore_ts_);
+        if (has_mvcc_cells_) {
+            fib.set_key_value_version(1);
+            fib.set_max_memstore_ts(max_memstore_ts_);
+        }
         fib.set_comparator(opts_.comparator);
         fib.set_data_block_encoding(opts_.data_block_encoding);
         fib.set_create_time();
@@ -436,7 +478,7 @@ private:
             last_data_block_offset_ >= 0
                 ? static_cast<uint64_t>(last_data_block_offset_) : 0);
         tb.set_comparator_class_name(opts_.comparator);
-        tb.set_compression_codec(static_cast<uint32_t>(opts_.compression));
+        tb.set_compression_codec(hbase_compression_codec(opts_.compression));
 
         std::vector<uint8_t> trailer_bytes;
         HFILE_RETURN_IF_ERROR(tb.finish(trailer_bytes));
@@ -468,9 +510,13 @@ private:
         total_value_bytes_ += vl;
         max_tags_len_ = std::max(max_tags_len_,
                                  static_cast<uint32_t>(kv.tags.size()));
-        max_memstore_ts_ = std::max<uint64_t>(max_memstore_ts_, kv.memstore_ts);
-        uint8_t mvcc_buf[10];
-        int mvcc_len = encode_varint64(mvcc_buf, kv.memstore_ts);
+        if (kv.has_memstore_ts) {
+            has_mvcc_cells_ = true;
+            max_memstore_ts_ = std::max<uint64_t>(max_memstore_ts_, kv.memstore_ts);
+        }
+        int mvcc_len = kv.has_memstore_ts
+            ? writable_vint_size(static_cast<int64_t>(kv.memstore_ts))
+            : 0;
         size_t cell_size = 4 + 4 + kl + kv.value.size() + 2 + kv.tags.size()
                          + static_cast<size_t>(mvcc_len);
         max_cell_size_ = std::max(max_cell_size_, cell_size);
@@ -584,6 +630,7 @@ private:
     uint32_t data_block_count_       = 0;
     uint32_t max_tags_len_           = 0;
     uint64_t max_memstore_ts_        = 0;
+    bool     has_mvcc_cells_         = false;
     size_t   max_cell_size_          = 0;
     int64_t  first_data_block_offset_ = -1;
     int64_t  last_data_block_offset_  = -1;

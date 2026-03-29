@@ -15,10 +15,10 @@ namespace meta {
 /// Builds and serializes the HFile v3 Trailer.
 ///
 /// Layout at file tail:
-///   [ProtoBuf bytes of FileTrailerProto]       (variable)
-///   [protobuf_start_offset: uint32 BE]         (4 bytes)
-///   [major_version: uint32 BE = 3]             (4 bytes)
-///   [minor_version: uint32 BE = 3]             (4 bytes)
+///   [TRABLK"$]                                 (8 bytes)
+///   [delimited FileTrailerProto]               (variable)
+///   [zero padding]                             (to fixed size - 4)
+///   [version: uint32 LE-like materialized int] (4 bytes)
 class TrailerBuilder {
 public:
     TrailerBuilder() = default;
@@ -37,29 +37,34 @@ public:
     void set_compression_codec(uint32_t v)             { proto_.set_compression_codec(v); }
 
     /// Serialize trailer and append to `out`.
-    /// Must be called after all other data is written; `file_size_before_trailer`
-    /// is the current file position (== total bytes before this call).
     Status finish(std::vector<uint8_t>& out) const {
         std::string pb_bytes;
         if (!proto_.SerializeToString(&pb_bytes))
             return Status::Internal("Failed to serialize FileTrailerProto");
 
-        size_t pb_size = pb_bytes.size();
-        size_t off     = out.size();
+        uint8_t delimited_prefix[10];
+        int prefix_len = encode_varint64(delimited_prefix, pb_bytes.size());
+        size_t payload_size = kBlockMagicSize + static_cast<size_t>(prefix_len)
+                            + pb_bytes.size() + kTrailerVersionSize;
+        if (payload_size > kTrailerFixedSize) {
+            return Status::Internal("Trailer exceeds fixed HBase trailer size");
+        }
 
-        // PB bytes + 4 (pb_offset) + 4 (major) + 4 (minor)
-        out.resize(off + pb_size + kTrailerTailSize);
+        size_t off = out.size();
+        out.resize(off + kTrailerFixedSize, 0);
         uint8_t* p = out.data() + off;
 
-        std::memcpy(p, pb_bytes.data(), pb_size);
-        p += pb_size;
+        std::memcpy(p, kTrailerBlockMagic.data(), kTrailerBlockMagic.size());
+        p += kTrailerBlockMagic.size();
+        std::memcpy(p, delimited_prefix, prefix_len);
+        p += prefix_len;
+        std::memcpy(p, pb_bytes.data(), pb_bytes.size());
 
-        // protobuf_start_offset: offset from end of file to start of PB
-        // = pb_size + 12  (includes the 12 fixed tail bytes)
-        uint32_t pb_offset = static_cast<uint32_t>(pb_size + kTrailerTailSize);
-        write_be32(p, pb_offset);       p += 4;
-        write_be32(p, kHFileMajorVersion); p += 4;
-        write_be32(p, kHFileMinorVersion); p += 4;
+        uint32_t materialized_version =
+            (static_cast<uint32_t>(kHFileMinorVersion) << 24) |
+            (static_cast<uint32_t>(kHFileMajorVersion) & 0x00FFFFFFu);
+        write_be32(out.data() + off + kTrailerFixedSize - kTrailerVersionSize,
+                   materialized_version);
 
         return Status::OK();
     }

@@ -14,6 +14,25 @@ static IndexWriteResult finish_simple(BlockIndexWriter& w,
     return w.finish(0, intermed, root_out);
 }
 
+struct ParsedRootEntry {
+    int64_t offset;
+    uint32_t data_size;
+    std::string key;
+    size_t bytes;
+};
+
+static ParsedRootEntry parse_root_entry(const std::vector<uint8_t>& root, size_t off) {
+    ParsedRootEntry out;
+    out.offset = static_cast<int64_t>(read_be64(root.data() + off));
+    out.data_size = read_be32(root.data() + off + 8);
+    int64_t key_len = 0;
+    int vint_size = decode_writable_vint(root.data() + off + 12, key_len);
+    out.key.assign(reinterpret_cast<const char*>(root.data() + off + 12 + vint_size),
+                   static_cast<size_t>(key_len));
+    out.bytes = 12 + static_cast<size_t>(vint_size) + static_cast<size_t>(key_len);
+    return out;
+}
+
 // ─── 1-level (inline root) ────────────────────────────────────────────────────
 
 TEST(BlockIndexWriter, EmptyOneLevel) {
@@ -22,9 +41,7 @@ TEST(BlockIndexWriter, EmptyOneLevel) {
     auto r = finish_simple(w, root);
     EXPECT_EQ(r.num_root_entries, 0u);
     EXPECT_EQ(r.num_levels, 1);
-    // root payload = count(4B) only
-    EXPECT_EQ(root.size(), 4u);
-    EXPECT_EQ(read_be32(root.data()), 0u);
+    EXPECT_TRUE(root.empty());
 }
 
 TEST(BlockIndexWriter, SingleEntryOneLevel) {
@@ -37,13 +54,11 @@ TEST(BlockIndexWriter, SingleEntryOneLevel) {
     EXPECT_EQ(r.num_root_entries, 1u);
     EXPECT_EQ(r.num_levels, 1);
 
-    // count(4) + offset(8) + dataSize(4) + keyLen(4) + key(4)
-    EXPECT_EQ(root.size(), 4u + 8u + 4u + 4u + 4u);
-    EXPECT_EQ(read_be32(root.data()), 1u);
-    EXPECT_EQ(static_cast<int64_t>(read_be64(root.data() + 4)), 33);
-    EXPECT_EQ(read_be32(root.data() + 12), 65536u);
-    EXPECT_EQ(read_be32(root.data() + 16), 4u);
-    EXPECT_EQ(std::memcmp(root.data() + 20, key, 4), 0);
+    auto entry = parse_root_entry(root, 0);
+    EXPECT_EQ(entry.offset, 33);
+    EXPECT_EQ(entry.data_size, 65536u);
+    EXPECT_EQ(entry.key, "row1");
+    EXPECT_EQ(root.size(), entry.bytes);
 }
 
 TEST(BlockIndexWriter, BelowThresholdIsOneLevel) {
@@ -57,7 +72,14 @@ TEST(BlockIndexWriter, BelowThresholdIsOneLevel) {
     auto r = finish_simple(w, root);
     EXPECT_EQ(r.num_levels, 1);
     EXPECT_EQ(r.num_root_entries, 100u);
-    EXPECT_EQ(read_be32(root.data()), 100u);
+    size_t off = 0;
+    for (int i = 0; i < 100; ++i) {
+        auto entry = parse_root_entry(root, off);
+        EXPECT_EQ(entry.offset, static_cast<int64_t>(i * 65536));
+        EXPECT_EQ(entry.data_size, 65536u);
+        off += entry.bytes;
+    }
+    EXPECT_EQ(off, root.size());
 }
 
 // ─── 2-level (intermediate + root) ───────────────────────────────────────────
@@ -83,8 +105,12 @@ TEST(BlockIndexWriter, ExceedsThresholdIsTwoLevel) {
     // Intermediate buffer must be non-empty
     EXPECT_GT(intermed.size(), 0u);
 
-    // Root has exactly 3 entries
-    EXPECT_EQ(read_be32(root.data()), 3u);
+    auto entry0 = parse_root_entry(root, 0);
+    auto entry1 = parse_root_entry(root, entry0.bytes);
+    auto entry2 = parse_root_entry(root, entry0.bytes + entry1.bytes);
+    EXPECT_EQ(entry0.key, "row0");
+    EXPECT_EQ(entry1.key, "row10");
+    EXPECT_EQ(entry2.key, "row20");
 
     // First intermediate block should start with IDXINTE2 magic
     EXPECT_EQ(std::memcmp(intermed.data(),
@@ -110,20 +136,20 @@ TEST(BlockIndexWriter, TwoLevelIntermediateOffsets) {
     EXPECT_EQ(r.num_levels, 2);
     EXPECT_EQ(r.num_root_entries, 2u);  // ceil(8/4) = 2 blocks
 
-    // First root entry should point to intermed_start
-    // Root payload: count(4) + [offset(8)+dataSize(4)+keyLen(4)+key...] ...
-    EXPECT_EQ(read_be32(root.data()), 2u);
-    int64_t first_root_offset = static_cast<int64_t>(read_be64(root.data() + 4));
-    EXPECT_EQ(first_root_offset, intermed_start);
+    auto entry0 = parse_root_entry(root, 0);
+    auto entry1 = parse_root_entry(root, entry0.bytes);
+    EXPECT_EQ(entry0.offset, intermed_start);
 
-    // Second root entry should point to intermed_start + size_of_first_block
-    // First intermediate block: header(33) + count(4) + 4*(8+4+4+4) = 33+4+80 = 117
-    // (key = 4 bytes each)
-    uint32_t first_block_size = read_be32(root.data() + 4 + 8); // dataSize field
-    int64_t second_offset = static_cast<int64_t>(
-        read_be64(root.data() + 4 + (8 + 4 + 4 + 4)));          // second entry offset
-    EXPECT_EQ(second_offset, intermed_start + static_cast<int64_t>(first_block_size));
-    (void)first_block_size;
+    uint32_t first_block_size = entry0.data_size;
+    EXPECT_EQ(entry1.offset, intermed_start + static_cast<int64_t>(first_block_size));
+
+    const uint8_t* payload = intermed.data() + kBlockHeaderSize;
+    EXPECT_EQ(read_be32(payload), 4u);
+    EXPECT_EQ(read_be32(payload + 4), 0u);
+    EXPECT_EQ(read_be32(payload + 8), 16u);
+    EXPECT_EQ(read_be32(payload + 12), 32u);
+    EXPECT_EQ(read_be32(payload + 16), 48u);
+    EXPECT_EQ(read_be32(payload + 20), 64u);
 }
 
 TEST(BlockIndexWriter, TwoLevelFirstKeysCorrect) {
@@ -142,15 +168,8 @@ TEST(BlockIndexWriter, TwoLevelFirstKeysCorrect) {
     EXPECT_EQ(r.num_levels, 2);
     EXPECT_EQ(r.num_root_entries, 2u);
 
-    // Root entry 0's first key must be "aaa" (first key of block 0)
-    // Root layout: count(4) + entry0[offset(8)+dataSize(4)+keyLen(4)+key(3)] + entry1[...]
-    uint32_t key0_len = read_be32(root.data() + 4 + 8 + 4);
-    EXPECT_EQ(key0_len, 3u);
-    EXPECT_EQ(std::memcmp(root.data() + 4 + 8 + 4 + 4, "aaa", 3), 0);
-
-    // Root entry 1's first key must be "ddd" (first key of block 1)
-    size_t e0_size = 8 + 4 + 4 + key0_len;
-    uint32_t key1_len = read_be32(root.data() + 4 + e0_size + 8 + 4);
-    EXPECT_EQ(key1_len, 3u);
-    EXPECT_EQ(std::memcmp(root.data() + 4 + e0_size + 8 + 4 + 4, "ddd", 3), 0);
+    auto entry0 = parse_root_entry(root, 0);
+    auto entry1 = parse_root_entry(root, entry0.bytes);
+    EXPECT_EQ(entry0.key, "aaa");
+    EXPECT_EQ(entry1.key, "ddd");
 }

@@ -26,6 +26,14 @@ import java.util.List;
  */
 public class HFileVerifier {
 
+    private static final class Expectations {
+        Integer majorVersion;
+        Long entryCount;
+        String compression;
+        String encoding;
+        List<String> rows = List.of();
+    }
+
     private int totalFiles   = 0;
     private int passedFiles  = 0;
     private int failedFiles  = 0;
@@ -41,6 +49,16 @@ public class HFileVerifier {
             .desc("Print each KV").build());
         opts.addOption(Option.builder().longOpt("max-kvs")
             .hasArg().desc("Max KVs to scan per file (default: unlimited)").build());
+        opts.addOption(Option.builder().longOpt("expect-major-version")
+            .hasArg().desc("Expected HFile major version").build());
+        opts.addOption(Option.builder().longOpt("expect-entry-count")
+            .hasArg().desc("Expected HFile entry count").build());
+        opts.addOption(Option.builder().longOpt("expect-compression")
+            .hasArg().desc("Expected compression name").build());
+        opts.addOption(Option.builder().longOpt("expect-encoding")
+            .hasArg().desc("Expected data block encoding name").build());
+        opts.addOption(Option.builder().longOpt("expect-rows")
+            .hasArg().desc("Comma-separated expected row sequence").build());
 
         CommandLineParser parser = new DefaultParser();
         CommandLine cmd;
@@ -57,6 +75,7 @@ public class HFileVerifier {
         long maxKVs = cmd.hasOption("max-kvs")
             ? Long.parseLong(cmd.getOptionValue("max-kvs"))
             : Long.MAX_VALUE;
+        Expectations expectations = parseExpectations(cmd);
 
         List<File> files = new ArrayList<>();
 
@@ -83,7 +102,7 @@ public class HFileVerifier {
 
         HFileVerifier verifier = new HFileVerifier();
         for (File f : files) {
-            verifier.verifyFile(f, verbose, maxKVs);
+            verifier.verifyFile(f, verbose, maxKVs, expectations);
         }
 
         System.out.printf("\n=== Summary ===%n");
@@ -107,7 +126,28 @@ public class HFileVerifier {
         }
     }
 
-    private void verifyFile(File file, boolean verbose, long maxKVs) {
+    private static Expectations parseExpectations(CommandLine cmd) {
+        Expectations expectations = new Expectations();
+        if (cmd.hasOption("expect-major-version")) {
+            expectations.majorVersion = Integer.parseInt(cmd.getOptionValue("expect-major-version"));
+        }
+        if (cmd.hasOption("expect-entry-count")) {
+            expectations.entryCount = Long.parseLong(cmd.getOptionValue("expect-entry-count"));
+        }
+        if (cmd.hasOption("expect-compression")) {
+            expectations.compression = cmd.getOptionValue("expect-compression");
+        }
+        if (cmd.hasOption("expect-encoding")) {
+            expectations.encoding = cmd.getOptionValue("expect-encoding");
+        }
+        if (cmd.hasOption("expect-rows")) {
+            String raw = cmd.getOptionValue("expect-rows").trim();
+            expectations.rows = raw.isEmpty() ? List.of() : Arrays.asList(raw.split(",", -1));
+        }
+        return expectations;
+    }
+
+    private void verifyFile(File file, boolean verbose, long maxKVs, Expectations expectations) {
         ++totalFiles;
         System.out.printf("Verifying: %s%n", file.getAbsolutePath());
 
@@ -140,23 +180,52 @@ public class HFileVerifier {
                     "Expected HFile v3, got v" +
                     reader.getTrailer().getMajorVersion());
             }
+            if (expectations.majorVersion != null &&
+                reader.getTrailer().getMajorVersion() != expectations.majorVersion) {
+                throw new RuntimeException(
+                    "Expected major version " + expectations.majorVersion +
+                    ", got " + reader.getTrailer().getMajorVersion());
+            }
+            if (expectations.entryCount != null &&
+                reader.getEntries() != expectations.entryCount) {
+                throw new RuntimeException(
+                    "Expected entry count " + expectations.entryCount +
+                    ", got " + reader.getEntries());
+            }
+            if (expectations.compression != null &&
+                !ctx.getCompression().name().equalsIgnoreCase(expectations.compression)) {
+                throw new RuntimeException(
+                    "Expected compression " + expectations.compression +
+                    ", got " + ctx.getCompression().name());
+            }
+            if (expectations.encoding != null &&
+                !ctx.getDataBlockEncoding().name().equalsIgnoreCase(expectations.encoding)) {
+                throw new RuntimeException(
+                    "Expected encoding " + expectations.encoding +
+                    ", got " + ctx.getDataBlockEncoding().name());
+            }
 
             // ── Validate FileInfo mandatory fields ─────────────────────────
             validateFileInfo(reader);
 
             // ── Scan all KVs and check sort order ─────────────────────────
             HFileScanner scanner = reader.getScanner(conf, false, false);
-            scanner.seekTo();
+            boolean seekResult = scanner.seekTo();
+            if (!seekResult) {
+                throw new RuntimeException("Failed to seek to first cell");
+            }
 
             Cell prevCell = null;
             long kvCount  = 0;
             boolean sortOk = true;
+            List<String> actualRows = new ArrayList<>();
 
-            while (scanner.next() && kvCount < maxKVs) {
+            do {
                 Cell cell = scanner.getCell();
+                if (cell == null) break;
 
                 if (prevCell != null) {
-                    int cmp = CellUtil.CELL_COMPARATOR.compare(prevCell, cell);
+                    int cmp = org.apache.hadoop.hbase.CellComparator.getInstance().compare(prevCell, cell);
                     if (cmp >= 0) {
                         System.err.printf(
                             "  SORT ERROR at KV %d: %s >= %s%n",
@@ -166,6 +235,7 @@ public class HFileVerifier {
                         sortOk = false;
                     }
                 }
+                actualRows.add(Bytes.toString(CellUtil.cloneRow(cell)));
 
                 if (verbose && kvCount < 20) {
                     System.out.printf(
@@ -182,11 +252,17 @@ public class HFileVerifier {
                 prevCell = cell;
                 ++kvCount;
                 ++totalKVs;
-            }
+                if (kvCount >= maxKVs) break;
+            } while (scanner.next());
 
             reader.close();
 
             if (!sortOk) throw new RuntimeException("Sort order violation detected");
+            if (!expectations.rows.isEmpty() && !actualRows.equals(expectations.rows)) {
+                throw new RuntimeException(
+                    "Row sequence mismatch: expected=" + expectations.rows +
+                    ", actual=" + actualRows);
+            }
 
             System.out.printf("  KVs scanned     : %,d%n", kvCount);
             System.out.println("  Result          : PASS");

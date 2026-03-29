@@ -2,6 +2,7 @@
 
 #include <hfile/types.h>
 #include <hfile/status.h>
+#include "checksum/crc32c.h"
 #include <vector>
 #include <span>
 #include <cstdint>
@@ -153,18 +154,25 @@ private:
         // HFile block header (33 bytes) + chunk_data
         // Magic: BLMFBLK2
         size_t off = out.size();
-        out.resize(off + kBlockHeaderSize + chunk_data.size());
+        size_t on_disk_data_with_header = kBlockHeaderSize + chunk_data.size();
+        size_t n_chunks = (on_disk_data_with_header + kBytesPerChecksum - 1) / kBytesPerChecksum;
+        std::vector<uint8_t> checksum_buf(n_chunks * 4);
+        out.resize(off + kBlockHeaderSize + chunk_data.size() + checksum_buf.size());
         uint8_t* p = out.data() + off;
 
         std::memcpy(p, kBloomChunkMagic.data(), 8); p += 8;
-        write_be32(p, static_cast<uint32_t>(chunk_data.size()));  p += 4; // compSz
+        write_be32(p, static_cast<uint32_t>(chunk_data.size() + checksum_buf.size())); p += 4;
         write_be32(p, static_cast<uint32_t>(chunk_data.size()));  p += 4; // uncompSz
         write_be64(p, 0);                                          p += 8; // prevOffset
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, kBytesPerChecksum); p += 4;
-        write_be32(p, static_cast<uint32_t>(chunk_data.size()));  p += 4; // onDiskDataSize
+        write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
 
         std::memcpy(p, chunk_data.data(), chunk_data.size());
+        checksum::compute_hfile_checksums(
+            out.data() + off, kBlockHeaderSize + chunk_data.size(), kBytesPerChecksum, checksum_buf.data());
+        std::memcpy(out.data() + off + kBlockHeaderSize + chunk_data.size(),
+                    checksum_buf.data(), checksum_buf.size());
     }
 
     void write_bloom_meta_block(std::vector<uint8_t>& out) {
@@ -175,17 +183,20 @@ private:
         size_t off = out.size();
         size_t data_size = 1 + 4 + 8 + 8 + 4 + 1
                          + chunks_.size() * (8 + 4);
-        out.resize(off + kBlockHeaderSize + data_size);
+        size_t on_disk_data_with_header = kBlockHeaderSize + data_size;
+        size_t n_chunks = (on_disk_data_with_header + kBytesPerChecksum - 1) / kBytesPerChecksum;
+        std::vector<uint8_t> checksum_buf(n_chunks * 4);
+        out.resize(off + kBlockHeaderSize + data_size + checksum_buf.size());
         uint8_t* p = out.data() + off;
 
         // Block header — BLMFMET2
         std::memcpy(p, kBloomMetaMagic.data(), 8); p += 8;
-        write_be32(p, static_cast<uint32_t>(data_size)); p += 4;
+        write_be32(p, static_cast<uint32_t>(data_size + checksum_buf.size())); p += 4;
         write_be32(p, static_cast<uint32_t>(data_size)); p += 4;
         write_be64(p, 0);                                 p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, kBytesPerChecksum); p += 4;
-        write_be32(p, static_cast<uint32_t>(data_size)); p += 4;
+        write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
 
         // Bloom meta data
         *p++ = 3;  // version 3
@@ -211,6 +222,13 @@ private:
             write_be32(p, static_cast<uint32_t>(chunks_[i].size())); p += 4;
             (void)chunk_offset_idx;
         }
+        checksum::compute_hfile_checksums(
+            out.data() + off,
+            kBlockHeaderSize + data_size,
+            kBytesPerChecksum,
+            checksum_buf.data());
+        std::memcpy(out.data() + off + kBlockHeaderSize + data_size,
+                    checksum_buf.data(), checksum_buf.size());
     }
 
     BloomType              type_;

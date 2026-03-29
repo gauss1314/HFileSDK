@@ -47,8 +47,8 @@ inline size_t serialize_kv(const KeyValue& kv, uint8_t* dst) noexcept {
         std::memcpy(p, kv.tags.data(), kv.tags.size()); p += kv.tags.size();
     }
 
-    // MVCC / MemstoreTS (VarInt, typically 0)
-    p += encode_varint64(p, kv.memstore_ts);
+    if (kv.has_memstore_ts)
+        p += encode_writable_vint(p, static_cast<int64_t>(kv.memstore_ts));
 
     return static_cast<size_t>(p - dst);
 }

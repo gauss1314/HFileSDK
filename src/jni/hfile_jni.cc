@@ -201,7 +201,8 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject /*obj*/, jstring j_config
             "data_block_encoding",
             "fsync_policy",
             "error_policy",
-            "bloom_type"
+            "bloom_type",
+            "include_mvcc"
         };
         for (const auto& [key, _] : cfg) {
             if (!kAllowedKeys.count(key))
@@ -254,6 +255,11 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject /*obj*/, jstring j_config
             else if (*bt == "row")      g_writer_opts.bloom_type = hfile::BloomType::Row;
             else if (*bt == "rowcol")   g_writer_opts.bloom_type = hfile::BloomType::RowCol;
             else return hfile::ErrorCode::INVALID_ARGUMENT;
+        }
+
+        if (auto mvcc = hfile::jni::config_int(cfg, "include_mvcc")) {
+            if (*mvcc != 0 && *mvcc != 1) return hfile::ErrorCode::INVALID_ARGUMENT;
+            g_writer_opts.include_mvcc = (*mvcc != 0);
         }
 
         return 0;
