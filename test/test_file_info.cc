@@ -23,6 +23,7 @@ TEST(FileInfoBuilder, AllMandatoryFields) {
     fib.set_len_of_biggest_cell(10240);
 
     std::vector<uint8_t> out;
+    ASSERT_TRUE(fib.validate_required_fields().ok());
     fib.finish(out);
 
     ASSERT_GE(out.size(), 5u);
@@ -42,8 +43,10 @@ TEST(FileInfoBuilder, EncodingNames) {
         fib.set_comparator(kCellComparator);
         fib.set_data_block_encoding(enc);
         fib.set_create_time();
+        fib.set_len_of_biggest_cell(0);
 
         std::vector<uint8_t> out;
+        ASSERT_TRUE(fib.validate_required_fields().ok());
         fib.finish(out);
         EXPECT_GE(out.size(), 5u);
         EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
@@ -61,12 +64,24 @@ TEST(FileInfoBuilder, ComparatorString) {
     fib.set_max_memstore_ts(0);
     fib.set_data_block_encoding(Encoding::None);
     fib.set_create_time();
+    fib.set_len_of_biggest_cell(0);
 
     std::vector<uint8_t> out;
+    ASSERT_TRUE(fib.validate_required_fields().ok());
     fib.finish(out);
 
     // The comparator string should appear somewhere in the serialized bytes
     std::string expected = std::string(kCellComparator);
     std::string haystack(out.begin(), out.end());
     EXPECT_NE(haystack.find("CellComparatorImpl"), std::string::npos);
+}
+
+TEST(FileInfoBuilder, RejectsMissingMandatoryFields) {
+    FileInfoBuilder fib;
+    fib.set_last_key({});
+    fib.set_avg_key_len(0);
+    fib.set_avg_value_len(0);
+    auto s = fib.validate_required_fields();
+    EXPECT_FALSE(s.ok());
+    EXPECT_NE(s.message().find("mandatory field"), std::string::npos);
 }

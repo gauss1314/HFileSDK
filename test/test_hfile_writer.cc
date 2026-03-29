@@ -280,8 +280,34 @@ TEST(HFileWriter, FileInfoContainsMandatoryFields) {
     EXPECT_NE(content.find("hfile.AVG_KEY_LEN"),       std::string::npos);
     EXPECT_NE(content.find("hfile.AVG_VALUE_LEN"),     std::string::npos);
     EXPECT_NE(content.find("hfile.MAX_TAGS_LEN"),      std::string::npos);
+    EXPECT_NE(content.find("hfile.KEY_VALUE_VERSION"), std::string::npos);
+    EXPECT_NE(content.find("hfile.MAX_MEMSTORE_TS_KEY"), std::string::npos);
     EXPECT_NE(content.find("hfile.COMPARATOR"),        std::string::npos);
     EXPECT_NE(content.find("hfile.DATA_BLOCK_ENCODING"), std::string::npos);
+    EXPECT_NE(content.find("hfile.CREATE_TIME_TS"), std::string::npos);
+    EXPECT_NE(content.find("hfile.LEN_OF_BIGGEST_CELL"), std::string::npos);
+
+    fs::remove(path);
+}
+
+TEST(HFileWriter, AppendAfterFinishRejected) {
+    auto path = tmp_path("append_after_finish");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    ASSERT_TRUE(w->append(make_kv(rk, fam, q, v, "r001", "col", 1000, "val")).ok());
+    ASSERT_TRUE(w->finish().ok());
+
+    auto append_status = w->append(make_kv(rk, fam, q, v, "r002", "col", 1001, "val2"));
+    EXPECT_FALSE(append_status.ok());
+    EXPECT_NE(append_status.message().find("after finish"), std::string::npos);
 
     fs::remove(path);
 }

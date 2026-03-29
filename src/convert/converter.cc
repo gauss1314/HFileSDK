@@ -192,7 +192,9 @@ static std::vector<uint8_t> scalar_to_bytes(const arrow::Array& arr, int64_t row
         return put64(bits);
     }
     case T::TIMESTAMP: {
-        int64_t v = static_cast<const arrow::Int64Array&>(arr).Value(row);
+        auto& ta = static_cast<const arrow::TimestampArray&>(arr);
+        auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
+        int64_t v = normalize_timestamp_to_millis(ta.Value(row), unit);
         return put64(static_cast<uint64_t>(v));
     }
     default: {
@@ -240,7 +242,23 @@ static Status build_sort_index(
             std::to_string(max_col_idx) + " but Arrow schema has only " +
             std::to_string(num_cols) + " columns");
     }
-    for (int c = 0; c <= max_col_idx; ++c) {
+
+    std::vector<bool> referenced_cols(static_cast<size_t>(std::max(0, num_cols)), false);
+    for (const auto& seg : rkb.segments()) {
+        if (seg.type != arrow_convert::RowKeySegment::Type::ColumnRef &&
+            seg.type != arrow_convert::RowKeySegment::Type::EncodedColumn)
+            continue;
+        if (seg.col_index >= num_cols) {
+            return Status::InvalidArg(
+                "SCHEMA_MISMATCH: rowKeyRule references column index " +
+                std::to_string(seg.col_index) + " but Arrow schema has only " +
+                std::to_string(num_cols) + " columns");
+        }
+        referenced_cols[static_cast<size_t>(seg.col_index)] = true;
+    }
+    for (int c = 0; c < num_cols; ++c) {
+        if (!referenced_cols[static_cast<size_t>(c)])
+            continue;
         if (!is_supported_rowkey_type(schema->field(c)->type())) {
             return Status::InvalidArg(
                 "SCHEMA_MISMATCH: unsupported Arrow type for row key field '" +
@@ -265,23 +283,17 @@ static Status build_sort_index(
         batches_out.push_back(batch);
 
         for (int64_t r = 0; r < n_rows; ++r) {
-            // Build rowValue: pipe-join all column string values
-            // Max index needed = max_col_idx, so we only need columns 0..max_col_idx
-            std::string row_val;
-            int max_i = std::min(max_col_idx + 1, num_cols);
-            row_val.reserve(static_cast<size_t>(max_i) * 12);
-            for (int c = 0; c < max_i; ++c) {
-                if (c > 0) row_val += '|';
-                std::string field;
-                auto field_status = scalar_to_string(*batch->column(c), r, &field);
+            std::vector<std::string> owned_fields(
+                max_col_idx >= 0 ? static_cast<size_t>(max_col_idx + 1) : 0);
+            std::vector<std::string_view> fields(owned_fields.size());
+            for (int c = 0; c <= max_col_idx; ++c) {
+                if (!referenced_cols[static_cast<size_t>(c)])
+                    continue;
+                auto field_status = scalar_to_string(*batch->column(c), r, &owned_fields[static_cast<size_t>(c)]);
                 if (!field_status.ok())
                     return field_status;
-                row_val += field;
+                fields[static_cast<size_t>(c)] = owned_fields[static_cast<size_t>(c)];
             }
-
-            // Build fields view
-            auto fields = arrow_convert::split_row_value(row_val,
-                                                          max_col_idx + 2);
             std::string rk = rkb.build(fields);
 
             if (rk.empty()) {
@@ -315,7 +327,8 @@ static Status append_grouped_row_cells(
         const std::string&                  row_key,
         const std::string&                  cf,
         int64_t                             default_ts,
-        int64_t*                            kv_written) {
+        int64_t*                            kv_written,
+        int64_t*                            kv_skipped) {
     std::sort(cells.begin(), cells.end(),
               [](const GroupedCell& a, const GroupedCell& b) {
                   return a.qualifier < b.qualifier;
@@ -336,10 +349,16 @@ static Status append_grouped_row_cells(
 
     for (const auto& cell : cells) {
         std::vector<uint8_t> q_bytes(cell.qualifier.begin(), cell.qualifier.end());
+        auto before_entry_count = writer.entry_count();
         auto s = writer.append(row_bytes, cf_bytes, q_bytes,
                                ts, cell.value);
         if (!s.ok()) return s;
-        if (kv_written) ++(*kv_written);
+        auto after_entry_count = writer.entry_count();
+        if (after_entry_count > before_entry_count) {
+            if (kv_written) ++(*kv_written);
+        } else if (kv_skipped) {
+            ++(*kv_skipped);
+        }
     }
     return Status::OK();
 }
@@ -483,10 +502,12 @@ ConvertResult convert(const ConvertOptions& opts) {
         }
 
         int64_t kv_written = 0;
+        int64_t kv_skipped = 0;
         auto s = append_grouped_row_cells(*writer, cells, row_key,
                                           opts.column_family,
                                           opts.default_timestamp,
-                                          &kv_written);
+                                          &kv_written,
+                                          &kv_skipped);
         if (!s.ok()) {
             result.error_code = s.message().find("SORT_ORDER_VIOLATION") != std::string::npos ||
                                 s.message().find("DUPLICATE_CELL") != std::string::npos
@@ -497,6 +518,7 @@ ConvertResult convert(const ConvertOptions& opts) {
             return result;
         }
         result.kv_written_count += kv_written;
+        result.kv_skipped_count += kv_skipped;
         rows_done += static_cast<int64_t>(j - i);
 
         if (opts.progress_cb && rows_done % progress_step == 0)

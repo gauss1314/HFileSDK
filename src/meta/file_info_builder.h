@@ -81,6 +81,26 @@ public:
         set_bytes(std::string(fileinfo::kLenOfBiggestCell), {buf, 8});
     }
 
+    Status validate_required_fields() const {
+        static const std::string kRequiredKeys[] = {
+            std::string(fileinfo::kLastKey),
+            std::string(fileinfo::kAvgKeyLen),
+            std::string(fileinfo::kAvgValueLen),
+            std::string(fileinfo::kMaxTagsLen),
+            std::string(fileinfo::kKeyValueVersion),
+            std::string(fileinfo::kMaxMemstoreTsKey),
+            std::string(fileinfo::kComparator),
+            std::string(fileinfo::kDataBlockEncoding),
+            std::string(fileinfo::kCreateTimeTs),
+            std::string(fileinfo::kLenOfBiggestCell),
+        };
+        for (const auto& key : kRequiredKeys) {
+            if (!entries_.count(key))
+                return Status::InvalidArg("FileInfo missing mandatory field: " + key);
+        }
+        return Status::OK();
+    }
+
     /// Serialize the FileInfo block into `out`.
     /// Format: [PBUF magic][delimited FileInfoProto]
     void finish(std::vector<uint8_t>& out) const {

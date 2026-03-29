@@ -190,7 +190,7 @@ bash scripts/coverage.sh
 1. 每个 HFile **只能包含一个** Column Family
 2. HFile 版本必须是 **v3**（major=3, minor=3）
 3. 每个 Cell 必须包含 `tags_length`（2B）和 `mvcc`（VarInt），即使为零
-4. Trailer 必须用 **ProtoBuf** 序列化，尾部固定格式 `[pb_offset(4B)][3][3]`
+4. Trailer 必须用 **ProtoBuf** 序列化，尾部为固定 4 KB 区域：`[TRABLK"$][varint pb_length][FileTrailerProto][padding][materialized_version]`
 5. FileInfo 必须包含全部 **10 个必填字段**
 6. Bulk Load 目录结构：`<output_dir>/<cf_name>/<hfile>`
 7. 文件内 KV **严格有序**：Row↑ → Family↑ → Qualifier↑ → Timestamp↓ → Type↓

@@ -347,7 +347,6 @@ public class HFileVerifier {
     }
 
     private void validateFileInfo(Reader reader) throws Exception {
-        // These fields are mandatory per DESIGN.md §2.3
         String[] required = {
             "hfile.LASTKEY",
             "hfile.AVG_KEY_LEN",
@@ -358,11 +357,17 @@ public class HFileVerifier {
             "hfile.KEY_VALUE_VERSION",
             "hfile.MAX_MEMSTORE_TS_KEY",
             "hfile.CREATE_TIME_TS",
+            "hfile.LEN_OF_BIGGEST_CELL",
         };
 
-        // HBase 2.6.x exposes FileInfo through getFileContext / internal API
-        // We verify by checking that the reader opens without error and
-        // the trailer has valid comparator class set
+        HFileInfo fileInfo = ((HFileReaderImpl) reader).getHFileInfo();
+        for (String key : required) {
+            byte[] value = fileInfo.get(Bytes.toBytes(key));
+            if (value == null) {
+                throw new RuntimeException("Missing FileInfo key: " + key);
+            }
+        }
+
         String comparator = reader.getTrailer().getComparatorClassName();
         if (comparator == null || comparator.isEmpty()) {
             throw new RuntimeException("Missing comparator class name in trailer");

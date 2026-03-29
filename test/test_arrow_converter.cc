@@ -590,6 +590,59 @@ TEST(ArrowConverter, ConvertAcceptsLongHashRowKeyRule) {
     fs::remove_all(dir);
 }
 
+TEST(ArrowConverter, ConvertAllowsUnusedUnsupportedColumnsBeforeReferencedIndex) {
+    arrow::BinaryBuilder c0_builder;
+    arrow::StringBuilder c1_builder;
+    arrow::StringBuilder c2_builder;
+    arrow::StringBuilder c3_builder;
+    arrow::StringBuilder c4_builder;
+    arrow::StringBuilder c5_builder;
+
+    ARROW_EXPECT_OK(c0_builder.Append("raw", 3));
+    ARROW_EXPECT_OK(c1_builder.Append("a"));
+    ARROW_EXPECT_OK(c2_builder.Append("b"));
+    ARROW_EXPECT_OK(c3_builder.Append("c"));
+    ARROW_EXPECT_OK(c4_builder.Append("d"));
+    ARROW_EXPECT_OK(c5_builder.Append("row-key"));
+
+    std::shared_ptr<arrow::Array> c0, c1, c2, c3, c4, c5;
+    ARROW_EXPECT_OK(c0_builder.Finish(&c0));
+    ARROW_EXPECT_OK(c1_builder.Finish(&c1));
+    ARROW_EXPECT_OK(c2_builder.Finish(&c2));
+    ARROW_EXPECT_OK(c3_builder.Finish(&c3));
+    ARROW_EXPECT_OK(c4_builder.Finish(&c4));
+    ARROW_EXPECT_OK(c5_builder.Finish(&c5));
+
+    auto schema = arrow::schema({
+        arrow::field("c0", arrow::binary()),
+        arrow::field("c1", arrow::utf8()),
+        arrow::field("c2", arrow::utf8()),
+        arrow::field("c3", arrow::utf8()),
+        arrow::field("c4", arrow::utf8()),
+        arrow::field("c5", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 1, {c0, c1, c2, c3, c4, c5});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "KEY,5,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::OK);
+    EXPECT_TRUE(fs::exists(hfile_path));
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream) {
     auto dir = make_temp_dir();
     auto arrow_path = dir / "broken.arrow";

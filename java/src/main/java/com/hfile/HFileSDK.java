@@ -1,7 +1,7 @@
 package com.hfile;
 
 /**
- * JNI bridge to the C++ HFileSDK shared library ({@code libhfilesdk.so}).
+ * JNI bridge to the C++ HFileSDK shared library ({@code libhfilesdk.so} / {@code libhfilesdk.dylib} / {@code hfilesdk.dll}).
  *
  * <p>Usage:
  * <pre>{@code

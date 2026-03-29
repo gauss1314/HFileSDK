@@ -175,6 +175,8 @@ public:
     }
 
     Status append(const KeyValue& kv) {
+        if (finished_)
+            return Status::InvalidArg("append() called after finish()");
         // ── Input validation ──────────────────────────────────────────────
         auto vs = validate_kv(kv, opts_);
         if (!vs.ok()) {
@@ -443,14 +445,13 @@ private:
         fib.set_avg_value_len(entry_count_ > 0
             ? static_cast<uint32_t>(total_value_bytes_ / entry_count_) : 0);
         fib.set_max_tags_len(max_tags_len_);
-        if (has_mvcc_cells_) {
-            fib.set_key_value_version(1);
-            fib.set_max_memstore_ts(max_memstore_ts_);
-        }
+        fib.set_key_value_version(1);
+        fib.set_max_memstore_ts(has_mvcc_cells_ ? max_memstore_ts_ : 0);
         fib.set_comparator(opts_.comparator);
         fib.set_data_block_encoding(opts_.data_block_encoding);
         fib.set_create_time();
         fib.set_len_of_biggest_cell(static_cast<uint64_t>(max_cell_size_));
+        HFILE_RETURN_IF_ERROR(fib.validate_required_fields());
 
         std::vector<uint8_t> fi_bytes;
         fib.finish(fi_bytes);

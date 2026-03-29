@@ -12,6 +12,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
 
 // Auto-generated JNI header (produced by javac -h or javah):
 // Expected class: com.hfile.HFileSDK
@@ -20,9 +21,12 @@
 namespace hfile {
 namespace jni {
 
-// Thread-local last result storage (one per JNI calling thread)
-static thread_local ConvertResult tl_last_result;
-static thread_local std::string   tl_last_result_json;
+struct InstanceState {
+    jobject       weak_ref{nullptr};
+    WriterOptions writer_opts;
+    ConvertResult last_result;
+    std::string   last_result_json{"{}"};
+};
 
 static std::string result_to_json(const ConvertResult& r) {
     std::ostringstream oss;
@@ -41,12 +45,62 @@ static std::string result_to_json(const ConvertResult& r) {
     return oss.str();
 }
 
+static ConvertResult make_error_result(int code, std::string message) {
+    ConvertResult r;
+    r.error_code = code;
+    r.error_message = std::move(message);
+    return r;
+}
+
 } // namespace jni
 } // namespace hfile
 
-// ─── Global config (set via configure()) ─────────────────────────────────────
-static hfile::WriterOptions g_writer_opts;
-static std::mutex           g_config_mutex;
+// ─── Per-instance config / state (set via configure()) ──────────────────────
+static std::mutex                           g_config_mutex;
+static std::vector<hfile::jni::InstanceState> g_instance_states;
+
+static void cleanup_instance_states_locked(JNIEnv* env) {
+    auto it = g_instance_states.begin();
+    while (it != g_instance_states.end()) {
+        if (env->IsSameObject(it->weak_ref, nullptr)) {
+            env->DeleteWeakGlobalRef(it->weak_ref);
+            it = g_instance_states.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+static hfile::jni::InstanceState* find_instance_state_locked(JNIEnv* env, jobject obj) {
+    cleanup_instance_states_locked(env);
+    for (auto& state : g_instance_states) {
+        if (env->IsSameObject(state.weak_ref, obj))
+            return &state;
+    }
+    return nullptr;
+}
+
+static hfile::jni::InstanceState& get_or_create_instance_state_locked(JNIEnv* env, jobject obj) {
+    if (auto* state = find_instance_state_locked(env, obj))
+        return *state;
+    hfile::jni::InstanceState state;
+    state.weak_ref = env->NewWeakGlobalRef(obj);
+    state.writer_opts.column_family = "cf";
+    g_instance_states.push_back(std::move(state));
+    return g_instance_states.back();
+}
+
+static void set_instance_result(JNIEnv* env, jobject obj, const hfile::ConvertResult& result) {
+    std::lock_guard<std::mutex> lk(g_config_mutex);
+    auto& state = get_or_create_instance_state_locked(env, obj);
+    state.last_result = result;
+    state.last_result_json = hfile::jni::result_to_json(result);
+}
+
+static hfile::WriterOptions get_instance_writer_opts(JNIEnv* env, jobject obj) {
+    std::lock_guard<std::mutex> lk(g_config_mutex);
+    return get_or_create_instance_state_locked(env, obj).writer_opts;
+}
 
 // ─── JNI exports ─────────────────────────────────────────────────────────────
 extern "C" {
@@ -61,7 +115,7 @@ extern "C" {
  * Returns: 0 = success, non-zero = ErrorCode constant
  */
 JNIEXPORT jint JNICALL
-Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject /*obj*/,
+Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
                                  jstring j_arrow_path,
                                  jstring j_hfile_path,
                                  jstring j_table_name,
@@ -77,48 +131,45 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject /*obj*/,
         std::string row_key_rule;
         hfile::Status s = jstring_to_string(env, j_arrow_path, &arrow_path);
         if (!s.ok()) {
-            tl_last_result = {};
-            tl_last_result.error_code = s.code() == hfile::Status::Code::InvalidArg
+            auto r = make_error_result(
+                s.code() == hfile::Status::Code::InvalidArg
                 ? hfile::ErrorCode::INVALID_ARGUMENT
-                : hfile::ErrorCode::INTERNAL_ERROR;
-            tl_last_result.error_message = "arrowPath: " + s.message();
-            tl_last_result_json = result_to_json(tl_last_result);
-            return tl_last_result.error_code;
+                : hfile::ErrorCode::INTERNAL_ERROR,
+                "arrowPath: " + s.message());
+            set_instance_result(env, obj, r);
+            return r.error_code;
         }
         s = jstring_to_string(env, j_hfile_path, &hfile_path);
         if (!s.ok()) {
-            tl_last_result = {};
-            tl_last_result.error_code = s.code() == hfile::Status::Code::InvalidArg
+            auto r = make_error_result(
+                s.code() == hfile::Status::Code::InvalidArg
                 ? hfile::ErrorCode::INVALID_ARGUMENT
-                : hfile::ErrorCode::INTERNAL_ERROR;
-            tl_last_result.error_message = "hfilePath: " + s.message();
-            tl_last_result_json = result_to_json(tl_last_result);
-            return tl_last_result.error_code;
+                : hfile::ErrorCode::INTERNAL_ERROR,
+                "hfilePath: " + s.message());
+            set_instance_result(env, obj, r);
+            return r.error_code;
         }
         s = optional_jstring_to_string(env, j_table_name, &table_name);
         if (!s.ok()) {
-            tl_last_result = {};
-            tl_last_result.error_code = hfile::ErrorCode::INTERNAL_ERROR;
-            tl_last_result.error_message = "tableName: " + s.message();
-            tl_last_result_json = result_to_json(tl_last_result);
-            return tl_last_result.error_code;
+            auto r = make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
+                                       "tableName: " + s.message());
+            set_instance_result(env, obj, r);
+            return r.error_code;
         }
         s = optional_jstring_to_string(env, j_row_key_rule, &row_key_rule);
         if (!s.ok()) {
-            tl_last_result = {};
-            tl_last_result.error_code = hfile::ErrorCode::INTERNAL_ERROR;
-            tl_last_result.error_message = "rowKeyRule: " + s.message();
-            tl_last_result_json = result_to_json(tl_last_result);
-            return tl_last_result.error_code;
+            auto r = make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
+                                       "rowKeyRule: " + s.message());
+            set_instance_result(env, obj, r);
+            return r.error_code;
         }
 
         // ── Validate required parameters ──────────────────────────────────
         if (arrow_path.empty() || hfile_path.empty()) {
-            tl_last_result = {};
-            tl_last_result.error_code    = hfile::ErrorCode::INVALID_ARGUMENT;
-            tl_last_result.error_message = "arrowPath and hfilePath must not be null/empty";
-            tl_last_result_json = result_to_json(tl_last_result);
-            return hfile::ErrorCode::INVALID_ARGUMENT;
+            auto r = make_error_result(hfile::ErrorCode::INVALID_ARGUMENT,
+                                       "arrowPath and hfilePath must not be null/empty");
+            set_instance_result(env, obj, r);
+            return r.error_code;
         }
 
         // ── Build ConvertOptions ──────────────────────────────────────────
@@ -127,36 +178,33 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject /*obj*/,
         opts.hfile_path   = hfile_path;
         opts.table_name   = table_name;
         opts.row_key_rule = row_key_rule;
-        {
-            std::lock_guard<std::mutex> lk(g_config_mutex);
-            opts.writer_opts = g_writer_opts;
-        }
+        opts.writer_opts  = get_instance_writer_opts(env, obj);
+        opts.column_family = opts.writer_opts.column_family.empty()
+            ? opts.column_family
+            : opts.writer_opts.column_family;
+        opts.writer_opts.column_family = opts.column_family;
 
         // ── Execute conversion ────────────────────────────────────────────
         hfile::ConvertResult result = hfile::convert(opts);
 
-        // Store for getLastResult()
-        tl_last_result      = result;
-        tl_last_result_json = result_to_json(result);
+        set_instance_result(env, obj, result);
 
         return result.error_code;
 
     } catch (const std::exception& e) {
         fprintf(stderr, "[ERROR] JNI convert: %s\n", e.what());
-        hfile::ConvertResult r;
-        r.error_code    = hfile::ErrorCode::INTERNAL_ERROR;
-        r.error_message = std::string("Internal C++ exception: ") + e.what();
-        hfile::jni::tl_last_result      = r;
-        hfile::jni::tl_last_result_json = hfile::jni::result_to_json(r);
-        return hfile::ErrorCode::INTERNAL_ERROR;
+        auto r = hfile::jni::make_error_result(
+            hfile::ErrorCode::INTERNAL_ERROR,
+            std::string("Internal C++ exception: ") + e.what());
+        set_instance_result(env, obj, r);
+        return r.error_code;
     } catch (...) {
         fprintf(stderr, "[ERROR] JNI convert: unknown exception\n");
-        hfile::ConvertResult r;
-        r.error_code    = hfile::ErrorCode::INTERNAL_ERROR;
-        r.error_message = "Internal C++ exception: unknown";
-        hfile::jni::tl_last_result      = r;
-        hfile::jni::tl_last_result_json = hfile::jni::result_to_json(r);
-        return hfile::ErrorCode::INTERNAL_ERROR;
+        auto r = hfile::jni::make_error_result(
+            hfile::ErrorCode::INTERNAL_ERROR,
+            "Internal C++ exception: unknown");
+        set_instance_result(env, obj, r);
+        return r.error_code;
     }
 }
 
@@ -165,10 +213,16 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject /*obj*/,
  * Returns JSON string with the details of the last convert() call.
  */
 JNIEXPORT jstring JNICALL
-Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject /*obj*/)
+Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject obj)
 {
     try {
-        return env->NewStringUTF(hfile::jni::tl_last_result_json.c_str());
+        std::string result_json = "{}";
+        {
+            std::lock_guard<std::mutex> lk(g_config_mutex);
+            if (auto* state = find_instance_state_locked(env, obj))
+                result_json = state->last_result_json;
+        }
+        return env->NewStringUTF(result_json.c_str());
     } catch (...) {
         return env->NewStringUTF("{}");
     }
@@ -180,19 +234,40 @@ Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject /*obj*/)
  * configJson: {"compression":"lz4","block_size":65536,"column_family":"cf",...}
  */
 JNIEXPORT jint JNICALL
-Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject /*obj*/, jstring j_config)
+Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
 {
     try {
         std::string config;
         auto str_status = hfile::jni::optional_jstring_to_string(env, j_config, &config);
-        if (!str_status.ok()) return hfile::ErrorCode::INTERNAL_ERROR;
-        if (config.empty()) return 0;
+        if (!str_status.ok()) {
+            auto r = hfile::jni::make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
+                                                   "configJson: " + str_status.message());
+            set_instance_result(env, obj, r);
+            return r.error_code;
+        }
+        if (config.empty()) {
+            set_instance_result(env, obj, hfile::ConvertResult{});
+            return 0;
+        }
 
         std::lock_guard<std::mutex> lk(g_config_mutex);
+        auto& state = get_or_create_instance_state_locked(env, obj);
+        auto next_opts = state.writer_opts;
+        auto fail_config = [&](std::string message) {
+            state.last_result = hfile::jni::make_error_result(
+                hfile::ErrorCode::INVALID_ARGUMENT, std::move(message));
+            state.last_result_json = hfile::jni::result_to_json(state.last_result);
+            return state.last_result.error_code;
+        };
 
         hfile::jni::JsonConfigObject cfg;
         auto parse_status = hfile::jni::parse_json_config(config, &cfg);
-        if (!parse_status.ok()) return hfile::ErrorCode::INVALID_ARGUMENT;
+        if (!parse_status.ok()) {
+            state.last_result = hfile::jni::make_error_result(
+                hfile::ErrorCode::INVALID_ARGUMENT, parse_status.message());
+            state.last_result_json = hfile::jni::result_to_json(state.last_result);
+            return state.last_result.error_code;
+        }
 
         static const std::unordered_set<std::string> kAllowedKeys = {
             "compression",
@@ -206,64 +281,70 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject /*obj*/, jstring j_config
         };
         for (const auto& [key, _] : cfg) {
             if (!kAllowedKeys.count(key))
-                return hfile::ErrorCode::INVALID_ARGUMENT;
+                return fail_config("Unsupported config key: " + key);
         }
 
         if (auto comp = hfile::jni::config_string(cfg, "compression")) {
-            if      (*comp == "none")   g_writer_opts.compression = hfile::Compression::None;
-            else if (*comp == "lz4")    g_writer_opts.compression = hfile::Compression::LZ4;
-            else if (*comp == "zstd")   g_writer_opts.compression = hfile::Compression::Zstd;
-            else if (*comp == "snappy") g_writer_opts.compression = hfile::Compression::Snappy;
-            else if (*comp == "gzip")   g_writer_opts.compression = hfile::Compression::GZip;
-            else return hfile::ErrorCode::INVALID_ARGUMENT;
+            if      (*comp == "none")   next_opts.compression = hfile::Compression::None;
+            else if (*comp == "lz4")    next_opts.compression = hfile::Compression::LZ4;
+            else if (*comp == "zstd")   next_opts.compression = hfile::Compression::Zstd;
+            else if (*comp == "snappy") next_opts.compression = hfile::Compression::Snappy;
+            else if (*comp == "gzip")   next_opts.compression = hfile::Compression::GZip;
+            else return fail_config("Invalid compression: " + *comp);
         }
 
         if (auto bs = hfile::jni::config_int(cfg, "block_size")) {
-            if (*bs <= 0) return hfile::ErrorCode::INVALID_ARGUMENT;
-            g_writer_opts.block_size = static_cast<size_t>(*bs);
+            if (*bs <= 0) return fail_config("block_size must be > 0");
+            next_opts.block_size = static_cast<size_t>(*bs);
         }
 
         if (auto cf = hfile::jni::config_string(cfg, "column_family")) {
-            if (cf->empty()) return hfile::ErrorCode::INVALID_ARGUMENT;
-            g_writer_opts.column_family = *cf;
+            if (cf->empty()) return fail_config("column_family must not be empty");
+            next_opts.column_family = *cf;
         }
 
         if (auto enc = hfile::jni::config_string(cfg, "data_block_encoding")) {
-            if      (*enc == "NONE")      g_writer_opts.data_block_encoding = hfile::Encoding::None;
-            else if (*enc == "PREFIX")    g_writer_opts.data_block_encoding = hfile::Encoding::Prefix;
-            else if (*enc == "DIFF")      g_writer_opts.data_block_encoding = hfile::Encoding::Diff;
-            else if (*enc == "FAST_DIFF") g_writer_opts.data_block_encoding = hfile::Encoding::FastDiff;
-            else return hfile::ErrorCode::INVALID_ARGUMENT;
+            if      (*enc == "NONE")      next_opts.data_block_encoding = hfile::Encoding::None;
+            else if (*enc == "PREFIX")    next_opts.data_block_encoding = hfile::Encoding::Prefix;
+            else if (*enc == "DIFF")      next_opts.data_block_encoding = hfile::Encoding::Diff;
+            else if (*enc == "FAST_DIFF") next_opts.data_block_encoding = hfile::Encoding::FastDiff;
+            else return fail_config("Invalid data_block_encoding: " + *enc);
         }
 
         if (auto fp = hfile::jni::config_string(cfg, "fsync_policy")) {
-            if      (*fp == "safe")      g_writer_opts.fsync_policy = hfile::FsyncPolicy::Safe;
-            else if (*fp == "fast")      g_writer_opts.fsync_policy = hfile::FsyncPolicy::Fast;
-            else if (*fp == "paranoid")  g_writer_opts.fsync_policy = hfile::FsyncPolicy::Paranoid;
-            else return hfile::ErrorCode::INVALID_ARGUMENT;
+            if      (*fp == "safe")      next_opts.fsync_policy = hfile::FsyncPolicy::Safe;
+            else if (*fp == "fast")      next_opts.fsync_policy = hfile::FsyncPolicy::Fast;
+            else if (*fp == "paranoid")  next_opts.fsync_policy = hfile::FsyncPolicy::Paranoid;
+            else return fail_config("Invalid fsync_policy: " + *fp);
         }
 
         if (auto ep = hfile::jni::config_string(cfg, "error_policy")) {
-            if      (*ep == "strict")    g_writer_opts.error_policy = hfile::ErrorPolicy::Strict;
-            else if (*ep == "skip_row")  g_writer_opts.error_policy = hfile::ErrorPolicy::SkipRow;
-            else if (*ep == "skip_batch")g_writer_opts.error_policy = hfile::ErrorPolicy::SkipBatch;
-            else return hfile::ErrorCode::INVALID_ARGUMENT;
+            if      (*ep == "strict")    next_opts.error_policy = hfile::ErrorPolicy::Strict;
+            else if (*ep == "skip_row")  next_opts.error_policy = hfile::ErrorPolicy::SkipRow;
+            else if (*ep == "skip_batch")next_opts.error_policy = hfile::ErrorPolicy::SkipBatch;
+            else return fail_config("Invalid error_policy: " + *ep);
         }
 
         if (auto bt = hfile::jni::config_string(cfg, "bloom_type")) {
-            if      (*bt == "none")     g_writer_opts.bloom_type = hfile::BloomType::None;
-            else if (*bt == "row")      g_writer_opts.bloom_type = hfile::BloomType::Row;
-            else if (*bt == "rowcol")   g_writer_opts.bloom_type = hfile::BloomType::RowCol;
-            else return hfile::ErrorCode::INVALID_ARGUMENT;
+            if      (*bt == "none")     next_opts.bloom_type = hfile::BloomType::None;
+            else if (*bt == "row")      next_opts.bloom_type = hfile::BloomType::Row;
+            else if (*bt == "rowcol")   next_opts.bloom_type = hfile::BloomType::RowCol;
+            else return fail_config("Invalid bloom_type: " + *bt);
         }
 
         if (auto mvcc = hfile::jni::config_int(cfg, "include_mvcc")) {
-            if (*mvcc != 0 && *mvcc != 1) return hfile::ErrorCode::INVALID_ARGUMENT;
-            g_writer_opts.include_mvcc = (*mvcc != 0);
+            if (*mvcc != 0 && *mvcc != 1) return fail_config("include_mvcc must be 0 or 1");
+            next_opts.include_mvcc = (*mvcc != 0);
         }
 
+        state.writer_opts = std::move(next_opts);
+        state.last_result = {};
+        state.last_result_json = hfile::jni::result_to_json(state.last_result);
         return 0;
     } catch (...) {
+        auto r = hfile::jni::make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
+                                               "Internal C++ exception during configure()");
+        set_instance_result(env, obj, r);
         return hfile::ErrorCode::INTERNAL_ERROR;
     }
 }

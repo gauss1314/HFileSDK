@@ -203,6 +203,9 @@ std::pair<RowKeyBuilder, Status> RowKeyBuilder::compile(const std::string& rule)
                 return {std::move(builder),
                         Status::InvalidArg("rowKeyRule: invalid index '" +
                                            std::string(fields[1]) + "'")};
+            if (idx < 0)
+                return {std::move(builder),
+                        Status::InvalidArg("rowKeyRule: index must be >= 0")};
             seg.col_index = idx;
         }
 
@@ -218,6 +221,9 @@ std::pair<RowKeyBuilder, Status> RowKeyBuilder::compile(const std::string& rule)
                 return {std::move(builder),
                         Status::InvalidArg("rowKeyRule: invalid padLen '" +
                                            std::string(fields[3]) + "'")};
+            if (pl < 0)
+                return {std::move(builder),
+                        Status::InvalidArg("rowKeyRule: padLen must be >= 0")};
             seg.pad_len = pl;
         }
 

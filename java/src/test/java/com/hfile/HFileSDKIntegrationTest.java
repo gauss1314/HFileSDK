@@ -59,6 +59,22 @@ public class HFileSDKIntegrationTest {
         HFileSDK sdk = new HFileSDK();
         int rc = sdk.configure("{\"compression\":\"bogus\"}");
         assertEquals(HFileSDK.INVALID_ARGUMENT, rc);
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"error_code\":1"));
+    }
+
+    @Test
+    void instanceStateIsIsolatedAcrossSdkObjects() {
+        HFileSDK sdk1 = new HFileSDK();
+        HFileSDK sdk2 = new HFileSDK();
+
+        assertEquals(HFileSDK.INVALID_ARGUMENT, sdk1.configure("{\"compression\":\"bogus\"}"));
+        assertEquals(HFileSDK.INVALID_ARGUMENT, sdk2.convert("", "", "test_table", "ID,0,false,0"));
+
+        String result1 = sdk1.getLastResult();
+        String result2 = sdk2.getLastResult();
+        assertTrue(result1.contains("compression"));
+        assertTrue(result2.contains("must not be null/empty"));
     }
 
     @Test
@@ -128,6 +144,35 @@ public class HFileSDKIntegrationTest {
         assertTrue(lastResult.contains("\"error_code\":0"));
         assertTrue(lastResult.contains("\"kv_written_count\":4"));
         assertTrue(Files.exists(hfilePath));
+    }
+
+    @Test
+    void configureColumnFamilyAffectsConvert(@TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");
+        writeArrowStream(arrowPath, List.of("row1"), List.of("value1"));
+
+        HFileSDK sdk = new HFileSDK();
+        int configureRc = sdk.configure("""
+            {
+              "compression":"none",
+              "column_family":"altcf",
+              "data_block_encoding":"NONE",
+              "bloom_type":"none",
+              "include_mvcc":0
+            }
+            """);
+        assertEquals(HFileSDK.OK, configureRc);
+
+        int rc = sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "ID,0,false,0");
+        assertEquals(HFileSDK.OK, rc);
+
+        String raw = Files.readString(hfilePath, StandardCharsets.ISO_8859_1);
+        assertTrue(raw.contains("altcf"));
     }
 
     private static void writeArrowStream(Path path,

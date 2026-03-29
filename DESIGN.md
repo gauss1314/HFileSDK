@@ -52,7 +52,7 @@ Arrow RecordBatch → HFile v3 → 本地/HDFS → BulkLoadHFilesTool → HBase 
 | C-1 | 每个 HFile **只含一个** Column Family | `HFileWriterImpl::append()` 拒绝错误 CF |
 | C-2 | HFile 版本必须是 **v3**（major=3, minor=3） | `TrailerBuilder` 硬编码 |
 | C-3 | 每个 Cell 必须有 `tags_length`（2B BE）和 `mvcc`（VarInt），即使为零 | 所有 `*_encoder.h` |
-| C-4 | Trailer 必须用 **ProtoBuf** 序列化，尾部固定 `[pb_offset(4B)][3][3]` | `TrailerBuilder::finish()` |
+| C-4 | Trailer 必须用 **ProtoBuf** 序列化，尾部固定 4 KB：`[TRABLK"$][varint pb_length][FileTrailerProto][padding][materialized_version]` | `TrailerBuilder::finish()` |
 | C-5 | FileInfo 必须包含全部 **10 个字段**（见 §2.3） | `FileInfoBuilder` |
 | C-6 | Bulk Load 目录：`<output_dir>/<cf>/<hfile>` | `BulkLoadWriterImpl` |
 | C-7 | KV 严格有序：Row↑→Family↑→Qualifier↑→Timestamp↓→Type↓ | `compare_keys()` + 写入验证 |
@@ -83,10 +83,10 @@ Arrow RecordBatch → HFile v3 → 本地/HDFS → BulkLoadHFilesTool → HBase 
 │  FileInfo Block      (FILEINF2)         │
 ├─────────────────────────────────────────┤
 │  Trailer                                │
-│  [ProtoBuf FileTrailerProto bytes]      │
-│  [pb_start_offset : uint32 BE]          │ ← pb大小 + 12
-│  [major_version   : uint32 BE = 3]      │
-│  [minor_version   : uint32 BE = 3]      │
+│  [TRABLK"$ magic]                       │
+│  [varint pb_length][FileTrailerProto]   │
+│  [zero padding]                         │
+│  [materialized_version : uint32 BE]     │
 └─────────────────────────────────────────┘
 ```
 
@@ -277,7 +277,8 @@ Arrow IPC Stream 文件（磁盘）
         ▼
 RecordBatch（内存，一批数千～数万行）
         │
-        │ 第一遍：每行列值 → "|" 拼接 rowValue 字符串
+        │ 第一遍：仅对规则实际引用的列做字符串化
+        │         → 组装 fields[index]
         │         → RowKeyBuilder.build() → row key 字符串
         │         收集 SortEntry{rowKey, batchIdx, rowIdx}
         ▼
@@ -319,7 +320,7 @@ colName,index,isReverse,padLen[,padMode][,padContent]
 
 ```
 rowKeyRule = "STARTTIME,0,false,10#IMSI,1,true,15#MSISDN,2,false,11,RIGHT,#$RND$,3,false,4"
-rowValue   = "20240301123000|460001234567890|13800138000|120|1024000|2048000"
+fields     = ["20240301123000", "460001234567890", "13800138000"]
 ```
 
 | 段 | 规则 | 原值 | 处理 | 结果 |
@@ -334,13 +335,7 @@ rowValue   = "20240301123000|460001234567890|13800138000|120|1024000|2048000"
 #### 与 rowValue 的关系（v4.0 重要变更）
 
 v3.0 及之前：`rowValue` 由 Java 调用方构建后传入 JNI。  
-**v4.0 开始**：`rowValue` 由 SDK 内部从 Arrow 列值自动生成：
-
-```
-Arrow 行第 i 列的字符串值  →  pipe 拼接  →  rowValue
-例：列[0]="20240301123000", 列[1]="460001234567890", 列[2]="13800138000"
-    → rowValue = "20240301123000|460001234567890|13800138000"
-```
+**v4.0 开始**：JNI 不再接收 `rowValue` 参数；SDK 直接从 Arrow 中取出 `rowKeyRule` 实际引用的列，按索引组装 `fields[index]` 并交给 `RowKeyBuilder::build()`，不再经历“先用 `|` 拼接、再拆回 fields”的过程。
 
 当 `rowKeyRule` 引用的列索引超出 Arrow Schema，或字段类型不在支持集合内（例如 `Binary`），转换会返回 `SCHEMA_MISMATCH`，而不是静默生成错误 RowKey。
 
@@ -354,14 +349,15 @@ auto [rkb, s] = RowKeyBuilder::compile(row_key_rule);
 
 // 第一遍扫描：每行生成 row key
 for (int64_t r = 0; r < batch.num_rows(); ++r) {
-    std::string row_val = build_pipe_value(batch, r, max_col_idx);
-    auto fields = split_row_value(row_val);
+    std::vector<std::string> owned_fields(max_col_idx + 1);
+    std::vector<std::string_view> fields(max_col_idx + 1);
+    materialize_referenced_fields(batch, r, referenced_cols, owned_fields, fields);
     std::string rk = rkb.build(fields);
     sort_index.push_back({rk, batch_idx, r});
 }
 ```
 
-#### 已实现流程图（Arrow → rowValue → RowKey）
+#### 已实现流程图（Arrow → fields → RowKey）
 
 ```mermaid
 flowchart TD
@@ -374,11 +370,9 @@ ColumnRef / Random / Fill / EncodedColumn"]
 
     E --> F["build_sort_index()
 第一遍扫描 Arrow"]
-    F --> G["对 0..max_col_idx 列逐个调用 scalar_to_string()"]
-    G --> H["用 | 拼接成 rowValue"]
-    H --> I["split_row_value(rowValue, max_col_idx + 2)
-保留空字段"]
-    I --> J["RowKeyBuilder::build(fields)"]
+    F --> G["仅对规则实际引用的列调用 scalar_to_string()"]
+    G --> H["按列索引写入 owned_fields / fields"]
+    H --> J["RowKeyBuilder::build(fields)"]
 
     J --> K{"遍历每个 segment"}
     K --> L["Random
@@ -413,7 +407,6 @@ flowchart LR
     A["convert()"] --> B["RowKeyBuilder::compile()"]
     A --> C["build_sort_index()"]
     C --> D["scalar_to_string()"]
-    C --> E["split_row_value()"]
     C --> F["RowKeyBuilder::build()"]
     F --> G["random_digits()"]
     F --> H["encode_long_or_short()"]
@@ -425,7 +418,7 @@ flowchart LR
 
 #### 各阶段一句话说明
 
-1. **Arrow → rowValue**：第一遍扫描 Arrow，只取 `rowKeyRule` 需要的前 `0..max_col_idx` 列，逐列字符串化后用 `|` 拼接成 `rowValue`。
+1. **Arrow → fields**：第一遍扫描 Arrow，只对 `rowKeyRule` 真正引用的列做字符串化，并按原始列索引放入 `fields[index]`。
 2. **解析 rowKeyRule**：`compile()` 把规则拆成多个 segment，并识别每段是普通列、随机段、填充段还是编码段。
 3. **逐段生成 RowKey**：`build()` 逐段取值；编码段还会执行 `hash`、`long()`、`short()` 和 Base64。
 4. **拼接所有段**：每段统一经过 `pad -> reverse` 后，依次追加到 `result`，形成最终 RowKey。

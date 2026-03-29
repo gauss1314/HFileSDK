@@ -25,6 +25,14 @@ STAGING_DIR="${STAGING_DIR:-/tmp/hfilesdk_staging}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 BUILD_DIR="build"
 
+if command -v sysctl >/dev/null 2>&1; then
+  JOBS="$(sysctl -n hw.ncpu)"
+elif command -v nproc >/dev/null 2>&1; then
+  JOBS="$(nproc)"
+else
+  JOBS=4
+fi
+
 # ─── Parse args ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -47,9 +55,9 @@ if [[ ! -f "$BUILD_DIR/bench/macro/bm_e2e_write" ]]; then
   cmake -B "$BUILD_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
     -DHFILE_ENABLE_BENCHMARKS=ON \
-    -DHFILE_ENABLE_HDFS="${SKIP_HBASE:=0}" \
+    -DHFILE_ENABLE_HDFS="$([[ "$SKIP_HBASE" -eq 0 ]] && echo ON || echo OFF)" \
     -DCMAKE_CXX_FLAGS="-O3 -march=native"
-  cmake --build "$BUILD_DIR" -j"$(nproc)"
+  cmake --build "$BUILD_DIR" -j"$JOBS"
 fi
 
 mkdir -p "$RESULTS_DIR"
@@ -68,7 +76,7 @@ drop_caches() {
 
 # ─── Unit tests first ────────────────────────────────────────────────────────
 echo "▶ Running unit tests..."
-cd "$BUILD_DIR" && ctest --output-on-failure -j"$(nproc)" && cd ..
+cd "$BUILD_DIR" && ctest --output-on-failure -j"$JOBS" && cd ..
 echo "  Unit tests: PASS"
 echo ""
 

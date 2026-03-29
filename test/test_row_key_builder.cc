@@ -264,6 +264,16 @@ void test_long_hash_matches_java_semantics(){
     hfile::write_be64(bytes.data(), static_cast<uint64_t>(static_cast<int64_t>(hashed)));
     EXPECT_EQ(b.build(f), b64(bytes));
 }
+void test_negative_index_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("ID,-1,false,0");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("index must be >= 0") != std::string::npos);
+}
+void test_negative_pad_len_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("ID,0,false,-1");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("padLen must be >= 0") != std::string::npos);
+}
 
 // ─── AutoSort: verify that identical rowKeyRule applied to sorted/unsorted
 //     rows produces the same output order ──────────────────────────────────────
@@ -321,6 +331,8 @@ int main(){
     test_short_hash_matches_java_semantics();
     test_long_plain_matches_java_semantics();
     test_long_hash_matches_java_semantics();
+    test_negative_index_rejected();
+    test_negative_pad_len_rejected();
     test_sort_invariant();
     printf("Tests run: %d  Passed: %d  Failed: %d\n\n", T, P, T-P);
     return (P==T) ? 0 : 1;

@@ -140,7 +140,8 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
   → JNI 层: 参数校验 + 异常捕获（C++ 异常绝不穿透 JNI 边界）
     → 编译 rowKeyRule 为 RowKeyBuilder
     → 【第一遍】逐 Batch 读取 Arrow IPC Stream 文件
-        → 每行: 列值 "|" 拼接为 rowValue 字符串
+        → 每行: 仅对规则实际引用的列做字符串化
+        → 按列索引组装 fields[index]
         → RowKeyBuilder.build(fields) → row key
         → 收集 SortEntry{rowKey, batchIdx, rowIdx}，所有 batch 保留在内存
     → stable_sort（row key 字典序升序）
@@ -153,7 +154,7 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
   → 返回错误码（0=成功），getLastResult() 返回 JSON 指标
 ```
 
-**关键：`rowValue` 参数已在 v4.0 删除。** SDK 从 Arrow 列值内部构建管道符分隔字符串，调用方无需传入。
+**关键：`rowValue` 参数已在 v4.0 删除。** SDK 直接从 Arrow 中取出规则实际引用的列并组装 `fields[index]`，调用方无需传入。
 
 ---
 
