@@ -85,7 +85,7 @@ TEST(KVSerialize, TagsLengthAlwaysPresent) {
     uint32_t key_len = read_be32(buf.data());
     uint32_t val_len = read_be32(buf.data() + 4);
     size_t offset = 4 + 4 + key_len + val_len;
-    ASSERT_LT(offset + 2, buf.size());
+    ASSERT_LE(offset + 2, buf.size());
     uint16_t tags_len = read_be16(buf.data() + offset);
     EXPECT_EQ(tags_len, 0);  // No tags, but field must exist
 }

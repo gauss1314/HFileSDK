@@ -9,8 +9,19 @@
 ## 运行方式
 
 ```bash
-cmake --build build -j8
-cd build && ctest --output-on-failure
+bash scripts/test.sh
+```
+
+如需只做构建，可执行：
+
+```bash
+bash scripts/build.sh
+```
+
+如需向 `ctest` 透传筛选条件：
+
+```bash
+bash scripts/test.sh -- -R test_arrow_converter
 ```
 
 ## 覆盖率报表
@@ -131,7 +142,7 @@ bash scripts/coverage.sh
 | 模块 | 已覆盖场景 | 对应用例 |
 |---|---|---|
 | HFileSDK Java JNI | `configure()` 非法 JSON、空路径错误、非法 row key rule、Java 生成 Arrow 文件并经 JNI 完成真实转换 | `test_java_jni_integration` |
-| HBase Reader 黑盒校验 | Java/JNI 生成固定 fixture，再用 HBase 原生 Reader 校验 major version、entry count、compression、encoding、row 顺序 | `test_java_hbase_reader_verify` |
+| HBase Reader 黑盒校验 | Java/JNI 生成固定 fixture，再用 HBase 原生 Reader 校验 major version、entry count、compression、encoding，以及 row/family/qualifier/value/type 顺序 | `test_java_hbase_reader_verify` |
 
 ## 当前边界
 

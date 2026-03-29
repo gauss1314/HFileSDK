@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-build-coverage}"
+BUILD_DIR="${BUILD_DIR:-build}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 JOBS="${JOBS:-}"
 CMAKE_ARGS=()
@@ -35,22 +35,16 @@ CONFIGURE_CMD=(
   -S "${ROOT_DIR}"
   -B "${ROOT_DIR}/${BUILD_DIR}"
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-  -DHFILE_ENABLE_COVERAGE=ON
 )
 if ((${#CMAKE_ARGS[@]} > 0)); then
   CONFIGURE_CMD+=("${CMAKE_ARGS[@]}")
 fi
 
-echo "==> Configuring coverage build: ${BUILD_DIR}"
+echo "==> Configuring build: ${BUILD_DIR}"
 "${CONFIGURE_CMD[@]}"
 
-echo "==> Building coverage targets"
+echo "==> Building targets"
 cmake --build "${ROOT_DIR}/${BUILD_DIR}" -j"${JOBS}"
 
-echo "==> Running coverage pipeline"
-cmake --build "${ROOT_DIR}/${BUILD_DIR}" --target hfile_coverage_ci
-
 echo ""
-echo "Coverage summary: ${ROOT_DIR}/${BUILD_DIR}/coverage/summary.txt"
-echo "Coverage HTML:    ${ROOT_DIR}/${BUILD_DIR}/coverage/html/index.html"
-echo "CI artifacts:     ${ROOT_DIR}/${BUILD_DIR}/artifacts"
+echo "Build directory: ${ROOT_DIR}/${BUILD_DIR}"

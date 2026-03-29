@@ -59,6 +59,10 @@ execute_process(
           --expect-compression NONE
           --expect-encoding NONE
           --expect-rows row1,row1,row2,row2
+          --expect-families cf,cf,cf,cf
+          --expect-qualifiers id,value,id,value
+          --expect-values row1,value1,row2,value2
+          --expect-types Put,Put,Put,Put
   WORKING_DIRECTORY "${HFILE_VERIFY_MODULE_DIR}"
   RESULT_VARIABLE HFILE_VERIFY_STATUS
 )

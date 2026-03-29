@@ -47,8 +47,42 @@ struct GroupedCell {
 
 // ─── Arrow scalar → UTF-8 string (for rowValue building) ──────────────────────
 
-static std::string scalar_to_string(const arrow::Array& arr, int64_t row) {
-    if (arr.IsNull(row)) return "";
+static int64_t normalize_timestamp_to_millis(int64_t value, arrow::TimeUnit::type unit) {
+    switch (unit) {
+    case arrow::TimeUnit::SECOND: return value * 1000;
+    case arrow::TimeUnit::MILLI:  return value;
+    case arrow::TimeUnit::MICRO:  return value / 1000;
+    case arrow::TimeUnit::NANO:   return value / 1000000;
+    }
+    return value;
+}
+
+static bool is_supported_rowkey_type(const std::shared_ptr<arrow::DataType>& type) {
+    using T = arrow::Type;
+    switch (type->id()) {
+    case T::STRING:
+    case T::LARGE_STRING:
+    case T::INT8:
+    case T::INT16:
+    case T::INT32:
+    case T::INT64:
+    case T::UINT8:
+    case T::UINT16:
+    case T::UINT32:
+    case T::UINT64:
+    case T::FLOAT:
+    case T::DOUBLE:
+    case T::BOOL:
+    case T::TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static Status scalar_to_string(const arrow::Array& arr, int64_t row, std::string* out) {
+    out->clear();
+    if (arr.IsNull(row)) return Status::OK();
 
     using T = arrow::Type;
     auto t = arr.type_id();
@@ -57,33 +91,35 @@ static std::string scalar_to_string(const arrow::Array& arr, int64_t row) {
     case T::STRING: {
         auto& sa = static_cast<const arrow::StringArray&>(arr);
         auto sv = sa.GetView(row);
-        return std::string(sv.data(), sv.size());
+        *out = std::string(sv.data(), sv.size());
+        return Status::OK();
     }
     case T::LARGE_STRING: {
         auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
         auto sv = sa.GetView(row);
-        return std::string(sv.data(), sv.size());
+        *out = std::string(sv.data(), sv.size());
+        return Status::OK();
     }
-    case T::INT8:   return std::to_string(static_cast<const arrow::Int8Array&>(arr).Value(row));
-    case T::INT16:  return std::to_string(static_cast<const arrow::Int16Array&>(arr).Value(row));
-    case T::INT32:  return std::to_string(static_cast<const arrow::Int32Array&>(arr).Value(row));
-    case T::INT64:  return std::to_string(static_cast<const arrow::Int64Array&>(arr).Value(row));
-    case T::UINT8:  return std::to_string(static_cast<const arrow::UInt8Array&>(arr).Value(row));
-    case T::UINT16: return std::to_string(static_cast<const arrow::UInt16Array&>(arr).Value(row));
-    case T::UINT32: return std::to_string(static_cast<const arrow::UInt32Array&>(arr).Value(row));
-    case T::UINT64: return std::to_string(static_cast<const arrow::UInt64Array&>(arr).Value(row));
-    case T::FLOAT:  return std::to_string(static_cast<const arrow::FloatArray&>(arr).Value(row));
-    case T::DOUBLE: return std::to_string(static_cast<const arrow::DoubleArray&>(arr).Value(row));
-    case T::BOOL:
-        return static_cast<const arrow::BooleanArray&>(arr).Value(row) ? "1" : "0";
+    case T::INT8:   *out = std::to_string(static_cast<const arrow::Int8Array&>(arr).Value(row)); return Status::OK();
+    case T::INT16:  *out = std::to_string(static_cast<const arrow::Int16Array&>(arr).Value(row)); return Status::OK();
+    case T::INT32:  *out = std::to_string(static_cast<const arrow::Int32Array&>(arr).Value(row)); return Status::OK();
+    case T::INT64:  *out = std::to_string(static_cast<const arrow::Int64Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT8:  *out = std::to_string(static_cast<const arrow::UInt8Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT16: *out = std::to_string(static_cast<const arrow::UInt16Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT32: *out = std::to_string(static_cast<const arrow::UInt32Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT64: *out = std::to_string(static_cast<const arrow::UInt64Array&>(arr).Value(row)); return Status::OK();
+    case T::FLOAT:  *out = std::to_string(static_cast<const arrow::FloatArray&>(arr).Value(row)); return Status::OK();
+    case T::DOUBLE: *out = std::to_string(static_cast<const arrow::DoubleArray&>(arr).Value(row)); return Status::OK();
+    case T::BOOL:   *out = static_cast<const arrow::BooleanArray&>(arr).Value(row) ? "1" : "0"; return Status::OK();
     case T::TIMESTAMP: {
-        return std::to_string(static_cast<const arrow::Int64Array&>(arr).Value(row));
+        auto& ta = static_cast<const arrow::TimestampArray&>(arr);
+        auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
+        *out = std::to_string(normalize_timestamp_to_millis(ta.Value(row), unit));
+        return Status::OK();
     }
     default:
-        // Fallback: ToString
-        auto s = arr.GetScalar(row);
-        if (s.ok()) return s.ValueOrDie()->ToString();
-        return "";
+        return Status::InvalidArg("SCHEMA_MISMATCH: unsupported Arrow type for row key field: " +
+                                  arr.type()->ToString());
     }
 }
 
@@ -198,6 +234,20 @@ static Status build_sort_index(
     auto schema = reader->schema();
     int num_cols = schema->num_fields();
 
+    if (max_col_idx >= num_cols) {
+        return Status::InvalidArg(
+            "SCHEMA_MISMATCH: rowKeyRule references column index " +
+            std::to_string(max_col_idx) + " but Arrow schema has only " +
+            std::to_string(num_cols) + " columns");
+    }
+    for (int c = 0; c <= max_col_idx; ++c) {
+        if (!is_supported_rowkey_type(schema->field(c)->type())) {
+            return Status::InvalidArg(
+                "SCHEMA_MISMATCH: unsupported Arrow type for row key field '" +
+                schema->field(c)->name() + "': " + schema->field(c)->type()->ToString());
+        }
+    }
+
     std::shared_ptr<arrow::RecordBatch> batch;
     int32_t batch_idx = 0;
 
@@ -222,7 +272,11 @@ static Status build_sort_index(
             row_val.reserve(static_cast<size_t>(max_i) * 12);
             for (int c = 0; c < max_i; ++c) {
                 if (c > 0) row_val += '|';
-                row_val += scalar_to_string(*batch->column(c), r);
+                std::string field;
+                auto field_status = scalar_to_string(*batch->column(c), r, &field);
+                if (!field_status.ok())
+                    return field_status;
+                row_val += field;
             }
 
             // Build fields view
@@ -347,6 +401,8 @@ ConvertResult convert(const ConvertOptions& opts) {
         if (!s.ok()) {
             result.error_code = s.message().find("MemoryBudget:") == 0
                 ? ErrorCode::MEMORY_EXHAUSTED
+                : s.message().find("SCHEMA_MISMATCH:") == 0
+                    ? ErrorCode::SCHEMA_MISMATCH
                 : ErrorCode::ARROW_FILE_ERROR;
             result.error_message = s.message();
             clog::err("Pass 1 failed: " + s.message());

@@ -170,7 +170,9 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 | `padMode` | `LEFT`（默认）或 `RIGHT` | `LEFT` |
 | `padContent` | 填充字符 | `0` |
 
-特殊名 `$RND$`：生成 `padLen` 位随机数字，每位 **0–8**（镜像 `UniverseHbaseBeanUtil.SEED=9`）。
+特殊名 `$RND$` / `RANDOM` / `RANDOM_COL`：生成 `padLen` 位随机数字，每位 **0–8**（镜像 `UniverseHbaseBeanUtil.SEED=9`）。
+特殊名 `FILL` / `FILL_COL`：使用空串后继续执行填充/反转。
+编码名 `long(...)` / `short(...)`：按 Java 兼容逻辑对字段做数值编码，当前支持 `short(hash)` / `long(hash)`。
 
 处理顺序：取字段值 → 填充（LEFT/RIGHT）→ 反转（与 Java `setValue()` 完全一致）。
 
@@ -228,7 +230,7 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
   - BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
   - I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos`
   - Java JNI：`configure()` 非法 JSON、空路径、非法 row key rule、Java 生成 Arrow 并经 JNI 完成转换
-  - HBase Reader：JNI 生成固定 HFile 后，用 `hfile-verify` 黑盒校验版本、entry count、编码、压缩与 row 顺序
+  - HBase Reader：JNI 生成固定 HFile 后，用 `hfile-verify` 黑盒校验版本、entry count、编码、压缩，以及 row/family/qualifier/value/type 顺序
 
 ---
 

@@ -44,7 +44,12 @@ package com.hfile;
  *   <li>{@code padMode} — {@code LEFT} (default) or {@code RIGHT}
  *   <li>{@code padContent} — pad character, default {@code 0}
  * </ul>
- * Special name {@code $RND$}: generates {@code padLen} random digits (0–8).
+ * Special names:
+ * <ul>
+ *   <li>{@code $RND$} / {@code RANDOM} / {@code RANDOM_COL} — generate {@code padLen} random digits (0–8)
+ *   <li>{@code FILL} / {@code FILL_COL} — use an empty string, then still apply padding/reverse rules
+ *   <li>{@code long(...)} / {@code short(...)} — Java-compatible numeric encoding segments; current transforms include {@code hash}
+ * </ul>
  *
  * <h3>Design note: rowValue removed</h3>
  * Earlier API versions accepted a {@code rowValue} parameter.

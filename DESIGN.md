@@ -311,7 +311,9 @@ colName,index,isReverse,padLen[,padMode][,padContent]
 | `padMode` | `LEFT`（默认，前缀补 `padContent`）或 `RIGHT` | `LEFT` |
 | `padContent` | 填充字符 | `0` |
 
-**特殊名称 `$RND$`**：不读取列值，生成 `padLen` 位随机数字（每位 0–8，与 `UniverseHbaseBeanUtil.SEED=9` 对应）。
+**特殊名称 `$RND$` / `RANDOM` / `RANDOM_COL`**：不读取列值，生成 `padLen` 位随机数字（每位 0–8，与 `UniverseHbaseBeanUtil.SEED=9` 对应）。  
+**特殊名称 `FILL` / `FILL_COL`**：取空串后继续执行填充/反转。  
+**编码名称 `long(...)` / `short(...)`**：对字段值执行 Java 兼容的数值编码，当前已支持 `short(hash)` / `long(hash)` 这类写法，输出为 Big-Endian 字节的 Base64 字符串。
 
 #### 示例（来自设计文档）
 
@@ -340,6 +342,8 @@ Arrow 行第 i 列的字符串值  →  pipe 拼接  →  rowValue
     → rowValue = "20240301123000|460001234567890|13800138000"
 ```
 
+当 `rowKeyRule` 引用的列索引超出 Arrow Schema，或字段类型不在支持集合内（例如 `Binary`），转换会返回 `SCHEMA_MISMATCH`，而不是静默生成错误 RowKey。
+
 这样 JNI 接口只需要 `arrowPath`、`hfilePath`、`tableName`、`rowKeyRule`，**rowValue 参数已删除**。
 
 #### 实现：`src/arrow/row_key_builder.h/.cc`
@@ -356,6 +360,75 @@ for (int64_t r = 0; r < batch.num_rows(); ++r) {
     sort_index.push_back({rk, batch_idx, r});
 }
 ```
+
+#### 已实现流程图（Arrow → rowValue → RowKey）
+
+```mermaid
+flowchart TD
+    A["convert(opts)"] --> B["RowKeyBuilder::compile(row_key_rule)"]
+    B --> C["按 # 拆分规则段"]
+    C --> D["每段按 , 解析
+name,index,isReverse,padLen[,padMode][,padContent]"]
+    D --> E["识别段类型
+ColumnRef / Random / Fill / EncodedColumn"]
+
+    E --> F["build_sort_index()
+第一遍扫描 Arrow"]
+    F --> G["对 0..max_col_idx 列逐个调用 scalar_to_string()"]
+    G --> H["用 | 拼接成 rowValue"]
+    H --> I["split_row_value(rowValue, max_col_idx + 2)
+保留空字段"]
+    I --> J["RowKeyBuilder::build(fields)"]
+
+    J --> K{"遍历每个 segment"}
+    K --> L["Random
+生成 0~8 随机数字"]
+    K --> M["Fill
+取空串"]
+    K --> N["ColumnRef
+取 fields[index]"]
+    K --> O["EncodedColumn
+取 fields[index]
+可选 hash
+再做 long()/short()
+Big-Endian + Base64"]
+
+    L --> P["apply_segment()
+pad -> reverse"]
+    M --> P
+    N --> P
+    O --> P
+
+    P --> Q["result += segment_value"]
+    Q --> R{"还有下一段?"}
+    R -- 是 --> K
+    R -- 否 --> S["得到最终 RowKey"]
+    S --> T["写入 SortEntry{row_key,batch_idx,row_idx}"]
+```
+
+#### 已实现函数调用关系图
+
+```mermaid
+flowchart LR
+    A["convert()"] --> B["RowKeyBuilder::compile()"]
+    A --> C["build_sort_index()"]
+    C --> D["scalar_to_string()"]
+    C --> E["split_row_value()"]
+    C --> F["RowKeyBuilder::build()"]
+    F --> G["random_digits()"]
+    F --> H["encode_long_or_short()"]
+    F --> I["apply_segment()"]
+    H --> J["java_hash_numeric_string()"]
+    H --> K["write_be16()/write_be64()"]
+    H --> L["base64_encode()"]
+```
+
+#### 各阶段一句话说明
+
+1. **Arrow → rowValue**：第一遍扫描 Arrow，只取 `rowKeyRule` 需要的前 `0..max_col_idx` 列，逐列字符串化后用 `|` 拼接成 `rowValue`。
+2. **解析 rowKeyRule**：`compile()` 把规则拆成多个 segment，并识别每段是普通列、随机段、填充段还是编码段。
+3. **逐段生成 RowKey**：`build()` 逐段取值；编码段还会执行 `hash`、`long()`、`short()` 和 Base64。
+4. **拼接所有段**：每段统一经过 `pad -> reverse` 后，依次追加到 `result`，形成最终 RowKey。
 
 ### 4.3 AutoSort（v4.0 实现）
 
@@ -789,7 +862,7 @@ HFileSDK/
 - BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
 - I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos` 掉电/磁盘满模拟
 - Java JNI：`configure()` 非法 JSON、空路径、非法 row key rule、Java→JNI→HFile 本地转换闭环
-- HBase Reader：固定 fixture 由 JNI 生成后，使用 HBase 原生 Reader 校验版本、entry count、编码、压缩与 row 顺序
+- HBase Reader：固定 fixture 由 JNI 生成后，使用 HBase 原生 Reader 校验版本、entry count、编码、压缩，以及 row/family/qualifier/value/type 顺序
 
 ### 10.2 调试辅助
 

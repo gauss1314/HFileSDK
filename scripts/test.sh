@@ -3,10 +3,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-build-coverage}"
+BUILD_DIR="${BUILD_DIR:-build}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-Release}"
 JOBS="${JOBS:-}"
 CMAKE_ARGS=()
+CTEST_ARGS=()
 
 if [[ -z "${JOBS}" ]]; then
   if command -v sysctl >/dev/null 2>&1; then
@@ -27,7 +28,20 @@ if [[ -d "${DEFAULT_PREFIX}" ]]; then
 fi
 
 if [[ $# -gt 0 ]]; then
-  CMAKE_ARGS+=("$@")
+  if [[ "$1" == "--" ]]; then
+    shift
+    CTEST_ARGS+=("$@")
+  else
+    while [[ $# -gt 0 ]]; do
+      if [[ "$1" == "--" ]]; then
+        shift
+        CTEST_ARGS+=("$@")
+        break
+      fi
+      CMAKE_ARGS+=("$1")
+      shift
+    done
+  fi
 fi
 
 CONFIGURE_CMD=(
@@ -35,22 +49,25 @@ CONFIGURE_CMD=(
   -S "${ROOT_DIR}"
   -B "${ROOT_DIR}/${BUILD_DIR}"
   -DCMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
-  -DHFILE_ENABLE_COVERAGE=ON
 )
 if ((${#CMAKE_ARGS[@]} > 0)); then
   CONFIGURE_CMD+=("${CMAKE_ARGS[@]}")
 fi
 
-echo "==> Configuring coverage build: ${BUILD_DIR}"
+CTEST_CMD=(
+  ctest
+  --test-dir "${ROOT_DIR}/${BUILD_DIR}"
+  --output-on-failure
+)
+if ((${#CTEST_ARGS[@]} > 0)); then
+  CTEST_CMD+=("${CTEST_ARGS[@]}")
+fi
+
+echo "==> Configuring test build: ${BUILD_DIR}"
 "${CONFIGURE_CMD[@]}"
 
-echo "==> Building coverage targets"
+echo "==> Building test targets"
 cmake --build "${ROOT_DIR}/${BUILD_DIR}" -j"${JOBS}"
 
-echo "==> Running coverage pipeline"
-cmake --build "${ROOT_DIR}/${BUILD_DIR}" --target hfile_coverage_ci
-
-echo ""
-echo "Coverage summary: ${ROOT_DIR}/${BUILD_DIR}/coverage/summary.txt"
-echo "Coverage HTML:    ${ROOT_DIR}/${BUILD_DIR}/coverage/html/index.html"
-echo "CI artifacts:     ${ROOT_DIR}/${BUILD_DIR}/artifacts"
+echo "==> Running ctest"
+"${CTEST_CMD[@]}"

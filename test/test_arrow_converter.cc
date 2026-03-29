@@ -500,6 +500,96 @@ TEST(ArrowConverter, ConvertRejectsInvalidRowKeyRule) {
     fs::remove_all(dir);
 }
 
+TEST(ArrowConverter, ConvertRejectsSchemaMismatchWhenRowKeyColumnMissing) {
+    auto batch = make_wide_batch(1);
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.row_key_rule = "ID,9,false,0";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::SCHEMA_MISMATCH);
+    EXPECT_NE(result.error_message.find("SCHEMA_MISMATCH"), std::string::npos);
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertRejectsUnsupportedBinaryRowKeyField) {
+    arrow::BinaryBuilder key_builder;
+    arrow::StringBuilder payload_builder;
+    ARROW_EXPECT_OK(key_builder.Append("row1", 4));
+    ARROW_EXPECT_OK(payload_builder.Append("v1"));
+
+    std::shared_ptr<arrow::Array> key_arr, payload_arr;
+    ARROW_EXPECT_OK(key_builder.Finish(&key_arr));
+    ARROW_EXPECT_OK(payload_builder.Finish(&payload_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::binary()),
+        arrow::field("payload", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 1, {key_arr, payload_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.row_key_rule = "ID,0,false,0";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::SCHEMA_MISMATCH);
+    EXPECT_NE(result.error_message.find("unsupported Arrow type"), std::string::npos);
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertAcceptsLongHashRowKeyRule) {
+    arrow::StringBuilder id_builder;
+    arrow::StringBuilder value_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append("123456789"));
+    ARROW_EXPECT_OK(value_builder.Append("v1"));
+    ARROW_EXPECT_OK(id_builder.Append("223456789"));
+    ARROW_EXPECT_OK(value_builder.Append("v2"));
+
+    std::shared_ptr<arrow::Array> id_arr, value_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(value_builder.Finish(&value_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::utf8()),
+        arrow::field("payload", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {id_arr, value_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "long(hash),0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1234;
+    opts.writer_opts.column_family = "cf";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::OK);
+    EXPECT_EQ(result.kv_written_count, 4);
+    EXPECT_TRUE(fs::exists(hfile_path));
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream) {
     auto dir = make_temp_dir();
     auto arrow_path = dir / "broken.arrow";

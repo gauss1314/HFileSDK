@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <array>
 using namespace hfile::arrow_convert;
 
 static int T=0, P=0;
@@ -16,6 +17,35 @@ static int T=0, P=0;
     if(_a==_b){++P;}else{\
         fprintf(stderr,"  FAIL %s:%d  [%s] != [%s]\n",__FILE__,__LINE__,\
             ([](auto v)->std::string{if constexpr(std::is_integral_v<decltype(v)>)return std::to_string(v);else return std::string(v);}(_a).c_str()),([](auto v)->std::string{if constexpr(std::is_integral_v<decltype(v)>)return std::to_string(v);else return std::string(v);}(_b).c_str()));}}while(0)
+
+static std::string b64(std::span<const uint8_t> data) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    out.reserve(((data.size() + 2) / 3) * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+        bool have_b1 = i + 1 < data.size();
+        bool have_b2 = i + 2 < data.size();
+        if (have_b1) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+        if (have_b2) n |= static_cast<uint32_t>(data[i + 2]);
+        out.push_back(kAlphabet[(n >> 18) & 0x3F]);
+        out.push_back(kAlphabet[(n >> 12) & 0x3F]);
+        out.push_back(have_b1 ? kAlphabet[(n >> 6) & 0x3F] : '=');
+        out.push_back(have_b2 ? kAlphabet[n & 0x3F] : '=');
+    }
+    return out;
+}
+
+static int16_t java_hash_string(std::string_view value) {
+    long long tmp = std::stoll(std::string(value));
+    long long part1 = tmp >> 32;
+    long long part2 = tmp & ((2LL << 32) - 1LL);
+    long long result = 1LL;
+    result = 31LL * result + part1;
+    result = 31LL * result + part2;
+    return static_cast<int16_t>(result % 65535LL);
+}
 
 // ─── split_row_value ──────────────────────────────────────────────────────────
 void test_split_basic(){
@@ -180,6 +210,60 @@ void test_rnd_dollar_variants(){
         for (char c : r) EXPECT(c >= '0' && c <= '8');
     }
 }
+void test_fill_alias_uses_empty_then_padding(){
+    auto [b, s] = RowKeyBuilder::compile("FILL,9,false,4");
+    EXPECT(s.ok());
+    auto f = split_row_value("hello|world");
+    EXPECT_EQ(b.build(f), "0000");
+}
+void test_random_alias_supported(){
+    auto [b, s] = RowKeyBuilder::compile("RANDOM,0,false,5");
+    EXPECT(s.ok());
+    auto f = split_row_value("x");
+    auto r = b.build(f);
+    EXPECT_EQ(r.size(), 5u);
+    for (char c : r) EXPECT(c >= '0' && c <= '8');
+}
+void test_random_col_alias_supported(){
+    auto [b, s] = RowKeyBuilder::compile("RANDOM_COL,0,false,5");
+    EXPECT(s.ok());
+    auto f = split_row_value("x");
+    auto r = b.build(f);
+    EXPECT_EQ(r.size(), 5u);
+    for (char c : r) EXPECT(c >= '0' && c <= '8');
+}
+void test_fill_col_alias_uses_empty_then_padding(){
+    auto [b, s] = RowKeyBuilder::compile("FILL_COL,9,true,4");
+    EXPECT(s.ok());
+    auto f = split_row_value("hello|world");
+    EXPECT_EQ(b.build(f), "0000");
+}
+void test_short_hash_matches_java_semantics(){
+    auto [b, s] = RowKeyBuilder::compile("short(hash),0,false,0");
+    EXPECT(s.ok());
+    auto f = split_row_value("123456789");
+    int16_t hashed = java_hash_string("123456789");
+    std::array<uint8_t, 2> bytes{};
+    hfile::write_be16(bytes.data(), static_cast<uint16_t>(hashed));
+    EXPECT_EQ(b.build(f), b64(bytes));
+}
+void test_long_plain_matches_java_semantics(){
+    auto [b, s] = RowKeyBuilder::compile("long(),0,false,0");
+    EXPECT(s.ok());
+    auto f = split_row_value("123456789");
+    std::array<uint8_t, 8> bytes{};
+    hfile::write_be64(bytes.data(), static_cast<uint64_t>(123456789LL));
+    EXPECT_EQ(b.build(f), b64(bytes));
+}
+void test_long_hash_matches_java_semantics(){
+    auto [b, s] = RowKeyBuilder::compile("long(hash),0,false,0");
+    EXPECT(s.ok());
+    auto f = split_row_value("123456789");
+    int16_t hashed = java_hash_string("123456789");
+    std::array<uint8_t, 8> bytes{};
+    hfile::write_be64(bytes.data(), static_cast<uint64_t>(static_cast<int64_t>(hashed)));
+    EXPECT_EQ(b.build(f), b64(bytes));
+}
 
 // ─── AutoSort: verify that identical rowKeyRule applied to sorted/unsorted
 //     rows produces the same output order ──────────────────────────────────────
@@ -230,6 +314,13 @@ int main(){
     test_empty_field_value();
     test_max_col_index();
     test_rnd_dollar_variants();
+    test_fill_alias_uses_empty_then_padding();
+    test_random_alias_supported();
+    test_random_col_alias_supported();
+    test_fill_col_alias_uses_empty_then_padding();
+    test_short_hash_matches_java_semantics();
+    test_long_plain_matches_java_semantics();
+    test_long_hash_matches_java_semantics();
     test_sort_invariant();
     printf("Tests run: %d  Passed: %d  Failed: %d\n\n", T, P, T-P);
     return (P==T) ? 0 : 1;

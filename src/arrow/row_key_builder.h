@@ -18,7 +18,14 @@ namespace arrow_convert {
 ///   Each SEG: "name,index,isReverse,padLen[,padMode][,padContent]"
 ///
 /// Special names:
-///   $RND$   — generate padLen random digits (0–8), index field ignored
+///   $RND$ / RANDOM / RANDOM_COL — generate padLen random digits (0–8), index field ignored
+///   FILL / FILL_COL             — use empty string, then still apply pad/reverse
+///
+/// Java-compatible encoded names:
+///   long(...), short(...)
+/// with optional nested transforms such as:
+///   short(hash)
+///   long(hash(...))
 ///
 /// Examples:
 ///   "STARTTIME,0,false,10"              → col[0], no reverse, left-pad to 10 with '0'
@@ -26,7 +33,9 @@ namespace arrow_convert {
 ///   "MSISDN,2,false,11,RIGHT"           → col[2], right-pad to 11 with '0'
 ///   "$RND$,3,false,4"                   → 4 random digits (0–8)
 struct RowKeySegment {
-    enum class Type { ColumnRef, Random };
+    enum class Type { ColumnRef, Random, Fill, EncodedColumn };
+    enum class EncodeKind { None, Int64Base64, Int16Base64 };
+    enum class Transform { Hash };
 
     Type        type       = Type::ColumnRef;
     std::string name;           // original column name (informational)
@@ -35,6 +44,8 @@ struct RowKeySegment {
     int         pad_len    = 0; // target length; 0 = no padding
     bool        pad_right  = false;  // false = LEFT (default), true = RIGHT
     char        pad_char   = '0';
+    EncodeKind  encode_kind = EncodeKind::None;
+    std::vector<Transform> transforms;
 };
 
 /// Compiled Row Key builder from a rowKeyRule expression.

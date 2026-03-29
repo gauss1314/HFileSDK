@@ -32,6 +32,11 @@ public class HFileVerifier {
         String compression;
         String encoding;
         List<String> rows = List.of();
+        List<String> families = List.of();
+        List<String> qualifiers = List.of();
+        List<String> values = List.of();
+        List<String> types = List.of();
+        List<Long> timestamps = List.of();
     }
 
     private int totalFiles   = 0;
@@ -59,6 +64,16 @@ public class HFileVerifier {
             .hasArg().desc("Expected data block encoding name").build());
         opts.addOption(Option.builder().longOpt("expect-rows")
             .hasArg().desc("Comma-separated expected row sequence").build());
+        opts.addOption(Option.builder().longOpt("expect-families")
+            .hasArg().desc("Comma-separated expected family sequence").build());
+        opts.addOption(Option.builder().longOpt("expect-qualifiers")
+            .hasArg().desc("Comma-separated expected qualifier sequence").build());
+        opts.addOption(Option.builder().longOpt("expect-values")
+            .hasArg().desc("Comma-separated expected UTF-8 value sequence").build());
+        opts.addOption(Option.builder().longOpt("expect-types")
+            .hasArg().desc("Comma-separated expected cell type sequence").build());
+        opts.addOption(Option.builder().longOpt("expect-timestamps")
+            .hasArg().desc("Comma-separated expected timestamp sequence").build());
 
         CommandLineParser parser = new DefaultParser();
         CommandLine cmd;
@@ -141,10 +156,31 @@ public class HFileVerifier {
             expectations.encoding = cmd.getOptionValue("expect-encoding");
         }
         if (cmd.hasOption("expect-rows")) {
-            String raw = cmd.getOptionValue("expect-rows").trim();
-            expectations.rows = raw.isEmpty() ? List.of() : Arrays.asList(raw.split(",", -1));
+            expectations.rows = parseCsv(cmd.getOptionValue("expect-rows"));
+        }
+        if (cmd.hasOption("expect-families")) {
+            expectations.families = parseCsv(cmd.getOptionValue("expect-families"));
+        }
+        if (cmd.hasOption("expect-qualifiers")) {
+            expectations.qualifiers = parseCsv(cmd.getOptionValue("expect-qualifiers"));
+        }
+        if (cmd.hasOption("expect-values")) {
+            expectations.values = parseCsv(cmd.getOptionValue("expect-values"));
+        }
+        if (cmd.hasOption("expect-types")) {
+            expectations.types = parseCsv(cmd.getOptionValue("expect-types"));
+        }
+        if (cmd.hasOption("expect-timestamps")) {
+            expectations.timestamps = parseCsv(cmd.getOptionValue("expect-timestamps")).stream()
+                .map(Long::parseLong)
+                .toList();
         }
         return expectations;
+    }
+
+    private static List<String> parseCsv(String raw) {
+        String trimmed = raw.trim();
+        return trimmed.isEmpty() ? List.of() : Arrays.asList(trimmed.split(",", -1));
     }
 
     private void verifyFile(File file, boolean verbose, long maxKVs, Expectations expectations) {
@@ -219,6 +255,11 @@ public class HFileVerifier {
             long kvCount  = 0;
             boolean sortOk = true;
             List<String> actualRows = new ArrayList<>();
+            List<String> actualFamilies = new ArrayList<>();
+            List<String> actualQualifiers = new ArrayList<>();
+            List<String> actualValues = new ArrayList<>();
+            List<String> actualTypes = new ArrayList<>();
+            List<Long> actualTimestamps = new ArrayList<>();
 
             do {
                 Cell cell = scanner.getCell();
@@ -236,17 +277,22 @@ public class HFileVerifier {
                     }
                 }
                 actualRows.add(Bytes.toString(CellUtil.cloneRow(cell)));
+                actualFamilies.add(Bytes.toString(CellUtil.cloneFamily(cell)));
+                actualQualifiers.add(Bytes.toString(CellUtil.cloneQualifier(cell)));
+                actualValues.add(Bytes.toString(CellUtil.cloneValue(cell)));
+                actualTypes.add(cell.getType().toString());
+                actualTimestamps.add(cell.getTimestamp());
 
                 if (verbose && kvCount < 20) {
                     System.out.printf(
-                        "  KV[%d]: row=%s  col=%s:%s  ts=%d  type=%s  valLen=%d%n",
+                        "  KV[%d]: row=%s  col=%s:%s  ts=%d  type=%s  value=%s%n",
                         kvCount,
                         Bytes.toStringBinary(CellUtil.cloneRow(cell)),
                         Bytes.toStringBinary(CellUtil.cloneFamily(cell)),
                         Bytes.toStringBinary(CellUtil.cloneQualifier(cell)),
                         cell.getTimestamp(),
                         cell.getType(),
-                        cell.getValueLength());
+                        Bytes.toStringBinary(CellUtil.cloneValue(cell)));
                 }
 
                 prevCell = cell;
@@ -262,6 +308,31 @@ public class HFileVerifier {
                 throw new RuntimeException(
                     "Row sequence mismatch: expected=" + expectations.rows +
                     ", actual=" + actualRows);
+            }
+            if (!expectations.families.isEmpty() && !actualFamilies.equals(expectations.families)) {
+                throw new RuntimeException(
+                    "Family sequence mismatch: expected=" + expectations.families +
+                    ", actual=" + actualFamilies);
+            }
+            if (!expectations.qualifiers.isEmpty() && !actualQualifiers.equals(expectations.qualifiers)) {
+                throw new RuntimeException(
+                    "Qualifier sequence mismatch: expected=" + expectations.qualifiers +
+                    ", actual=" + actualQualifiers);
+            }
+            if (!expectations.values.isEmpty() && !actualValues.equals(expectations.values)) {
+                throw new RuntimeException(
+                    "Value sequence mismatch: expected=" + expectations.values +
+                    ", actual=" + actualValues);
+            }
+            if (!expectations.types.isEmpty() && !actualTypes.equals(expectations.types)) {
+                throw new RuntimeException(
+                    "Type sequence mismatch: expected=" + expectations.types +
+                    ", actual=" + actualTypes);
+            }
+            if (!expectations.timestamps.isEmpty() && !actualTimestamps.equals(expectations.timestamps)) {
+                throw new RuntimeException(
+                    "Timestamp sequence mismatch: expected=" + expectations.timestamps +
+                    ", actual=" + actualTimestamps);
             }
 
             System.out.printf("  KVs scanned     : %,d%n", kvCount);
