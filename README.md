@@ -153,10 +153,16 @@ src/
   partition/            RegionPartitioner + CFGrouper
   arrow/                Arrow → KV 转换（WideTable / TallTable / RawKV）
 proto/                  FileTrailerProto（HFile v3）
-test/                   20 个测试文件（已全部纳入 ctest）
+test/                   21 个测试文件（已全部纳入 ctest）
 bench/                  微基准 + 端到端基准
 tools/                  Java 验证工具 + hfile-chaos + Python HTML 报告生成器
 ```
+
+***
+
+## 测试文档
+
+完整测试覆盖矩阵、运行方式和当前边界说明见 [TESTING.md](file:///Users/gauss/workspace/github_project/HFileSDK/TESTING.md)。
 
 ***
 

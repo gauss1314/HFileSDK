@@ -8,6 +8,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <limits>
 
 namespace fs = std::filesystem;
 using namespace hfile;
@@ -383,6 +384,72 @@ TEST(HFileWriter, DisableTagsAndMVCCShrinksOutput) {
     EXPECT_LT(fs::file_size(without_path), fs::file_size(with_path));
     fs::remove(with_path);
     fs::remove(without_path);
+}
+
+TEST(HFileWriter, AppendSpanOverloadWritesEntry) {
+    auto path = tmp_path("span_append");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> row = {'r', '1'};
+    std::vector<uint8_t> family = {'c', 'f'};
+    std::vector<uint8_t> qualifier = {'q'};
+    std::vector<uint8_t> value = {'v'};
+    std::vector<uint8_t> tags = {'t'};
+    auto st = w->append(
+        row, family, qualifier, 1000, value, KeyType::Put, tags, 7);
+    EXPECT_TRUE(st.ok()) << st.message();
+    EXPECT_EQ(w->entry_count(), 1u);
+    EXPECT_TRUE(w->finish().ok());
+    fs::remove(path);
+}
+
+TEST(HFileWriter, RowKeyTooLongRejected) {
+    auto path = tmp_path("row_key_too_long");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
+        .set_max_row_key_bytes(4)
+        .set_error_policy(ErrorPolicy::Strict)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    auto st = w->append(make_kv(rk, fam, q, v, "row_too_long", "col", 100, "v"));
+    EXPECT_FALSE(st.ok());
+    EXPECT_EQ(st.code(), Status::Code::InvalidArg);
+    EXPECT_NE(st.message().find("ROW_KEY_TOO_LONG"), std::string::npos);
+    fs::remove(path);
+}
+
+TEST(HFileWriter, DiskThresholdRejectsWrite) {
+    auto path = tmp_path("disk_threshold");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
+        .set_min_free_disk(std::numeric_limits<size_t>::max() / 2)
+        .set_disk_check_interval(1)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    auto st = w->append(make_kv(rk, fam, q, v, "row1", "col", 100, "value"));
+    EXPECT_FALSE(st.ok());
+    EXPECT_EQ(st.code(), Status::Code::IoError);
+    EXPECT_NE(st.message().find("DISK_SPACE_EXHAUSTED"), std::string::npos);
+    fs::remove(path);
 }
 
 TEST(HFileWriter, TrustedSortMode) {

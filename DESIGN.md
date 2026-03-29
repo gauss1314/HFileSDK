@@ -733,7 +733,7 @@ HFileSDK/
 │   ├── io/                  BufferedFileWriter / IoUringWriter / HdfsWriter
 │   ├── partition/           RegionPartitioner 实现 + CFGrouper
 │   └── arrow/               ArrowToKVConverter（3 种映射模式）
-├── test/                    20 个测试文件（已全部纳入 ctest）
+├── test/                    21 个测试文件（已全部纳入 ctest）
 ├── bench/
 │   ├── micro/               5 个 Google Benchmark 微基准
 │   └── macro/               1 个端到端基准
@@ -767,14 +767,26 @@ HFileSDK/
 
 ### 10.1 测试覆盖
 
+完整测试覆盖矩阵见 `TESTING.md`；此处保留设计层摘要。
+
 | 测试层次 | 覆盖范围 | 工具 | 数量 |
 |---------|---------|------|------|
-| 单元/回归测试 | 每个模块的核心逻辑与历史缺陷回归 | Google Test + 自定义框架 | 16 文件 |
-| 独立集成测试 | 跨模块交互（无外部依赖） | 同上 | 已纳入 `ctest` |
+| 单元/回归测试 | 编码、压缩、元数据、Writer、Arrow、BulkLoad、I/O、CFGrouper 与历史缺陷回归 | Google Test + 自定义框架 | 21 文件 |
+| `ctest` 目标 | 单元、集成、自定义测试与 chaos 故障注入入口 | GTest + 自定义测试 + `hfile-chaos` | 23 个 |
+| 独立集成测试 | `convert()`、BulkLoad、多批次统计、RawKV/TallTable 等跨模块交互 | 同上 | 已纳入 `ctest` |
 | 格式验证 | HFile 文件可被 HBase 原生 Reader 读取 | `hfile-verify` (Java) | 手动 |
 | Bulk Load 验证 | 完整链路 + HBase Scan 数据完整性 | `hfile-bulkload-verify` (Java) | 手动 |
 | 内存安全 | AddressSanitizer + UndefinedBehaviorSanitizer | Clang Sanitizers | 构建时选项 |
 | 性能回归 | 关键路径基准 | Google Benchmark | 6 个基准 |
+
+当前自动化测试矩阵已覆盖：
+
+- 编码与序列化：CRC32C、KV 编码、None/Prefix/Diff/FastDiff、VarInt 边界
+- 格式与元数据：Bloom、Index、FileInfo、Trailer
+- Writer 主链路：AutoSort、内存预算、磁盘阈值、tags/MVCC、排序校验、错误策略
+- Arrow 与转换编排：WideTable / TallTable / RawKV、坏 stream、非法 row key rule、空 row key 过滤、进度回调
+- BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
+- I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos` 掉电/磁盘满模拟
 
 ### 10.2 调试辅助
 
@@ -856,7 +868,6 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 
 ### 剩余工作（按优先级）
 
-**P1 — 功能完整性**
 **P2 — 数据驱动后决定**
 - [ ] **双缓冲 Pipeline**：先运行 `bench/java/` 拿到对比数据，若差距 < 3× 再实现
 - [ ] **AutoSort 外排序**：当前 AutoSort 将全量 batch 保留在内存；超大文件（> RAM）需外排序实现

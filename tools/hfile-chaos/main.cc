@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -174,18 +175,12 @@ int run_disk_full_sim(const Options& opts) {
     }
 
     fs::path hfile_path = opts.output_dir / "disk-full.hfile";
-    auto available = fs::space(opts.output_dir, ec).available;
-    if (ec) {
-        std::cerr << "Failed to query free space: " << ec.message() << "\n";
-        return 2;
-    }
-
     hfile::WriterOptions wo;
     wo.column_family = "cf";
     wo.sort_mode = hfile::WriterOptions::SortMode::PreSortedVerified;
     wo.fsync_policy = hfile::FsyncPolicy::Safe;
     wo.error_policy = hfile::ErrorPolicy::Strict;
-    wo.min_free_disk_bytes = available + 1;
+    wo.min_free_disk_bytes = std::numeric_limits<size_t>::max() / 2;
     wo.disk_check_interval_bytes = 1;
 
     auto status = write_workload(hfile_path, 1, opts.value_size, wo, false);

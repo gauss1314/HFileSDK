@@ -115,7 +115,7 @@ bench/
   micro/                Google Benchmark 微基准（5 个）
   macro/                端到端基准（1 个）
   java/                 Java HFile.Writer 基线 benchmark（Java 21）
-test/                   测试（20 个文件，已全部纳入 ctest）
+test/                   测试（21 个文件，已全部纳入 ctest）
 tools/
   hfile-verify/         Java HBase 原生 Reader 验证工具（Java 21）
   hfile-bulkload-verify/ Bulk Load 后数据完整性验证（Java 21）
@@ -206,6 +206,18 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 4. 运行故障注入测试：`hfile-chaos --mode kill-during-write --verify-no-corrupt-files`
 5. 如有 HDFS 环境，执行完整 Bulk Load 流程并用 hfile-bulkload-verify 验证
 
+### 当前测试矩阵
+
+- 完整测试说明见 `@TESTING.md`
+- 当前已纳入 `ctest` 的目标数为 **23**
+- 自动化覆盖已包含：
+  - 编码与序列化：CRC32C、KV 编码、None/Prefix/Diff/FastDiff、VarInt 边界
+  - 格式与元数据：Bloom、Index、FileInfo、Trailer
+  - Writer：AutoSort、内存预算、磁盘阈值、tags/MVCC、排序校验、错误策略
+  - Arrow/convert：WideTable、TallTable、RawKV、坏 stream、非法 row key rule、进度回调
+  - BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
+  - I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos`
+
 ---
 
 ## 实现阶段（当前状态）
@@ -229,7 +241,6 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 
 - ⏳ **双缓冲 Encode/Compress/IO Pipeline**：待 `bench/java/` 基线数据驱动后决定（见 DESIGN.md §11）
 - ⏳ **AutoSort 外排序**：当前全量 batch 保留内存；超大文件（> 可用 RAM）需外排序
-- ⏳ **`converter.cc` 集成测试**：需要真实 Arrow 16.0.0 库安装
 
 ---
 

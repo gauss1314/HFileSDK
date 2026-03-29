@@ -249,11 +249,14 @@ set(GTEST_SOURCES
   test/test_trailer.cc
   test/test_hfile_writer.cc
   test/test_prefix_encoder.cc
+  test/test_diff_encoder.cc
   test/test_fast_diff_encoder.cc
   test/test_index_writer.cc
   test/test_compressor.cc
   test/test_arrow_converter.cc
   test/test_region_partitioner.cc
+  test/test_cf_grouper.cc
+  test/test_io_writers.cc
   test/test_jni_json_utils.cc
   test/test_bulk_load_writer_behavior.cc
 )
