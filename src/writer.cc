@@ -42,8 +42,13 @@ static int64_t free_disk_bytes(const std::string& path) {
 #if defined(_WIN32) || defined(_WIN64)
     (void)path; return INT64_MAX;   // not implemented on Windows
 #else
+    namespace fs = std::filesystem;
+    fs::path probe{path};
+    std::error_code ec;
+    if (!fs::exists(probe, ec))
+        probe = probe.has_parent_path() ? probe.parent_path() : fs::current_path();
     struct statvfs st{};
-    if (::statvfs(path.c_str(), &st) != 0) return INT64_MAX;  // can't check = don't block
+    if (::statvfs(probe.c_str(), &st) != 0) return INT64_MAX;  // can't check = don't block
     return static_cast<int64_t>(st.f_bavail) * static_cast<int64_t>(st.f_frsize);
 #endif
 }
@@ -64,6 +69,29 @@ static Status validate_kv(const KeyValue& kv, const WriterOptions& opts) {
         return Status::InvalidArg(
             "NEGATIVE_TIMESTAMP: " + std::to_string(kv.timestamp));
     return Status::OK();
+}
+
+static OwnedKeyValue sanitize_owned_kv(const KeyValue& kv, const WriterOptions& opts) {
+    OwnedKeyValue out;
+    out.row.assign(kv.row.begin(), kv.row.end());
+    out.family.assign(kv.family.begin(), kv.family.end());
+    out.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+    out.timestamp = kv.timestamp;
+    out.key_type = kv.key_type;
+    out.value.assign(kv.value.begin(), kv.value.end());
+    if (opts.include_tags)
+        out.tags.assign(kv.tags.begin(), kv.tags.end());
+    out.memstore_ts = opts.include_mvcc ? kv.memstore_ts : 0;
+    return out;
+}
+
+static size_t estimate_owned_kv_bytes(const OwnedKeyValue& kv) noexcept {
+    return sizeof(OwnedKeyValue)
+         + kv.row.size()
+         + kv.family.size()
+         + kv.qualifier.size()
+         + kv.value.size()
+         + kv.tags.size();
 }
 
 // ─── Internal implementation class ───────────────────────────────────────────
@@ -94,8 +122,16 @@ public:
     Status open() {
         namespace fs = std::filesystem;
         fs::path p{path_};
-        if (p.has_parent_path())
-            fs::create_directories(p.parent_path());
+        if (opts_.bytes_per_checksum == 0)
+            return Status::InvalidArg("bytes_per_checksum must be > 0");
+        if (p.has_parent_path()) {
+            std::error_code ec;
+            fs::create_directories(p.parent_path(), ec);
+            if (ec)
+                return Status::IoError(
+                    "create_directories failed: " + p.parent_path().string() +
+                    ": " + ec.message());
+        }
 
         // ── Choose I/O backend based on FsyncPolicy ────────────────────────
         if (opts_.fsync_policy == FsyncPolicy::Safe) {
@@ -114,6 +150,11 @@ public:
                           opts_.bloom_type, opts_.bloom_error_rate);
 
         compress_buf_.resize(compressor_->max_compressed_size(opts_.block_size + 65536));
+        if (budget_) {
+            fixed_budget_bytes_ = compress_buf_.size();
+            auto s = budget_->reserve(fixed_budget_bytes_);
+            if (!s.ok()) return s;
+        }
         start_time_ = std::chrono::steady_clock::now();
         opened_     = true;
 
@@ -136,18 +177,12 @@ public:
 
             if (opts_.error_policy == ErrorPolicy::Strict)
                 return vs;
+            if (opts_.error_policy == ErrorPolicy::SkipBatch)
+                return Status::InvalidArg("SKIP_BATCH: " + vs.message());
             if (opts_.max_error_count > 0 && error_count_ > opts_.max_error_count)
                 return Status::InvalidArg(
                     "MAX_ERRORS_EXCEEDED: " + std::to_string(error_count_) + " errors");
-            return Status::OK();  // SkipRow / SkipBatch: swallow and continue
-        }
-
-        // ── Sort-order validation ─────────────────────────────────────────
-        if (opts_.sort_mode == WriterOptions::SortMode::PreSortedVerified &&
-            entry_count_ > 0) {
-            int cmp = compare_keys(kv, last_kv_.as_view());
-            if (cmp <= 0)
-                return Status::InvalidArg("SORT_ORDER_VIOLATION: KV out of order");
+            return Status::OK();  // SkipRow: swallow and continue
         }
 
         // ── Column family check ───────────────────────────────────────────
@@ -158,48 +193,16 @@ public:
                 "KeyValue family '" + std::string(kv_family) +
                 "' != configured family '" + opts_.column_family + "'");
 
-        // ── Periodic disk check ───────────────────────────────────────────
-        if (opts_.disk_check_interval_bytes > 0 &&
-            opts_.min_free_disk_bytes > 0) {
-            bytes_since_disk_check_ += kv.encoded_size();
-            if (bytes_since_disk_check_ >= opts_.disk_check_interval_bytes) {
-                bytes_since_disk_check_ = 0;
-                int64_t free = free_disk_bytes(path_);
-                if (free >= 0 &&
-                    static_cast<size_t>(free) < opts_.min_free_disk_bytes) {
-                    log::error("DISK_SPACE_EXHAUSTED: only " +
-                               std::to_string(free / 1024 / 1024) + " MB free");
-                    return Status::IoError("DISK_SPACE_EXHAUSTED");
-                }
-            }
+        if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
+            auto owned = sanitize_owned_kv(kv, opts_);
+            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
+            return Status::OK();
         }
 
-        // ── Encode → block ────────────────────────────────────────────────
-        if (!encoder_->append(kv)) {
-            HFILE_RETURN_IF_ERROR(flush_data_block());
-            if (!encoder_->append(kv))
-                return Status::Internal("Failed to append KV even after flush");
-        }
-
-        bloom_->add(kv.row);
-        if (opts_.bloom_type == BloomType::RowCol)
-            bloom_->add_row_col(kv.row, kv.qualifier);
-
-        uint32_t kl = kv.key_length();
-        uint32_t vl = static_cast<uint32_t>(kv.value.size());
-        total_key_bytes_   += kl;
-        total_value_bytes_ += vl;
-        max_tags_len_ = std::max(max_tags_len_,
-                                  static_cast<uint32_t>(kv.tags.size()));
-        size_t cell_size = 4 + 4 + kl + kv.value.size() + 2 + kv.tags.size() + 1;
-        max_cell_size_   = std::max(max_cell_size_, cell_size);
-
-        // Save last key for FileInfo + sort validation
-        save_last_key(kv);
-        if (entry_count_ == 0) save_first_key(kv);
-
-        ++entry_count_;
-        return Status::OK();
+        auto owned = sanitize_owned_kv(kv, opts_);
+        return append_materialized_kv(
+            owned.as_view(), true, true,
+            opts_.sort_mode == WriterOptions::SortMode::PreSortedVerified);
     }
 
     Status finish() {
@@ -212,6 +215,22 @@ public:
         //       and take corrective action.
 
         // Flush remaining data block
+        if (opts_.sort_mode == WriterOptions::SortMode::AutoSort &&
+            !auto_sorted_kvs_.empty()) {
+            std::stable_sort(auto_sorted_kvs_.begin(), auto_sorted_kvs_.end(),
+                             [](const OwnedKeyValue& a, const OwnedKeyValue& b) {
+                                 return compare_keys(a.as_view(), b.as_view()) < 0;
+                             });
+            for (const auto& kv : auto_sorted_kvs_) {
+                auto s = append_materialized_kv(kv.as_view(), false, false, true);
+                if (!s.ok()) return s;
+            }
+            if (budget_ && auto_sort_reserved_bytes_ > 0) {
+                budget_->release(auto_sort_reserved_bytes_);
+                auto_sort_reserved_bytes_ = 0;
+            }
+            auto_sorted_kvs_.clear();
+        }
         if (!encoder_->empty()) {
             HFILE_RETURN_IF_ERROR(flush_data_block());
         }
@@ -261,6 +280,7 @@ public:
         if (atomic_writer_) {
             HFILE_RETURN_IF_ERROR(atomic_writer_->commit());
         } else {
+            HFILE_RETURN_IF_ERROR(plain_writer_->flush());
             HFILE_RETURN_IF_ERROR(plain_writer_->close());
         }
 
@@ -311,6 +331,11 @@ private:
 
         total_uncompressed_bytes_ += raw.size();
         ++data_block_count_;
+        if (opts_.fsync_policy == FsyncPolicy::Paranoid &&
+            opts_.fsync_block_interval > 0 &&
+            (data_block_count_ % opts_.fsync_block_interval) == 0) {
+            HFILE_RETURN_IF_ERROR(writer_->flush());
+        }
         encoder_->reset();
         return Status::OK();
     }
@@ -379,7 +404,7 @@ private:
             ? static_cast<uint32_t>(total_value_bytes_ / entry_count_) : 0);
         fib.set_max_tags_len(max_tags_len_);
         fib.set_key_value_version(1);      // includes MemstoreTS
-        fib.set_max_memstore_ts(0);        // Bulk Load: always 0
+        fib.set_max_memstore_ts(max_memstore_ts_);
         fib.set_comparator(opts_.comparator);
         fib.set_data_block_encoding(opts_.data_block_encoding);
         fib.set_create_time();
@@ -419,20 +444,106 @@ private:
     }
 
     // ── Helpers for tracking last/first key ────────────────────────────────────
-    void save_last_key(const KeyValue& kv) {
+    void save_last_key(const KeyValue& kv, bool keep_for_validation) {
         last_key_.resize(kv.key_length());
         block::serialize_key(kv, last_key_.data());
-        // Copy for sort validation
-        last_kv_.row.assign(kv.row.begin(), kv.row.end());
-        last_kv_.family.assign(kv.family.begin(), kv.family.end());
-        last_kv_.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
-        last_kv_.timestamp = kv.timestamp;
-        last_kv_.key_type  = kv.key_type;
+        if (keep_for_validation) {
+            last_kv_.row.assign(kv.row.begin(), kv.row.end());
+            last_kv_.family.assign(kv.family.begin(), kv.family.end());
+            last_kv_.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+            last_kv_.timestamp = kv.timestamp;
+            last_kv_.key_type  = kv.key_type;
+        }
     }
 
     void save_first_key(const KeyValue& kv) {
         first_key_.resize(kv.key_length());
         block::serialize_key(kv, first_key_.data());
+    }
+
+    void record_cell_stats(const KeyValue& kv) {
+        uint32_t kl = kv.key_length();
+        uint32_t vl = static_cast<uint32_t>(kv.value.size());
+        total_key_bytes_ += kl;
+        total_value_bytes_ += vl;
+        max_tags_len_ = std::max(max_tags_len_,
+                                 static_cast<uint32_t>(kv.tags.size()));
+        max_memstore_ts_ = std::max<uint64_t>(max_memstore_ts_, kv.memstore_ts);
+        uint8_t mvcc_buf[10];
+        int mvcc_len = encode_varint64(mvcc_buf, kv.memstore_ts);
+        size_t cell_size = 4 + 4 + kl + kv.value.size() + 2 + kv.tags.size()
+                         + static_cast<size_t>(mvcc_len);
+        max_cell_size_ = std::max(max_cell_size_, cell_size);
+    }
+
+    Status maybe_check_disk_space(size_t encoded_bytes) {
+        if (opts_.disk_check_interval_bytes == 0 || opts_.min_free_disk_bytes == 0)
+            return Status::OK();
+        bytes_since_disk_check_ += encoded_bytes;
+        if (bytes_since_disk_check_ < opts_.disk_check_interval_bytes)
+            return Status::OK();
+        bytes_since_disk_check_ = 0;
+        int64_t free = free_disk_bytes(path_);
+        if (free >= 0 && static_cast<size_t>(free) < opts_.min_free_disk_bytes) {
+            log::error("DISK_SPACE_EXHAUSTED: only " +
+                       std::to_string(free / 1024 / 1024) + " MB free");
+            return Status::IoError("DISK_SPACE_EXHAUSTED");
+        }
+        return Status::OK();
+    }
+
+    Status append_materialized_kv(
+            const KeyValue& kv,
+            bool increment_entry_count,
+            bool record_stats,
+            bool verify_sort) {
+        if (verify_sort && written_entry_count_ > 0) {
+            int cmp = compare_keys(kv, last_kv_.as_view());
+            if (cmp <= 0)
+                return Status::InvalidArg("SORT_ORDER_VIOLATION: KV out of order");
+        }
+
+        HFILE_RETURN_IF_ERROR(maybe_check_disk_space(kv.encoded_size()));
+
+        if (!encoder_->append(kv)) {
+            HFILE_RETURN_IF_ERROR(flush_data_block());
+            if (!encoder_->append(kv))
+                return Status::Internal("Failed to append KV even after flush");
+        }
+
+        bloom_->add(kv.row);
+        if (opts_.bloom_type == BloomType::RowCol)
+            bloom_->add_row_col(kv.row, kv.qualifier);
+
+        if (record_stats) record_cell_stats(kv);
+        if (written_entry_count_ == 0) save_first_key(kv);
+        save_last_key(kv, verify_sort);
+
+        ++written_entry_count_;
+        if (increment_entry_count) ++entry_count_;
+        return Status::OK();
+    }
+
+    Status buffer_auto_sorted_kv(OwnedKeyValue kv) {
+        size_t reserve_bytes = estimate_owned_kv_bytes(kv);
+        if (auto_sorted_kvs_.size() == auto_sorted_kvs_.capacity()) {
+            size_t new_cap = auto_sorted_kvs_.capacity() == 0 ? 16 : auto_sorted_kvs_.capacity() * 2;
+            reserve_bytes += (new_cap - auto_sorted_kvs_.capacity()) * sizeof(OwnedKeyValue);
+            if (budget_) HFILE_RETURN_IF_ERROR(budget_->reserve(reserve_bytes));
+            try {
+                auto_sorted_kvs_.reserve(new_cap);
+            } catch (...) {
+                if (budget_) budget_->release(reserve_bytes);
+                return Status::Internal("AutoSort reserve failed");
+            }
+        } else if (budget_) {
+            HFILE_RETURN_IF_ERROR(budget_->reserve(reserve_bytes));
+        }
+        auto_sort_reserved_bytes_ += reserve_bytes;
+        record_cell_stats(kv.as_view());
+        ++entry_count_;
+        auto_sorted_kvs_.push_back(std::move(kv));
+        return Status::OK();
     }
 
     // ── State ─────────────────────────────────────────────────────────────────
@@ -454,13 +565,17 @@ private:
     std::vector<uint8_t>   last_key_;
     std::vector<uint8_t>   first_key_;
     OwnedKeyValue          last_kv_;
+    std::vector<OwnedKeyValue> auto_sorted_kvs_;
 
     // ── Production: resource management ──────────────────────────────────────
     std::unique_ptr<memory::MemoryBudget>       budget_;
+    size_t   fixed_budget_bytes_{0};
+    size_t   auto_sort_reserved_bytes_{0};
     size_t   bytes_since_disk_check_{0};
 
     // ── Statistics ────────────────────────────────────────────────────────────
     uint64_t entry_count_            = 0;
+    uint64_t written_entry_count_    = 0;
     uint64_t skipped_rows_           = 0;
     uint64_t error_count_            = 0;
     uint64_t total_key_bytes_        = 0;
@@ -468,6 +583,7 @@ private:
     uint64_t total_uncompressed_bytes_ = 0;
     uint32_t data_block_count_       = 0;
     uint32_t max_tags_len_           = 0;
+    uint64_t max_memstore_ts_        = 0;
     size_t   max_cell_size_          = 0;
     int64_t  first_data_block_offset_ = -1;
     int64_t  last_data_block_offset_  = -1;
@@ -591,12 +707,18 @@ std::pair<std::unique_ptr<HFileWriter>, Status> HFileWriter::Builder::build() {
     if (opts_.column_family.empty())
         return {nullptr, Status::InvalidArg("column_family must be set")};
 
-    auto impl = std::make_unique<HFileWriterImpl>(path_, opts_);
-    Status s  = impl->open();
-    if (!s.ok()) return {nullptr, s};
+    try {
+        auto impl = std::make_unique<HFileWriterImpl>(path_, opts_);
+        Status s  = impl->open();
+        if (!s.ok()) return {nullptr, s};
 
-    return {std::unique_ptr<HFileWriter>(new HFileWriter(std::move(impl))),
-            Status::OK()};
+        return {std::unique_ptr<HFileWriter>(new HFileWriter(std::move(impl))),
+                Status::OK()};
+    } catch (const std::exception& e) {
+        return {nullptr, Status::Internal(std::string("writer build failed: ") + e.what())};
+    } catch (...) {
+        return {nullptr, Status::Internal("writer build failed: unknown exception")};
+    }
 }
 
 } // namespace hfile

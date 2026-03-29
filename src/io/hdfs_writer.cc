@@ -2,6 +2,7 @@
 
 #ifdef HFILE_HAS_HDFS
 
+#include <cstdio>
 #include <stdexcept>
 #include <cstring>
 #include <cerrno>
@@ -34,8 +35,11 @@ HdfsWriter::HdfsWriter(const std::string& namenode_uri,
 
 HdfsWriter::~HdfsWriter() {
     if (file_) {
-        drain();
-        hdfsCloseFile(fs_, file_);
+        auto s = drain();
+        if (!s.ok())
+            std::fprintf(stderr, "[ERROR] hdfs_writer: %s\n", s.message().c_str());
+        if (hdfsCloseFile(fs_, file_) != 0)
+            std::fprintf(stderr, "[ERROR] hdfs_writer: close failed\n");
     }
     if (fs_) hdfsDisconnect(fs_);
 }

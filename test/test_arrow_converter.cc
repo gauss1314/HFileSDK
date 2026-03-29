@@ -1,18 +1,24 @@
 #include <gtest/gtest.h>
 #include "arrow/arrow_to_kv_converter.h"
+#include "convert/converter.h"
 #include <hfile/types.h>
 
 #include <arrow/api.h>
 #include <arrow/builder.h>
+#include <arrow/io/file.h>
+#include <arrow/ipc/writer.h>
 #include <arrow/record_batch.h>
 #include <arrow/testing/gtest_util.h>
 #include <arrow/type.h>
 
 #include <vector>
 #include <string>
+#include <filesystem>
+#include <chrono>
 
 using namespace hfile;
 using namespace hfile::arrow_convert;
+namespace fs = std::filesystem;
 
 // ─── Helpers to build Arrow batches ──────────────────────────────────────────
 
@@ -69,6 +75,26 @@ static std::shared_ptr<arrow::RecordBatch> make_tall_batch(int n_rows = 3) {
     });
 
     return arrow::RecordBatch::Make(schema, n_rows, {rk, cf, q, ts, v});
+}
+
+static fs::path make_temp_dir() {
+    auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path dir = fs::temp_directory_path() / ("hfilesdk_test_" + std::to_string(now));
+    fs::create_directories(dir);
+    return dir;
+}
+
+static void write_ipc_stream(const arrow::RecordBatch& batch, const fs::path& path) {
+    auto sink_result = arrow::io::FileOutputStream::Open(path.string());
+    ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
+    auto sink = *sink_result;
+
+    auto writer_result = arrow::ipc::MakeStreamWriter(sink.get(), batch.schema());
+    ASSERT_TRUE(writer_result.ok()) << writer_result.status().ToString();
+    auto writer = *writer_result;
+    ARROW_EXPECT_OK(writer->WriteRecordBatch(batch));
+    ARROW_EXPECT_OK(writer->Close());
+    ARROW_EXPECT_OK(sink->Close());
 }
 
 // ─── Wide Table ───────────────────────────────────────────────────────────────
@@ -222,4 +248,135 @@ TEST(ArrowConverter, Float32BigEndian) {
     EXPECT_EQ(bytes[1], 0x80);
     EXPECT_EQ(bytes[2], 0x00);
     EXPECT_EQ(bytes[3], 0x00);
+}
+
+TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
+    arrow::StringBuilder rk_builder;
+    arrow::Int64Builder age_builder;
+    arrow::StringBuilder name_builder;
+
+    ARROW_EXPECT_OK(rk_builder.Append("dup"));
+    ARROW_EXPECT_OK(age_builder.Append(10));
+    ARROW_EXPECT_OK(name_builder.AppendNull());
+
+    ARROW_EXPECT_OK(rk_builder.Append("dup"));
+    ARROW_EXPECT_OK(age_builder.AppendNull());
+    ARROW_EXPECT_OK(name_builder.Append("alice"));
+
+    std::shared_ptr<arrow::Array> rk_arr, age_arr, name_arr;
+    ARROW_EXPECT_OK(rk_builder.Finish(&rk_arr));
+    ARROW_EXPECT_OK(age_builder.Finish(&age_arr));
+    ARROW_EXPECT_OK(name_builder.Finish(&name_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::utf8()),
+        arrow::field("age", arrow::int64()),
+        arrow::field("name", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {rk_arr, age_arr, name_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1234;
+    opts.writer_opts.column_family = "cf";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::SORT_VIOLATION);
+    EXPECT_FALSE(result.error_message.empty());
+    EXPECT_FALSE(fs::exists(hfile_path));
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey) {
+    arrow::StringBuilder rk_builder;
+    arrow::Int64Builder age_builder;
+    arrow::StringBuilder name_builder;
+
+    ARROW_EXPECT_OK(rk_builder.Append("dup"));
+    ARROW_EXPECT_OK(age_builder.Append(10));
+    ARROW_EXPECT_OK(name_builder.AppendNull());
+
+    ARROW_EXPECT_OK(rk_builder.Append("dup"));
+    ARROW_EXPECT_OK(age_builder.Append(20));
+    ARROW_EXPECT_OK(name_builder.AppendNull());
+
+    std::shared_ptr<arrow::Array> rk_arr, age_arr, name_arr;
+    ARROW_EXPECT_OK(rk_builder.Finish(&rk_arr));
+    ARROW_EXPECT_OK(age_builder.Finish(&age_arr));
+    ARROW_EXPECT_OK(name_builder.Finish(&name_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::utf8()),
+        arrow::field("age", arrow::int64()),
+        arrow::field("name", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {rk_arr, age_arr, name_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1234;
+    opts.writer_opts.column_family = "cf";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::SORT_VIOLATION);
+    EXPECT_FALSE(result.error_message.empty());
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertSupportsLargeStringColumns) {
+    arrow::StringBuilder rk_builder;
+    arrow::LargeStringBuilder payload_builder;
+
+    ARROW_EXPECT_OK(rk_builder.Append("row_1"));
+    ARROW_EXPECT_OK(payload_builder.Append("large_payload"));
+
+    std::shared_ptr<arrow::Array> rk_arr, payload_arr;
+    ARROW_EXPECT_OK(rk_builder.Finish(&rk_arr));
+    ARROW_EXPECT_OK(payload_builder.Finish(&payload_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::utf8()),
+        arrow::field("payload", arrow::large_utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 1, {rk_arr, payload_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1234;
+    opts.writer_opts.column_family = "cf";
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::OK);
+    EXPECT_EQ(result.kv_written_count, 2);
+
+    fs::remove_all(dir);
 }

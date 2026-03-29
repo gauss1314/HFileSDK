@@ -308,6 +308,83 @@ TEST(HFileWriter, TagsAndMVCCPresent) {
     fs::remove(path);
 }
 
+TEST(HFileWriter, AutoSortSortsOutOfOrderInput) {
+    auto path = tmp_path("autosort");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    EXPECT_TRUE(w->append(make_kv(rk, fam, q, v, "b", "col", 100, "v")).ok());
+    EXPECT_TRUE(w->append(make_kv(rk, fam, q, v, "a", "col", 100, "v")).ok());
+    EXPECT_TRUE(w->finish().ok());
+    EXPECT_TRUE(fs::exists(path));
+    fs::remove(path);
+}
+
+TEST(HFileWriter, AutoSortRespectsMemoryBudget) {
+    auto path = tmp_path("autosort_memory");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_block_size(128)
+        .set_max_memory(66000)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    std::string big_value(4096, 'x');
+    auto st = w->append(make_kv(rk, fam, q, v, "row", "col", 100, big_value));
+    EXPECT_FALSE(st.ok());
+    fs::remove(path);
+}
+
+TEST(HFileWriter, DisableTagsAndMVCCShrinksOutput) {
+    auto with_path = tmp_path("tags_mvcc_on");
+    auto without_path = tmp_path("tags_mvcc_off");
+
+    auto [with_writer, s1] = HFileWriter::builder()
+        .set_path(with_path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_include_tags(true)
+        .set_include_mvcc(true)
+        .build();
+    auto [without_writer, s2] = HFileWriter::builder()
+        .set_path(without_path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_include_tags(false)
+        .set_include_mvcc(false)
+        .build();
+    ASSERT_TRUE(s1.ok());
+    ASSERT_TRUE(s2.ok());
+
+    std::vector<uint8_t> rk = {'r'}, fam = {'c','f'}, q = {'q'}, v(64, 'v'), tags(64, 't');
+    KeyValue kv;
+    kv.row = rk; kv.family = fam; kv.qualifier = q;
+    kv.timestamp = 1000; kv.key_type = KeyType::Put; kv.value = v;
+    kv.tags = tags;
+    kv.memstore_ts = 123456;
+
+    ASSERT_TRUE(with_writer->append(kv).ok());
+    ASSERT_TRUE(without_writer->append(kv).ok());
+    ASSERT_TRUE(with_writer->finish().ok());
+    ASSERT_TRUE(without_writer->finish().ok());
+
+    EXPECT_LT(fs::file_size(without_path), fs::file_size(with_path));
+    fs::remove(with_path);
+    fs::remove(without_path);
+}
+
 TEST(HFileWriter, TrustedSortMode) {
     // PreSortedTrusted: no validation, so out-of-order is accepted
     auto path = tmp_path("trusted_sort");

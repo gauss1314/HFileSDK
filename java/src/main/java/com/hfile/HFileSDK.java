@@ -134,6 +134,9 @@ public class HFileSDK {
      *   <li>{@code block_size}          — data block size in bytes (default 65536)
      *   <li>{@code column_family}       — HBase column family name (default "cf")
      *   <li>{@code data_block_encoding} — {@code "NONE" | "PREFIX" | "DIFF" | "FAST_DIFF"}
+     *   <li>{@code fsync_policy}        — {@code "safe" | "fast" | "paranoid"}
+     *   <li>{@code error_policy}        — {@code "strict" | "skip_row" | "skip_batch"}
+     *   <li>{@code bloom_type}          — {@code "none" | "row" | "rowcol"}
      * </ul>
      *
      * @param configJson JSON configuration string.

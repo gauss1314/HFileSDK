@@ -363,7 +363,7 @@ for (int64_t r = 0; r < batch.num_rows(); ++r) {
 |------|------|------|
 | `PreSortedTrusted` | 调用方保证有序，不验证 | ✅ |
 | `PreSortedVerified` | 流式验证每个 KV | ✅ |
-| **`AutoSort`**（**默认**）| **SDK 内部两遍扫描排序** | ✅ **v4.0 已实现** |
+| **`AutoSort`**（**默认**）| **`convert()` 两遍扫描排序；`HFileWriter` 内存缓冲并在 `finish()` 排序** | ✅ **已实现** |
 
 **两遍扫描实现**（`src/convert/converter.cc`）：
 
@@ -733,7 +733,7 @@ HFileSDK/
 │   ├── io/                  BufferedFileWriter / IoUringWriter / HdfsWriter
 │   ├── partition/           RegionPartitioner 实现 + CFGrouper
 │   └── arrow/               ArrowToKVConverter（3 种映射模式）
-├── test/                    14 个测试文件，242+ 断言（全部通过）
+├── test/                    20 个测试文件（已全部纳入 ctest）
 ├── bench/
 │   ├── micro/               5 个 Google Benchmark 微基准
 │   └── macro/               1 个端到端基准
@@ -769,8 +769,8 @@ HFileSDK/
 
 | 测试层次 | 覆盖范围 | 工具 | 数量 |
 |---------|---------|------|------|
-| 单元测试 | 每个模块的核心逻辑 | Google Test | 14 文件 |
-| 独立集成测试 | 跨模块交互（无外部依赖） | 自定义框架 | 242+ 断言 |
+| 单元/回归测试 | 每个模块的核心逻辑与历史缺陷回归 | Google Test + 自定义框架 | 16 文件 |
+| 独立集成测试 | 跨模块交互（无外部依赖） | 同上 | 已纳入 `ctest` |
 | 格式验证 | HFile 文件可被 HBase 原生 Reader 读取 | `hfile-verify` (Java) | 手动 |
 | Bulk Load 验证 | 完整链路 + HBase Scan 数据完整性 | `hfile-bulkload-verify` (Java) | 手动 |
 | 内存安全 | AddressSanitizer + UndefinedBehaviorSanitizer | Clang Sanitizers | 构建时选项 |
@@ -857,8 +857,6 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 ### 剩余工作（按优先级）
 
 **P1 — 功能完整性**
-- [ ] **`WriterOptions::SortMode::AutoSort`**：内部基于间接索引数组的排序（接口已有，实现缺失）
-
 **P2 — 数据驱动后决定**
 - [ ] **双缓冲 Pipeline**：先运行 `bench/java/` 拿到对比数据，若差距 < 3× 再实现
 - [ ] **AutoSort 外排序**：当前 AutoSort 将全量 batch 保留在内存；超大文件（> RAM）需外排序实现

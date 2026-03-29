@@ -35,7 +35,7 @@ enum class ErrorPolicy : uint8_t {
     /// Skip the offending row, continue with the rest of the batch.
     SkipRow   = 1,
 
-    /// Skip the entire batch if any row in it fails, continue with next batch.
+    /// Skip the entire RecordBatch if any row in it fails, continue with next batch.
     SkipBatch = 2,
 };
 
@@ -72,8 +72,8 @@ struct WriterOptions {
     double       bloom_error_rate = 0.01;
 
     // ── HFile v3 cell tags / MVCC ──────────────────────────────────────────
-    bool         include_tags  = true;
-    bool         include_mvcc  = true;
+    bool         include_tags  = true;   // false => strip user tags, still emit tags_length=0
+    bool         include_mvcc  = true;   // false => force MemstoreTS to 0 on disk
 
     // ── Comparator & checksum ──────────────────────────────────────────────
     std::string  comparator          = std::string(kCellComparator);
@@ -83,7 +83,7 @@ struct WriterOptions {
     enum class SortMode {
         PreSortedTrusted,   // caller guarantees order, no validation
         PreSortedVerified,  // caller guarantees order, stream-verify each KV
-        AutoSort,           // SDK sorts internally via two-pass scan (default)
+        AutoSort,           // HFileWriter buffers KVs in memory and sorts at finish()
     };
     // Default: AutoSort — input end does not guarantee order.
     // Use PreSortedTrusted / PreSortedVerified only when input is known sorted.
@@ -109,13 +109,14 @@ struct WriterOptions {
     size_t       max_value_bytes    = 10ULL * 1024 * 1024;  // 10 MB
 
     // ── Resource governance [Production] ──────────────────────────────────
-    /// Maximum memory the writer may consume across all buffers (0 = unlimited).
+    /// Maximum memory the writer may consume across buffers / AutoSort staging (0 = unlimited).
     size_t       max_memory_bytes  = 0;
     /// Minimum free disk space required; writing stops if below this (0 = disabled).
     size_t       min_free_disk_bytes = 512ULL * 1024 * 1024;  // 512 MB
     /// Check disk space every N bytes written (0 = disable periodic check).
     size_t       disk_check_interval_bytes = 256ULL * 1024 * 1024;  // 256 MB
     /// Maximum simultaneously open file handles across a BulkLoadWriter.
+    /// When exceeded, older active writers are finished and new HFiles are rolled.
     int          max_open_files    = 64;
 };
 

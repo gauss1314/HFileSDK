@@ -110,11 +110,16 @@ Status AtomicFileWriter::commit() {
 
 void AtomicFileWriter::abort() noexcept {
     if (!closed_) {
-        inner_->close();  // best-effort, ignore error
+        auto s = inner_->close();
+        if (!s.ok())
+            std::fprintf(stderr, "[ERROR] atomic_file_writer: %s\n", s.message().c_str());
         closed_ = true;
     }
     std::error_code ec;
     fs::remove(temp_path_, ec);  // best-effort delete of temp file
+    if (ec)
+        std::fprintf(stderr, "[ERROR] atomic_file_writer: remove failed: %s: %s\n",
+                     temp_path_.c_str(), ec.message().c_str());
 }
 
 // ─── fsync directory helper ───────────────────────────────────────────────────

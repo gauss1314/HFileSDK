@@ -99,13 +99,13 @@ auto [writer, status] = hfile::HFileWriter::builder()
 
 if (!status.ok()) { /* handle error */ }
 
-// 追加 KV（必须按 HBase 顺序：Row↑ → Qualifier↑ → Timestamp↓）
-for (auto& kv : sorted_kvs) {
+// 默认 AutoSort：可追加无序 KV，writer 在 finish() 前做内存排序
+for (auto& kv : input_kvs) {
     auto s = writer->append(kv);
     if (!s.ok()) { /* handle error */ }
 }
 
-writer->finish();  // 写 Index、Bloom、FileInfo、Trailer
+writer->finish();  // AutoSort + 写 Index、Bloom、FileInfo、Trailer
 ```
 
 ### Bulk Load 写入（推荐）
@@ -128,6 +128,7 @@ for (auto& batch : arrow_batches)
 auto [result, s] = bulk->finish();
 // result.staging_dir = "/tmp/staging/my_table"
 // result.files = ["cf1/hfile_region_0000.hfile", "cf2/hfile_region_0001.hfile", ...]
+// 若 max_open_files 触发滚动关闭，同一 Region 可能生成 *_0001.hfile 等后续分片
 
 // 之后通过 BulkLoadHFilesTool 加载到 HBase
 ```
@@ -152,9 +153,9 @@ src/
   partition/            RegionPartitioner + CFGrouper
   arrow/                Arrow → KV 转换（WideTable / TallTable / RawKV）
 proto/                  FileTrailerProto（HFile v3）
-test/                   13 个测试文件，190+ 断言
+test/                   20 个测试文件（已全部纳入 ctest）
 bench/                  微基准 + 端到端基准
-tools/                  Java 验证工具 + Python HTML 报告生成器
+tools/                  Java 验证工具 + hfile-chaos + Python HTML 报告生成器
 ```
 
 ***

@@ -145,14 +145,21 @@ public:
     /// Spawns a background thread; stopped when the registry is destroyed.
     void set_report_callback(ReportCallback cb,
                               std::chrono::seconds interval) {
+        stop_report_thread();
         report_cb_       = std::move(cb);
         report_interval_ = interval;
+        if (!report_cb_) return;
         report_running_  = true;
         report_thread_   = std::thread([this] {
             while (report_running_) {
                 std::this_thread::sleep_for(report_interval_);
-                if (report_running_ && report_cb_)
-                    report_cb_(snapshot());
+                if (report_running_ && report_cb_) {
+                    try {
+                        report_cb_(snapshot());
+                    } catch (...) {
+                        report_running_ = false;
+                    }
+                }
             }
         });
     }

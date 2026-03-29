@@ -37,7 +37,7 @@ struct BulkLoadResult {
 
     // ── Statistics ─────────────────────────────────────────────────────────
     uint64_t total_entries{0};   // KVs successfully written
-    uint64_t total_bytes{0};     // raw uncompressed bytes written
+    uint64_t total_bytes{0};     // final on-disk bytes of successfully committed HFiles
     uint64_t skipped_rows{0};    // rows skipped due to validation errors
     uint64_t total_rows{0};      // total rows processed (written + skipped)
 
@@ -55,8 +55,8 @@ struct BulkLoadResult {
 struct ProgressInfo {
     int64_t  total_kv_written{0};
     int64_t  total_bytes_written{0};
-    int      files_completed{0};
-    int      files_in_progress{0};
+    int      files_completed{0};   // finished and committed HFiles
+    int      files_in_progress{0}; // currently open active HFiles
     int64_t  skipped_rows{0};
     double   estimated_progress{0.0};     // 0.0–1.0
     std::chrono::milliseconds elapsed{0};

@@ -229,11 +229,18 @@ if(HFILE_ENABLE_JEMALLOC AND JEMALLOC_LIB)
   target_link_libraries(hfile PRIVATE ${JEMALLOC_LIB})
 endif()
 
+add_executable(hfile_chaos tools/hfile-chaos/main.cc)
+set_target_properties(hfile_chaos PROPERTIES OUTPUT_NAME hfile-chaos)
+target_link_libraries(hfile_chaos PRIVATE hfile)
+target_include_directories(hfile_chaos PRIVATE
+  ${CMAKE_SOURCE_DIR}/src
+  ${CMAKE_BINARY_DIR})
+
 # Tests
 enable_testing()
 find_package(GTest REQUIRED)
 
-set(TEST_SOURCES
+set(GTEST_SOURCES
   test/test_crc32c.cc
   test/test_kv_encoding.cc
   test/test_block_builder.cc
@@ -247,9 +254,11 @@ set(TEST_SOURCES
   test/test_compressor.cc
   test/test_arrow_converter.cc
   test/test_region_partitioner.cc
+  test/test_jni_json_utils.cc
+  test/test_bulk_load_writer_behavior.cc
 )
 
-foreach(TEST_SRC ${TEST_SOURCES})
+foreach(TEST_SRC ${GTEST_SOURCES})
   get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
   add_executable(${TEST_NAME} ${TEST_SRC})
   target_link_libraries(${TEST_NAME}
@@ -259,6 +268,40 @@ foreach(TEST_SRC ${TEST_SOURCES})
     ${CMAKE_BINARY_DIR})
   add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endforeach()
+
+set(CUSTOM_TEST_SOURCES
+  test/test_row_key_builder.cc
+  test/test_production_features.cc
+  test/test_round3_bugs.cc
+)
+
+foreach(TEST_SRC ${CUSTOM_TEST_SOURCES})
+  get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)
+  add_executable(${TEST_NAME} ${TEST_SRC})
+  target_link_libraries(${TEST_NAME} PRIVATE hfile)
+  target_include_directories(${TEST_NAME} PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR})
+  add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
+endforeach()
+
+add_test(
+  NAME hfile_chaos_kill
+  COMMAND hfile_chaos
+    --mode kill-during-write
+    --output-dir ${CMAKE_BINARY_DIR}/chaos/kill
+    --verify-no-corrupt-files
+    --rows 50000
+    --value-size 2048
+)
+
+add_test(
+  NAME hfile_chaos_disk_full
+  COMMAND hfile_chaos
+    --mode disk-full-sim
+    --output-dir ${CMAKE_BINARY_DIR}/chaos/disk
+    --verify-no-corrupt-files
+)
 
 # Benchmarks
 if(HFILE_ENABLE_BENCHMARKS)

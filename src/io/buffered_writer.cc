@@ -36,8 +36,12 @@ BufferedFileWriter::BufferedFileWriter(const std::string& path,
 
 BufferedFileWriter::~BufferedFileWriter() {
     if (file_) {
-        drain();           // best-effort flush; ignore error in destructor
-        std::fclose(file_);
+        auto s = drain();
+        if (!s.ok())
+            std::fprintf(stderr, "[ERROR] buffered_writer: %s\n", s.message().c_str());
+        if (std::fclose(file_) != 0)
+            std::fprintf(stderr, "[ERROR] buffered_writer: fclose failed: %s\n",
+                         std::strerror(errno));
         file_ = nullptr;
     }
 }

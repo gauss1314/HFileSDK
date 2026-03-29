@@ -16,10 +16,13 @@ static std::vector<std::string_view> split_sv(std::string_view s, char delim,
     std::vector<std::string_view> parts;
     size_t start = 0;
     while (start <= s.size()) {
+        if (max_count > 0 && static_cast<int>(parts.size()) + 1 >= max_count) {
+            parts.emplace_back(s.data() + start, s.size() - start);
+            break;
+        }
         size_t end = s.find(delim, start);
         if (end == std::string_view::npos) end = s.size();
         parts.emplace_back(s.data() + start, end - start);
-        if (max_count > 0 && static_cast<int>(parts.size()) >= max_count) break;
         start = end + 1;
     }
     return parts;

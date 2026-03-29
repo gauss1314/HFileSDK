@@ -254,6 +254,19 @@ void test_scoped_timer() {
     EXPECT_TRUE(h.p50 >= 50.0);  // at least 50 µs (liberal bound)
 }
 
+void test_metrics_report_callback_can_be_replaced() {
+    MetricsRegistry reg;
+    std::atomic<int> calls1{0};
+    std::atomic<int> calls2{0};
+    reg.set_report_callback([&](const MetricsSnapshot&) { ++calls1; }, std::chrono::seconds(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reg.set_report_callback([&](const MetricsSnapshot&) { ++calls2; }, std::chrono::seconds(0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    reg.stop_report_thread();
+    EXPECT_TRUE(calls1.load() > 0);
+    EXPECT_TRUE(calls2.load() > 0);
+}
+
 // ─── 4. FsyncPolicy / HFileWriter crash-safety ────────────────────────────────
 
 void test_safe_policy_commit_creates_file() {
@@ -526,6 +539,28 @@ void test_progress_info_fields() {
     EXPECT_EQ(p.elapsed.count(), 123);
 }
 
+void test_bulk_load_progress_callback_exception_is_contained() {
+    auto dir = tmpfile("test_bulk_progress_exception");
+    fs::remove_all(dir);
+    std::atomic<int> calls{0};
+    auto [bulk, s] = BulkLoadWriter::builder()
+        .set_output_dir(dir.string())
+        .set_column_families({"cf"})
+        .set_partitioner(RegionPartitioner::none())
+        .set_progress_callback([&](const ProgressInfo&) {
+            ++calls;
+            throw std::runtime_error("boom");
+        }, std::chrono::seconds(0))
+        .build();
+    EXPECT_OK(s);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    auto [result, fs2] = bulk->finish();
+    EXPECT_OK(fs2);
+    EXPECT_EQ(result.staging_dir, dir.string());
+    EXPECT_TRUE(calls.load() > 0);
+    fs::remove_all(dir);
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -553,6 +588,7 @@ int main() {
     test_metrics_snapshot();
     test_metrics_thread_safe();
     test_scoped_timer();
+    test_metrics_report_callback_can_be_replaced();
 
     // FsyncPolicy / crash-safety
     test_safe_policy_commit_creates_file();
@@ -576,6 +612,7 @@ int main() {
 
     // ProgressInfo
     test_progress_info_fields();
+    test_bulk_load_progress_callback_exception_is_contained();
 
     printf("Tests run: %d  Passed: %d  Failed: %d\n\n",
            TESTS, PASSED, TESTS - PASSED);

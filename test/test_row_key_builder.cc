@@ -34,7 +34,7 @@ void test_split_max_count(){
     // splitPreserveAllTokens with maxCount=3
     auto f = split_row_value("a|b|c|d|e", 3);
     EXPECT_EQ(f.size(), 3u);
-    EXPECT_EQ(std::string(f[2]),"c"); // rest is dropped (we stopped at 3)
+    EXPECT_EQ(std::string(f[2]),"c|d|e");
 }
 
 // ─── RowKeyBuilder::compile error cases ───────────────────────────────────────

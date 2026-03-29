@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <stdexcept>
 #include <liburing.h>
@@ -38,7 +39,9 @@ IoUringWriter::IoUringWriter(const std::string& path,
 
 IoUringWriter::~IoUringWriter() {
     if (fd_ >= 0) {
-        flush();
+        auto s = flush();
+        if (!s.ok())
+            std::fprintf(stderr, "[ERROR] iouring_writer: %s\n", s.message().c_str());
         ::close(fd_);
         fd_ = -1;
     }

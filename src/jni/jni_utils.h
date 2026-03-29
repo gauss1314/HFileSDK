@@ -6,15 +6,25 @@
 namespace hfile {
 namespace jni {
 
-/// Convert a jstring to std::string (UTF-8).
-/// Returns empty string if jstr is null.
-inline std::string jstring_to_string(JNIEnv* env, jstring jstr) {
-    if (!jstr) return "";
+inline Status jstring_to_string(JNIEnv* env, jstring jstr, std::string* out) {
+    if (!jstr) return Status::InvalidArg("JNI string is null");
     const char* chars = env->GetStringUTFChars(jstr, nullptr);
-    if (!chars) return "";
+    if (!chars) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return Status::Internal("JNI GetStringUTFChars failed");
+    }
     std::string result(chars);
     env->ReleaseStringUTFChars(jstr, chars);
-    return result;
+    *out = std::move(result);
+    return Status::OK();
+}
+
+inline Status optional_jstring_to_string(JNIEnv* env, jstring jstr, std::string* out) {
+    if (!jstr) {
+        out->clear();
+        return Status::OK();
+    }
+    return jstring_to_string(env, jstr, out);
 }
 
 /// Convert std::string to jstring.
