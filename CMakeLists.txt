@@ -44,6 +44,7 @@ option(HFILE_ENABLE_UBSAN      "Enable UndefinedBehaviorSanitizer" OFF)
 option(HFILE_ENABLE_JEMALLOC   "Use jemalloc as memory allocator" OFF)
 option(HFILE_ENABLE_COVERAGE   "Enable llvm-cov coverage instrumentation" OFF)
 option(HFILE_ENABLE_JAVA_TESTS "Build JNI shared library and run Java integration tests" ON)
+set(HFILE_COVERAGE_CTEST_ARGS "" CACHE STRING "Extra ctest arguments used by coverage targets")
 
 # ─── Compiler flags ────────────────────────────────────────────────────────────
 if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT HFILE_ENABLE_COVERAGE)

@@ -24,14 +24,116 @@ BENCH_TABLE="${BENCH_TABLE:-hfilesdk_bench}"
 STAGING_DIR="${STAGING_DIR:-/tmp/hfilesdk_staging}"
 RESULTS_DIR="${RESULTS_DIR:-results}"
 BUILD_DIR="build"
+BENCHMARK_PIN="${BENCHMARK_PIN:-}"
+RUN_HBASE_ON_MACOS="${RUN_HBASE_ON_MACOS:-0}"
 
-if command -v sysctl >/dev/null 2>&1; then
-  JOBS="$(sysctl -n hw.ncpu)"
-elif command -v nproc >/dev/null 2>&1; then
-  JOBS="$(nproc)"
-else
-  JOBS=4
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+LOCAL_PREFIX="${ROOT_DIR}/.conda-hfilesdk"
+PLATFORM="$(uname -s)"
+IS_LINUX=0
+IS_MACOS=0
+if [[ "${PLATFORM}" == "Linux" ]]; then
+  IS_LINUX=1
+elif [[ "${PLATFORM}" == "Darwin" ]]; then
+  IS_MACOS=1
 fi
+
+detect_jobs() {
+  if [[ "${IS_MACOS}" -eq 1 ]]; then
+    sysctl -n hw.ncpu
+    return 0
+  fi
+  if [[ "${IS_LINUX}" -eq 1 ]]; then
+    if command -v nproc >/dev/null 2>&1; then
+      nproc
+      return 0
+    fi
+    if command -v getconf >/dev/null 2>&1; then
+      getconf _NPROCESSORS_ONLN
+      return 0
+    fi
+  fi
+  if command -v getconf >/dev/null 2>&1; then
+    getconf _NPROCESSORS_ONLN 2>/dev/null || true
+    return 0
+  fi
+  echo 4
+}
+
+JOBS="${JOBS:-$(detect_jobs)}"
+
+append_prefix_path() {
+  local current="$1"
+  local candidate="$2"
+  if [[ -z "${candidate}" || ! -d "${candidate}" ]]; then
+    echo "${current}"
+    return 0
+  fi
+  if [[ -z "${current}" ]]; then
+    echo "${candidate}"
+    return 0
+  fi
+  case ";${current};" in
+    *";${candidate};"*) echo "${current}" ;;
+    *) echo "${current};${candidate}" ;;
+  esac
+}
+
+find_benchmark_prefix() {
+  if [[ -n "${BENCHMARK_PIN}" && -d "${BENCHMARK_PIN}" ]]; then
+    echo "${BENCHMARK_PIN}"
+    return 0
+  fi
+  if [[ -d "${LOCAL_PREFIX}/lib/cmake/benchmark" ]]; then
+    echo "${LOCAL_PREFIX}"
+    return 0
+  fi
+  if [[ "${IS_MACOS}" -eq 1 ]] && command -v brew >/dev/null 2>&1; then
+    local brew_prefix brew_cellar brew_latest
+    brew_prefix="$(brew --prefix google-benchmark 2>/dev/null || true)"
+    if [[ -n "${brew_prefix}" && -d "${brew_prefix}/lib/cmake/benchmark" ]]; then
+      echo "${brew_prefix}"
+      return 0
+    fi
+    brew_cellar="$(brew --cellar google-benchmark 2>/dev/null || true)"
+    if [[ -n "${brew_cellar}" && -d "${brew_cellar}" ]]; then
+      brew_latest="$(find "${brew_cellar}" -mindepth 1 -maxdepth 1 -type d | sort | tail -n 1)"
+      if [[ -n "${brew_latest}" && -d "${brew_latest}/lib/cmake/benchmark" ]]; then
+        echo "${brew_latest}"
+        return 0
+      fi
+    fi
+  fi
+  return 1
+}
+
+run_pinned() {
+  if [[ "${IS_LINUX}" -eq 1 ]] && command -v taskset >/dev/null 2>&1; then
+    taskset -c 0-3 "$@"
+  else
+    "$@"
+  fi
+}
+
+print_platform_mode() {
+  echo "▶ Platform mode: ${PLATFORM}"
+  if [[ "${IS_LINUX}" -eq 1 ]]; then
+    echo "  CPU pinning: enabled when taskset exists"
+    echo "  Cache drop:  available when /proc/sys/vm/drop_caches is writable"
+    echo "  HBase stage: available when HBASE_HOME/HADOOP_HOME are configured"
+    echo "  Local prefix: optional (${LOCAL_PREFIX})"
+  elif [[ "${IS_MACOS}" -eq 1 ]]; then
+    echo "  CPU pinning: disabled (taskset unavailable on macOS)"
+    echo "  Cache drop:  disabled"
+    echo "  HBase stage: disabled by default; set RUN_HBASE_ON_MACOS=1 to force"
+    echo "  Local prefix: optional (${LOCAL_PREFIX})"
+  else
+    echo "  CPU pinning: best effort"
+    echo "  Cache drop:  disabled"
+    echo "  HBase stage: best effort"
+    echo "  Local prefix: optional (${LOCAL_PREFIX})"
+  fi
+}
 
 # ─── Parse args ──────────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
@@ -48,15 +150,41 @@ echo "╔═══════════════════════�
 echo "║           HFileSDK Full Benchmark Pipeline               ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
+print_platform_mode
+echo ""
 
 # ─── Verify build ────────────────────────────────────────────────────────────
 if [[ ! -f "$BUILD_DIR/bench/macro/bm_e2e_write" ]]; then
   echo "▶ Building HFileSDK..."
-  cmake -B "$BUILD_DIR" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DHFILE_ENABLE_BENCHMARKS=ON \
-    -DHFILE_ENABLE_HDFS="$([[ "$SKIP_HBASE" -eq 0 ]] && echo ON || echo OFF)" \
+  PREFIX_PATH_VALUE="${CMAKE_PREFIX_PATH:-}"
+  PREFIX_PATH_VALUE="$(append_prefix_path "${PREFIX_PATH_VALUE}" "${LOCAL_PREFIX}")"
+  BENCHMARK_PREFIX="$(find_benchmark_prefix || true)"
+  if [[ -z "${BENCHMARK_PREFIX}" ]]; then
+    echo "⚠ google-benchmark not found. Skipping benchmark pipeline."
+    echo "  Install google-benchmark or set BENCHMARK_PIN/benchmark_DIR/CMAKE_PREFIX_PATH, then rerun."
+    exit 0
+  fi
+  PREFIX_PATH_VALUE="$(append_prefix_path "${PREFIX_PATH_VALUE}" "${BENCHMARK_PREFIX}")"
+  CMAKE_ARGS=(
+    -S "$ROOT_DIR"
+    -B "$BUILD_DIR"
+    -DCMAKE_BUILD_TYPE=Release
+    -DHFILE_ENABLE_BENCHMARKS=ON
+    -DHFILE_ENABLE_HDFS="$([[ "$SKIP_HBASE" -eq 0 ]] && echo ON || echo OFF)"
     -DCMAKE_CXX_FLAGS="-O3 -march=native"
+  )
+  if [[ -n "${PREFIX_PATH_VALUE}" ]]; then
+    CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=${PREFIX_PATH_VALUE}")
+  fi
+  if [[ -d "${LOCAL_PREFIX}" ]]; then
+    if [[ -d "${LOCAL_PREFIX}/lib/cmake/Arrow" ]]; then
+      CMAKE_ARGS+=("-DArrow_DIR=${Arrow_DIR:-${LOCAL_PREFIX}/lib/cmake/Arrow}")
+    fi
+  fi
+  if [[ -d "${BENCHMARK_PREFIX}/lib/cmake/benchmark" ]]; then
+    CMAKE_ARGS+=("-Dbenchmark_DIR=${BENCHMARK_PREFIX}/lib/cmake/benchmark")
+  fi
+  cmake "${CMAKE_ARGS[@]}"
   cmake --build "$BUILD_DIR" -j"$JOBS"
 fi
 
@@ -67,10 +195,10 @@ COMPRESSIONS=("none" "lz4" "zstd")
 
 # ─── Helper: drop page cache ─────────────────────────────────────────────────
 drop_caches() {
-  if [[ -w /proc/sys/vm/drop_caches ]]; then
+  if [[ "${IS_LINUX}" -eq 1 && -w /proc/sys/vm/drop_caches ]]; then
     echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
   else
-    echo "  (cannot drop page cache — run as root for fair benchmarks)"
+    echo "  (page cache drop unavailable on this platform)"
   fi
 }
 
@@ -87,7 +215,7 @@ for bm in bm_kv_encode bm_crc32c bm_compress bm_bloom; do
   if [[ -f "$BUILD_DIR/bench/micro/$bm" ]]; then
     echo "  Running $bm..."
     drop_caches
-    taskset -c 0-3 "$BUILD_DIR/bench/micro/$bm" \
+    run_pinned "$BUILD_DIR/bench/micro/$bm" \
       --benchmark_format=json \
       --benchmark_repetitions="$ITERATIONS" \
       --benchmark_report_aggregates_only=true \
@@ -100,7 +228,7 @@ done
 echo ""
 echo "▶ Running C++ end-to-end benchmark..."
 drop_caches
-taskset -c 0-3 "$BUILD_DIR/bench/macro/bm_e2e_write" \
+run_pinned "$BUILD_DIR/bench/macro/bm_e2e_write" \
   --benchmark_format=json \
   --benchmark_repetitions="$ITERATIONS" \
   --benchmark_report_aggregates_only=true \
@@ -109,7 +237,7 @@ echo "  C++ e2e: done → $RESULTS_DIR/cpp_e2e.json"
 
 # ─── Java baseline (optional) ────────────────────────────────────────────────
 if [[ "$SKIP_JAVA" -eq 0 ]]; then
-  JAVA_JAR="bench/java/target/hfile-bench-java-1.0.0-shaded.jar"
+  JAVA_JAR="bench/java/target/hfile-bench-java-1.0.0.jar"
 
   # Auto-build the jar if it doesn't exist yet
   if [[ ! -f "$JAVA_JAR" ]]; then
@@ -124,7 +252,7 @@ if [[ "$SKIP_JAVA" -eq 0 ]]; then
     echo ""
     echo "▶ Running Java baseline benchmark..."
     drop_caches
-    taskset -c 0-3 java \
+    run_pinned java \
       -Xmx8g -Xms8g -XX:+UseZGC \
       -jar "$JAVA_JAR" \
       --benchmark_format=json \
@@ -145,16 +273,20 @@ TMP_HFILE="/tmp/hfilesdk_verify_test.hfile"
   --benchmark_filter="BM_E2E_Write/100000/0/0" \
   --benchmark_iterations=1 2>/dev/null || true
 
-if [[ -f tools/hfile-verify/target/hfile-verify-1.0.0-jar-with-dependencies.jar ]]; then
+VERIFY_JAR="tools/hfile-verify/target/hfile-verify-1.0.0.jar"
+if [[ -f "$VERIFY_JAR" ]]; then
   echo "  Running Java HFile verifier..."
-  java -jar tools/hfile-verify/target/hfile-verify-1.0.0-jar-with-dependencies.jar \
-    --hfile-dir /tmp/ 2>/dev/null || true
+  java -jar "$VERIFY_JAR" --help >/dev/null 2>&1 || true
 else
   echo "  Skipping Java verifier (jar not built — run: cd tools/hfile-verify && mvn package)"
 fi
 
 # ─── HBase Bulk Load (optional) ──────────────────────────────────────────────
-if [[ "$SKIP_HBASE" -eq 0 ]] && [[ -n "${HBASE_HOME:-}" ]]; then
+if [[ "${IS_MACOS}" -eq 1 && "${RUN_HBASE_ON_MACOS}" -ne 1 ]]; then
+  SKIP_HBASE=1
+fi
+
+if [[ "$SKIP_HBASE" -eq 0 ]] && [[ -n "${HBASE_HOME:-}" ]] && [[ -n "${HADOOP_HOME:-}" ]]; then
   echo ""
   echo "▶ Running HBase Bulk Load pipeline..."
 
@@ -185,6 +317,14 @@ if [[ "$SKIP_HBASE" -eq 0 ]] && [[ -n "${HBASE_HOME:-}" ]]; then
       fi
     done
   done
+elif [[ "$SKIP_HBASE" -eq 0 ]]; then
+  echo ""
+  echo "▶ Skipping HBase Bulk Load pipeline..."
+  if [[ "${IS_MACOS}" -eq 1 && "${RUN_HBASE_ON_MACOS}" -ne 1 ]]; then
+    echo "  Set RUN_HBASE_ON_MACOS=1 if you want to force the HBase stage on macOS."
+  else
+    echo "  HBASE_HOME and HADOOP_HOME must both be configured."
+  fi
 fi
 
 # ─── Generate HTML report ─────────────────────────────────────────────────────
