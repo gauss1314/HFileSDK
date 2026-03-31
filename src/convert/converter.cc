@@ -107,6 +107,19 @@ static arrow::Result<std::shared_ptr<arrow::RecordBatch>> apply_column_removal(
     return result;
 }
 
+static arrow::Result<std::shared_ptr<arrow::Schema>> apply_schema_removal(
+        std::shared_ptr<arrow::Schema> schema,
+        const std::vector<int>&        removal_indices) {
+    if (removal_indices.empty()) return schema;
+    auto result = std::move(schema);
+    for (int idx : removal_indices) {
+        if (idx < result->num_fields()) {
+            ARROW_ASSIGN_OR_RAISE(result, result->RemoveField(idx));
+        }
+    }
+    return result;
+}
+
 // ─── SortEntry ────────────────────────────────────────────────────────────────
 
 struct SortEntry {
@@ -310,21 +323,15 @@ static Status build_sort_index(
 
     auto reader = reader_res.ValueOrDie();
 
-    // Compute the FILTERED schema by applying removals to the original schema.
+    // Compute the FILTERED schema directly from the original schema.
     // rowKeyRule indices are validated against this filtered schema.
     std::shared_ptr<arrow::Schema> filtered_schema;
     {
-        auto orig = reader->schema();
-        auto tmp_batch = arrow::RecordBatch::Make(
-            orig, 0,
-            std::vector<std::shared_ptr<arrow::Array>>(
-                static_cast<size_t>(orig->num_fields()),
-                nullptr));
-        auto filtered_res = apply_column_removal(tmp_batch, removal_indices);
+        auto filtered_res = apply_schema_removal(reader->schema(), removal_indices);
         if (!filtered_res.ok())
             return Status::IoError("Failed to compute filtered schema: " +
                                    filtered_res.status().ToString());
-        filtered_schema = (*filtered_res)->schema();
+        filtered_schema = std::move(*filtered_res);
     }
     int num_filtered_cols = filtered_schema->num_fields();
 

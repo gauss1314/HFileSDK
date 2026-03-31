@@ -643,6 +643,52 @@ TEST(ArrowConverter, ConvertAllowsUnusedUnsupportedColumnsBeforeReferencedIndex)
     fs::remove_all(dir);
 }
 
+TEST(ArrowConverter, ConvertSupportsExcludedColumnPrefixes) {
+    arrow::StringBuilder meta_builder;
+    arrow::StringBuilder id_builder;
+    arrow::StringBuilder payload_builder;
+
+    ARROW_EXPECT_OK(meta_builder.Append("meta-1"));
+    ARROW_EXPECT_OK(meta_builder.Append("meta-2"));
+    ARROW_EXPECT_OK(id_builder.Append("row-1"));
+    ARROW_EXPECT_OK(id_builder.Append("row-2"));
+    ARROW_EXPECT_OK(payload_builder.Append("value-1"));
+    ARROW_EXPECT_OK(payload_builder.Append("value-2"));
+
+    std::shared_ptr<arrow::Array> meta_arr, id_arr, payload_arr;
+    ARROW_EXPECT_OK(meta_builder.Finish(&meta_arr));
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(payload_builder.Finish(&payload_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("_hoodie_commit_time", arrow::utf8()),
+        arrow::field("id", arrow::utf8()),
+        arrow::field("payload", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {meta_arr, id_arr, payload_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.excluded_column_prefixes = {"_hoodie"};
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::OK);
+    EXPECT_EQ(result.arrow_rows_read, 2);
+    EXPECT_TRUE(fs::exists(hfile_path));
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream) {
     auto dir = make_temp_dir();
     auto arrow_path = dir / "broken.arrow";
