@@ -33,6 +33,29 @@ static void warn (const std::string& m){ fprintf(stderr,"[WARN]  convert: %s\n",
 static void err  (const std::string& m){ fprintf(stderr,"[ERROR] convert: %s\n",m.c_str()); }
 }
 
+static int map_status_to_error_code(const Status& s) {
+    if (s.message().find("MemoryBudget:") == 0)
+        return ErrorCode::MEMORY_EXHAUSTED;
+    if (s.message().find("SCHEMA_MISMATCH:") == 0)
+        return ErrorCode::SCHEMA_MISMATCH;
+    if (s.message().find("INVALID_ROW_KEY_RULE:") == 0)
+        return ErrorCode::INVALID_ROW_KEY_RULE;
+    if (s.message().find("DISK_SPACE_EXHAUSTED") != std::string::npos)
+        return ErrorCode::DISK_EXHAUSTED;
+    return s.code() == Status::Code::IoError ? ErrorCode::IO_ERROR
+                                             : ErrorCode::ARROW_FILE_ERROR;
+}
+
+static int map_pass1_status_to_error_code(const Status& s) {
+    if (s.message().find("MemoryBudget:") == 0)
+        return ErrorCode::MEMORY_EXHAUSTED;
+    if (s.message().find("SCHEMA_MISMATCH:") == 0)
+        return ErrorCode::SCHEMA_MISMATCH;
+    if (s.message().find("INVALID_ROW_KEY_RULE:") == 0)
+        return ErrorCode::INVALID_ROW_KEY_RULE;
+    return ErrorCode::ARROW_FILE_ERROR;
+}
+
 // ─── Column exclusion helper ──────────────────────────────────────────────────
 
 /// Build the set of column indices that should be excluded from HBase KV output.
@@ -408,7 +431,10 @@ static Status build_sort_index(
                 if (!field_status.ok()) return field_status;
                 fields[static_cast<size_t>(c)] = owned_fields[static_cast<size_t>(c)];
             }
-            std::string rk = rkb.build(fields);
+            std::string rk;
+            auto build_status = rkb.build_checked(fields, &rk);
+            if (!build_status.ok())
+                return Status::InvalidArg("INVALID_ROW_KEY_RULE: " + build_status.message());
 
             if (rk.empty()) {
                 result.kv_skipped_count++;
@@ -574,11 +600,7 @@ ConvertResult convert(const ConvertOptions& opts) {
                                     removal_indices,
                                     sort_index, batches, budget.get(), result);
         if (!s.ok()) {
-            result.error_code = s.message().find("MemoryBudget:") == 0
-                ? ErrorCode::MEMORY_EXHAUSTED
-                : s.message().find("SCHEMA_MISMATCH:") == 0
-                    ? ErrorCode::SCHEMA_MISMATCH
-                : ErrorCode::ARROW_FILE_ERROR;
+            result.error_code = map_pass1_status_to_error_code(s);
             result.error_message = s.message();
             clog::err("Pass 1 failed: " + s.message());
             return result;
@@ -726,7 +748,7 @@ ConvertResult convert(const ConvertOptions& opts) {
     // ── 6. Finish HFile ───────────────────────────────────────────────────
     auto fs = writer->finish();
     if (!fs.ok()) {
-        result.error_code = ErrorCode::IO_ERROR;
+        result.error_code = map_status_to_error_code(fs);
         result.error_message = fs.message();
         clog::err("HFile finish failed: " + fs.message());
         return result;

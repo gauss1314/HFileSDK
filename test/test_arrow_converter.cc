@@ -368,9 +368,11 @@ TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
     opts.writer_opts.column_family = "cf";
 
     auto result = convert(opts);
-    EXPECT_EQ(result.error_code, ErrorCode::SORT_VIOLATION);
-    EXPECT_FALSE(result.error_message.empty());
-    EXPECT_FALSE(fs::exists(hfile_path));
+    EXPECT_EQ(result.error_code, ErrorCode::OK);
+    EXPECT_EQ(result.duplicate_key_count, 1);
+    EXPECT_EQ(result.kv_written_count, 3);
+    EXPECT_EQ(result.kv_skipped_count, 1);
+    EXPECT_TRUE(fs::exists(hfile_path));
 
     fs::remove_all(dir);
 }
@@ -415,8 +417,10 @@ TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey) {
     opts.writer_opts.column_family = "cf";
 
     auto result = convert(opts);
-    EXPECT_EQ(result.error_code, ErrorCode::SORT_VIOLATION);
-    EXPECT_FALSE(result.error_message.empty());
+    EXPECT_EQ(result.error_code, ErrorCode::OK);
+    EXPECT_EQ(result.duplicate_key_count, 1);
+    EXPECT_EQ(result.kv_written_count, 2);
+    EXPECT_EQ(result.kv_skipped_count, 2);
 
     fs::remove_all(dir);
 }
@@ -687,6 +691,64 @@ TEST(ArrowConverter, ConvertSupportsExcludedColumnPrefixes) {
     EXPECT_EQ(result.arrow_rows_read, 2);
     EXPECT_TRUE(fs::exists(hfile_path));
     fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, WideTableRejectsUnsupportedValueType) {
+    arrow::StringBuilder rk_builder;
+    arrow::ListBuilder list_builder(arrow::default_memory_pool(),
+                                    std::make_shared<arrow::Int32Builder>());
+
+    ARROW_EXPECT_OK(rk_builder.Append("row-1"));
+    ARROW_EXPECT_OK(list_builder.Append());
+    auto* value_builder = static_cast<arrow::Int32Builder*>(list_builder.value_builder());
+    ARROW_EXPECT_OK(value_builder->Append(1));
+    ARROW_EXPECT_OK(value_builder->Append(2));
+
+    std::shared_ptr<arrow::Array> rk_arr, list_arr;
+    ARROW_EXPECT_OK(rk_builder.Finish(&rk_arr));
+    ARROW_EXPECT_OK(list_builder.Finish(&list_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("__row_key__", arrow::utf8()),
+        arrow::field("payload", arrow::list(arrow::int32())),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 1, {rk_arr, list_arr});
+
+    auto status = ArrowToKVConverter::convert_wide_table(
+        *batch, WideTableConfig{}, [](const KeyValue&) { return Status::OK(); });
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), Status::Code::InvalidArg);
+    EXPECT_NE(status.message().find("unsupported Arrow type"), std::string::npos);
+}
+
+TEST(ArrowConverter, RawKVRejectsTruncatedFamily) {
+    arrow::BinaryBuilder key_builder;
+    arrow::BinaryBuilder value_builder;
+    const uint8_t broken_key[] = {
+        0x00, 0x01,
+        'r',
+        0x03,
+        'c', 'f'
+    };
+    const uint8_t value[] = {'v'};
+    ARROW_EXPECT_OK(key_builder.Append(broken_key, sizeof(broken_key)));
+    ARROW_EXPECT_OK(value_builder.Append(value, sizeof(value)));
+
+    std::shared_ptr<arrow::Array> key_arr, value_arr;
+    ARROW_EXPECT_OK(key_builder.Finish(&key_arr));
+    ARROW_EXPECT_OK(value_builder.Finish(&value_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("key", arrow::binary()),
+        arrow::field("value", arrow::binary()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 1, {key_arr, value_arr});
+
+    auto status = ArrowToKVConverter::convert_raw_kv(
+        *batch, "key", "value", [](const KeyValue&) { return Status::OK(); });
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), Status::Code::Corruption);
+    EXPECT_NE(status.message().find("truncated family"), std::string::npos);
 }
 
 TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream) {

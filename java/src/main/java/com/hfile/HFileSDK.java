@@ -206,7 +206,10 @@ public class HFileSDK {
                 "{\"compression\":\"%s\",\"block_size\":%d," +
                 "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\"}",
                 compression, blockSize, columnFamily, dataBlockEncoding);
-            sdk.configure(cfg);
+            int rc = sdk.configure(cfg);
+            if (rc != OK) {
+                throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());
+            }
             return sdk;
         }
     }

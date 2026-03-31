@@ -18,66 +18,78 @@ namespace arrow_convert {
 
 // ─── Scalar serializer ────────────────────────────────────────────────────────
 
-std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
-        const ::arrow::Array& arr, int64_t row) {
+Status ArrowToKVConverter::serialize_scalar_checked(
+        const ::arrow::Array& arr, int64_t row, std::vector<uint8_t>* out) {
     using namespace ::arrow;
     using ::arrow::internal::checked_cast;
 
-    if (arr.IsNull(row)) return {};
+    out->clear();
+    if (arr.IsNull(row)) return Status::OK();
 
     switch (arr.type_id()) {
     case Type::BOOL: {
         auto& a = checked_cast<const BooleanArray&>(arr);
-        return {static_cast<uint8_t>(a.Value(row) ? 1 : 0)};
+        *out = {static_cast<uint8_t>(a.Value(row) ? 1 : 0)};
+        return Status::OK();
     }
     case Type::INT8: {
         auto v = checked_cast<const Int8Array&>(arr).Value(row);
-        return {static_cast<uint8_t>(v)};
+        *out = {static_cast<uint8_t>(v)};
+        return Status::OK();
     }
     case Type::INT16: {
         int16_t v = checked_cast<const Int16Array&>(arr).Value(row);
         uint8_t buf[2]; write_be16(buf, static_cast<uint16_t>(v));
-        return {buf, buf + 2};
+        out->assign(buf, buf + 2);
+        return Status::OK();
     }
     case Type::INT32: {
         int32_t v = checked_cast<const Int32Array&>(arr).Value(row);
         uint8_t buf[4]; write_be32(buf, static_cast<uint32_t>(v));
-        return {buf, buf + 4};
+        out->assign(buf, buf + 4);
+        return Status::OK();
     }
     case Type::INT64: {
         int64_t v = checked_cast<const Int64Array&>(arr).Value(row);
         uint8_t buf[8]; write_be64(buf, static_cast<uint64_t>(v));
-        return {buf, buf + 8};
+        out->assign(buf, buf + 8);
+        return Status::OK();
     }
     case Type::UINT8: {
-        return {checked_cast<const UInt8Array&>(arr).Value(row)};
+        *out = {checked_cast<const UInt8Array&>(arr).Value(row)};
+        return Status::OK();
     }
     case Type::UINT16: {
         uint16_t v = checked_cast<const UInt16Array&>(arr).Value(row);
         uint8_t buf[2]; write_be16(buf, v);
-        return {buf, buf + 2};
+        out->assign(buf, buf + 2);
+        return Status::OK();
     }
     case Type::UINT32: {
         uint32_t v = checked_cast<const UInt32Array&>(arr).Value(row);
         uint8_t buf[4]; write_be32(buf, v);
-        return {buf, buf + 4};
+        out->assign(buf, buf + 4);
+        return Status::OK();
     }
     case Type::UINT64: {
         uint64_t v = checked_cast<const UInt64Array&>(arr).Value(row);
         uint8_t buf[8]; write_be64(buf, v);
-        return {buf, buf + 8};
+        out->assign(buf, buf + 8);
+        return Status::OK();
     }
     case Type::FLOAT: {
         float f = checked_cast<const FloatArray&>(arr).Value(row);
         uint32_t bits; std::memcpy(&bits, &f, 4);
         uint8_t buf[4]; write_be32(buf, bits);
-        return {buf, buf + 4};
+        out->assign(buf, buf + 4);
+        return Status::OK();
     }
     case Type::DOUBLE: {
         double d = checked_cast<const DoubleArray&>(arr).Value(row);
         uint64_t bits; std::memcpy(&bits, &d, 8);
         uint8_t buf[8]; write_be64(buf, bits);
-        return {buf, buf + 8};
+        out->assign(buf, buf + 8);
+        return Status::OK();
     }
     case Type::STRING:
     case Type::LARGE_STRING: {
@@ -87,7 +99,8 @@ std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
         else
             sv = checked_cast<const LargeStringArray&>(arr).GetView(row);
         const auto* d = reinterpret_cast<const uint8_t*>(sv.data());
-        return std::vector<uint8_t>(d, d + sv.size());
+        out->assign(d, d + sv.size());
+        return Status::OK();
     }
     case Type::BINARY:
     case Type::LARGE_BINARY: {
@@ -97,13 +110,12 @@ std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
         else
             sv = checked_cast<const LargeBinaryArray&>(arr).GetView(row);
         const auto* d = reinterpret_cast<const uint8_t*>(sv.data());
-        return std::vector<uint8_t>(d, d + sv.size());
+        out->assign(d, d + sv.size());
+        return Status::OK();
     }
     case Type::TIMESTAMP: {
-        // Convert to milliseconds Big-Endian
         int64_t ts = checked_cast<const Int64Array&>(arr).Value(row);
         const auto& ts_type = checked_cast<const TimestampType&>(*arr.type());
-        // Normalise to milliseconds
         switch (ts_type.unit()) {
         case TimeUnit::SECOND: ts *= 1000; break;
         case TimeUnit::MILLI:  break;
@@ -111,11 +123,20 @@ std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
         case TimeUnit::NANO:   ts /= 1000000; break;
         }
         uint8_t buf[8]; write_be64(buf, static_cast<uint64_t>(ts));
-        return {buf, buf + 8};
+        out->assign(buf, buf + 8);
+        return Status::OK();
     }
     default:
-        return {};  // unsupported type → empty value
+        return Status::NotSupported("unsupported Arrow type: " + arr.type()->ToString());
     }
+}
+
+std::vector<uint8_t> ArrowToKVConverter::serialize_scalar(
+        const ::arrow::Array& arr, int64_t row) {
+    std::vector<uint8_t> out;
+    auto status = serialize_scalar_checked(arr, row, &out);
+    if (!status.ok()) return {};
+    return out;
 }
 
 // ─── Wide Table ───────────────────────────────────────────────────────────────
@@ -142,8 +163,12 @@ Status ArrowToKVConverter::convert_wide_table(
     const std::string& family = cfg.column_family;
 
     for (int64_t row = 0; row < batch.num_rows(); ++row) {
-        // Serialize row key
-        std::vector<uint8_t> rk = serialize_scalar(rk_arr, row);
+        std::vector<uint8_t> rk;
+        auto rk_status = serialize_scalar_checked(rk_arr, row, &rk);
+        if (!rk_status.ok())
+            return Status::InvalidArg("Wide table: row key column '" + cfg.row_key_column +
+                                      "' has " + rk_status.message() +
+                                      " at row " + std::to_string(row));
         if (rk.empty() && rk_arr.IsNull(row))
             return Status::InvalidArg("Row key column contains null at row " +
                                        std::to_string(row));
@@ -153,8 +178,13 @@ Status ArrowToKVConverter::convert_wide_table(
             if (col == rk_idx) continue;
             if (cfg.skip_null_columns && batch.column(col)->IsNull(row)) continue;
 
-            std::vector<uint8_t> val = serialize_scalar(*batch.column(col), row);
             const std::string&   qualifier = batch.schema()->field(col)->name();
+            std::vector<uint8_t> val;
+            auto value_status = serialize_scalar_checked(*batch.column(col), row, &val);
+            if (!value_status.ok())
+                return Status::InvalidArg("Wide table: column '" + qualifier +
+                                          "' has " + value_status.message() +
+                                          " at row " + std::to_string(row));
 
             KeyValue kv;
             kv.row       = {rk.data(), rk.size()};
@@ -194,14 +224,45 @@ Status ArrowToKVConverter::convert_tall_table(
     if (val_idx < 0) return Status::InvalidArg("Tall table: missing column '" + cfg.col_value + "'");
 
     for (int64_t row = 0; row < batch.num_rows(); ++row) {
-        std::vector<uint8_t> rk  = serialize_scalar(*batch.column(rk_idx),  row);
-        std::vector<uint8_t> cf  = serialize_scalar(*batch.column(cf_idx),   row);
-        std::vector<uint8_t> q   = serialize_scalar(*batch.column(q_idx),    row);
-        std::vector<uint8_t> val = serialize_scalar(*batch.column(val_idx),  row);
+        std::vector<uint8_t> rk, cf, q, val;
+        auto rk_status = serialize_scalar_checked(*batch.column(rk_idx), row, &rk);
+        if (!rk_status.ok())
+            return Status::InvalidArg("Tall table: column '" + cfg.col_row_key +
+                                      "' has " + rk_status.message() +
+                                      " at row " + std::to_string(row));
+        auto cf_status = serialize_scalar_checked(*batch.column(cf_idx), row, &cf);
+        if (!cf_status.ok())
+            return Status::InvalidArg("Tall table: column '" + cfg.col_cf +
+                                      "' has " + cf_status.message() +
+                                      " at row " + std::to_string(row));
+        auto q_status = serialize_scalar_checked(*batch.column(q_idx), row, &q);
+        if (!q_status.ok())
+            return Status::InvalidArg("Tall table: column '" + cfg.col_qualifier +
+                                      "' has " + q_status.message() +
+                                      " at row " + std::to_string(row));
+        auto val_status = serialize_scalar_checked(*batch.column(val_idx), row, &val);
+        if (!val_status.ok())
+            return Status::InvalidArg("Tall table: column '" + cfg.col_value +
+                                      "' has " + val_status.message() +
+                                      " at row " + std::to_string(row));
+        if (rk.empty() && batch.column(rk_idx)->IsNull(row))
+            return Status::InvalidArg("Tall table: row key column contains null at row " +
+                                      std::to_string(row));
+        if (cf.empty() && batch.column(cf_idx)->IsNull(row))
+            return Status::InvalidArg("Tall table: cf column contains null at row " +
+                                      std::to_string(row));
+        if (q.empty() && batch.column(q_idx)->IsNull(row))
+            return Status::InvalidArg("Tall table: qualifier column contains null at row " +
+                                      std::to_string(row));
 
         int64_t ts = 0;
         if (ts_idx >= 0) {
-            std::vector<uint8_t> ts_bytes = serialize_scalar(*batch.column(ts_idx), row);
+            std::vector<uint8_t> ts_bytes;
+            auto ts_status = serialize_scalar_checked(*batch.column(ts_idx), row, &ts_bytes);
+            if (!ts_status.ok())
+                return Status::InvalidArg("Tall table: column '" + cfg.col_timestamp +
+                                          "' has " + ts_status.message() +
+                                          " at row " + std::to_string(row));
             if (ts_bytes.size() == 8)
                 ts = static_cast<int64_t>(read_be64(ts_bytes.data()));
         }
@@ -239,11 +300,19 @@ Status ArrowToKVConverter::convert_raw_kv(
     if (val_idx < 0) return Status::InvalidArg("RawKV: missing column '" + value_column + "'");
 
     for (int64_t row = 0; row < batch.num_rows(); ++row) {
-        std::vector<uint8_t> raw_key = serialize_scalar(*batch.column(key_idx), row);
-        std::vector<uint8_t> val     = serialize_scalar(*batch.column(val_idx), row);
+        std::vector<uint8_t> raw_key;
+        auto key_status = serialize_scalar_checked(*batch.column(key_idx), row, &raw_key);
+        if (!key_status.ok())
+            return Status::InvalidArg("RawKV: key column '" + key_column +
+                                      "' has " + key_status.message() +
+                                      " at row " + std::to_string(row));
+        std::vector<uint8_t> val;
+        auto value_status = serialize_scalar_checked(*batch.column(val_idx), row, &val);
+        if (!value_status.ok())
+            return Status::InvalidArg("RawKV: value column '" + value_column +
+                                      "' has " + value_status.message() +
+                                      " at row " + std::to_string(row));
 
-        // Parse the pre-encoded HBase key
-        // Format: rowLen(2) + row + familyLen(1) + family + qualifier + ts(8) + type(1)
         const uint8_t* p = raw_key.data();
         if (raw_key.size() < 3) return Status::Corruption("RawKV: key too short");
 
@@ -251,7 +320,9 @@ Status ArrowToKVConverter::convert_raw_kv(
         if (raw_key.size() < 2 + row_len + 1) return Status::Corruption("RawKV: truncated row");
 
         std::span<const uint8_t> row_span{p, row_len}; p += row_len;
-        uint8_t fam_len = *p++; p += 0;
+        uint8_t fam_len = *p++;
+        if (raw_key.size() < 2 + row_len + 1 + fam_len + 9)
+            return Status::Corruption("RawKV: truncated family");
         std::span<const uint8_t> fam_span{p, fam_len}; p += fam_len;
 
         size_t remaining = raw_key.size() - (p - raw_key.data());

@@ -280,7 +280,7 @@ public:
         if (writers_.empty()) {
             result.elapsed = elapsed_ms();
             if (!result.failed_files.empty() && !result.files.empty())
-                return {result, Status::InvalidArg("PARTIAL_SUCCESS: " +
+                return {result, Status::IoError("PARTIAL_SUCCESS: " +
                     std::to_string(result.failed_files.size()) + " files failed")};
             if (!result.failed_files.empty())
                 return {result, first_finish_error_.ok() ? Status::IoError("All files failed")
@@ -357,7 +357,7 @@ public:
 
         // Return PARTIAL_SUCCESS if some files failed but some succeeded
         if (!result.failed_files.empty() && !result.files.empty())
-            return {result, Status::InvalidArg("PARTIAL_SUCCESS: " +
+            return {result, Status::IoError("PARTIAL_SUCCESS: " +
                 std::to_string(result.failed_files.size()) + " files failed")};
         if (!result.failed_files.empty())
             return {result, first_error.ok() ? Status::IoError("All files failed")
@@ -455,6 +455,7 @@ private:
             .set_max_error_count(cf_opts.max_error_count)
             .set_max_row_key_bytes(cf_opts.max_row_key_bytes)
             .set_max_value_bytes(cf_opts.max_value_bytes)
+            .set_max_memory(cf_opts.max_memory_bytes)
             .set_min_free_disk(cf_opts.min_free_disk_bytes)
             .set_disk_check_interval(cf_opts.disk_check_interval_bytes)
             .build();

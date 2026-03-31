@@ -37,13 +37,9 @@ BufferedFileWriter::BufferedFileWriter(const std::string& path,
 
 BufferedFileWriter::~BufferedFileWriter() {
     if (file_) {
-        auto s = drain();
+        auto s = close();
         if (!s.ok())
             std::fprintf(stderr, "[ERROR] buffered_writer: %s\n", s.message().c_str());
-        if (std::fclose(file_) != 0)
-            std::fprintf(stderr, "[ERROR] buffered_writer: fclose failed: %s\n",
-                         std::strerror(errno));
-        file_ = nullptr;
     }
 }
 
@@ -95,14 +91,14 @@ Status BufferedFileWriter::flush() {
 }
 
 Status BufferedFileWriter::close() {
-    HFILE_RETURN_IF_ERROR(drain());
-
+    Status drain_status = drain();
     if (file_) {
         if (std::fclose(file_) != 0)
             return Status::IoError(
                 std::string("fclose failed: ") + std::strerror(errno));
         file_ = nullptr;
     }
+    if (!drain_status.ok()) return drain_status;
     return Status::OK();
 }
 

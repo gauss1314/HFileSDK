@@ -59,6 +59,9 @@ public:
         const std::string&          value_column,
         KVCallback                  callback);
 
+    static Status serialize_scalar_checked(
+        const ::arrow::Array& arr, int64_t row, std::vector<uint8_t>* out);
+
     static std::vector<uint8_t> serialize_scalar(
         const ::arrow::Array& arr, int64_t row);
 };

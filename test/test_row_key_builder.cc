@@ -185,6 +185,10 @@ void test_out_of_range_col_index_gives_empty(){
     EXPECT(s.ok());
     auto f = split_row_value("only_two|fields");
     EXPECT_EQ(b.build(f), "");  // index 9 out of range → empty
+    std::string out;
+    auto bs = b.build_checked(f, &out);
+    EXPECT(!bs.ok());
+    EXPECT(std::string(bs.message()).find("missing field index 9") != std::string::npos);
 }
 void test_empty_field_value(){
     auto [b, s] = RowKeyBuilder::compile("F,1,false,5");  // index 1 is empty
@@ -274,6 +278,34 @@ void test_negative_pad_len_rejected(){
     EXPECT(!s.ok());
     EXPECT(std::string(s.message()).find("padLen must be >= 0") != std::string::npos);
 }
+void test_invalid_is_reverse_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("ID,0,maybe,0");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("isReverse must be true or false") != std::string::npos);
+}
+void test_invalid_pad_mode_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("ID,0,false,0,CENTER");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("padMode must be LEFT or RIGHT") != std::string::npos);
+}
+void test_long_plain_invalid_numeric_rejected_at_build(){
+    auto [b, s] = RowKeyBuilder::compile("long(),0,false,0");
+    EXPECT(s.ok());
+    auto f = split_row_value("abc");
+    std::string out;
+    auto bs = b.build_checked(f, &out);
+    EXPECT(!bs.ok());
+    EXPECT(std::string(bs.message()).find("cannot parse int64 value") != std::string::npos);
+}
+void test_short_plain_overflow_rejected_at_build(){
+    auto [b, s] = RowKeyBuilder::compile("short(),0,false,0");
+    EXPECT(s.ok());
+    auto f = split_row_value("40000");
+    std::string out;
+    auto bs = b.build_checked(f, &out);
+    EXPECT(!bs.ok());
+    EXPECT(std::string(bs.message()).find("cannot parse int16 value") != std::string::npos);
+}
 
 // ─── AutoSort: verify that identical rowKeyRule applied to sorted/unsorted
 //     rows produces the same output order ──────────────────────────────────────
@@ -346,6 +378,10 @@ int main(){
     test_long_hash_matches_java_semantics();
     test_negative_index_rejected();
     test_negative_pad_len_rejected();
+    test_invalid_is_reverse_rejected();
+    test_invalid_pad_mode_rejected();
+    test_long_plain_invalid_numeric_rejected_at_build();
+    test_short_plain_overflow_rejected_at_build();
     test_sort_invariant();
     printf("Tests run: %d  Passed: %d  Failed: %d\n\n", T, P, T-P);
     return (P==T) ? 0 : 1;

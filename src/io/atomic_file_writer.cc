@@ -69,7 +69,7 @@ Status AtomicFileWriter::flush() {
 Status AtomicFileWriter::close() {
     if (closed_) return Status::OK();
     auto s = inner_->close();
-    closed_ = true;
+    if (s.ok()) closed_ = true;
     return s;
 }
 
@@ -113,7 +113,7 @@ void AtomicFileWriter::abort() noexcept {
         auto s = inner_->close();
         if (!s.ok())
             std::fprintf(stderr, "[ERROR] atomic_file_writer: %s\n", s.message().c_str());
-        closed_ = true;
+        if (s.ok()) closed_ = true;
     }
     std::error_code ec;
     fs::remove(temp_path_, ec);  // best-effort delete of temp file

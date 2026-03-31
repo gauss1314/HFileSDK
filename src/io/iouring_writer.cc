@@ -32,8 +32,11 @@ IoUringWriter::IoUringWriter(const std::string& path,
     if (fd_ < 0)
         throw std::runtime_error(std::string("IoUringWriter: cannot open: ") + path);
 
-    if (io_uring_queue_init(ring_depth, &ring_, 0) < 0)
+    if (io_uring_queue_init(ring_depth, &ring_, 0) < 0) {
+        ::close(fd_);
+        fd_ = -1;
         throw std::runtime_error("IoUringWriter: io_uring_queue_init failed");
+    }
     ring_initialized_ = true;
 }
 

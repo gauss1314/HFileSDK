@@ -29,8 +29,11 @@ HdfsWriter::HdfsWriter(const std::string& namenode_uri,
                          static_cast<int>(buffer_size),
                          replication,
                          static_cast<tOffset>(block_size));
-    if (!file_)
+    if (!file_) {
+        hdfsDisconnect(fs_);
+        fs_ = nullptr;
         throw std::runtime_error("Cannot open HDFS file: " + hdfs_path);
+    }
 }
 
 HdfsWriter::~HdfsWriter() {
