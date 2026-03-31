@@ -99,37 +99,56 @@ public:
         init_chunk();
     }
 
-    /// Serialise bloom filter blocks into `meta_blocks_out`.
-    /// Returns offsets and sizes so the meta index can be built.
-    BloomWriteResult finish(std::vector<uint8_t>& meta_blocks_out,
-                            int64_t current_offset) {
-        BloomWriteResult result;
-        if (type_ == BloomType::None || (chunks_.empty() && cur_keys_ == 0)) {
-            return result;
-        }
+    /// Flush pending chunk and serialise all BLMFBLK2 blocks into `blocks_out`.
+    /// Records each chunk's absolute file offset (needed by the meta block).
+    /// Call from the writer's non-scanned section, after all data blocks.
+    /// Returns true if any bloom data was produced.
+    bool finish_data_blocks(std::vector<uint8_t>& blocks_out,
+                            int64_t current_file_offset) {
+        if (type_ == BloomType::None) return false;
         if (cur_keys_ > 0) finish_chunk();
+        if (chunks_.empty()) return false;
 
-        result.enabled        = true;
-        result.total_key_count = total_keys_;
-        result.bloom_data_offset = current_offset + static_cast<int64_t>(meta_blocks_out.size());
-
-        // Write each chunk as a bloom data block
         chunk_offsets_.reserve(chunks_.size());
         for (size_t i = 0; i < chunks_.size(); ++i) {
             chunk_offsets_.push_back(
-                current_offset + static_cast<int64_t>(meta_blocks_out.size()));
-            write_bloom_chunk_block(meta_blocks_out, chunks_[i]);
+                current_file_offset + static_cast<int64_t>(blocks_out.size()));
+            write_bloom_chunk_block(blocks_out, chunks_[i]);
         }
-
-        // Write the bloom meta block
-        result.bloom_meta_offset =
-            current_offset + static_cast<int64_t>(meta_blocks_out.size());
-        write_bloom_meta_block(meta_blocks_out);
-
-        return result;
+        return true;
     }
 
-    BloomType bloom_type() const noexcept { return type_; }
+    /// Serialise the BLMFMET2 bloom meta block into `meta_out`.
+    /// Must be called after finish_data_blocks().
+    /// `meta_block_file_offset` is the absolute file offset where this block starts
+    /// (used to build the meta root index entry pointing to BLMFMET2).
+    void finish_meta_block(std::vector<uint8_t>& meta_out) {
+        write_bloom_meta_block(meta_out);
+    }
+
+    bool      is_enabled()     const noexcept { return type_ != BloomType::None; }
+    bool      has_data()       const noexcept { return !chunks_.empty() || cur_keys_ > 0; }
+    uint32_t  total_keys()     const noexcept { return total_keys_; }
+    BloomType bloom_type()     const noexcept { return type_; }
+
+    /// Legacy combined API (chunk blocks + meta in one buffer).
+    /// Retained for unit tests that only care about serialised content, not layout.
+    BloomWriteResult finish(std::vector<uint8_t>& meta_blocks_out,
+                            int64_t current_offset) {
+        BloomWriteResult result;
+        if (type_ == BloomType::None || (chunks_.empty() && cur_keys_ == 0))
+            return result;
+
+        if (!finish_data_blocks(meta_blocks_out, current_offset)) return result;
+
+        result.enabled         = true;
+        result.total_key_count = total_keys_;
+        result.bloom_data_offset = current_offset;
+        result.bloom_meta_offset =
+            current_offset + static_cast<int64_t>(meta_blocks_out.size());
+        finish_meta_block(meta_blocks_out);
+        return result;
+    }
 
 private:
     void init_chunk() {

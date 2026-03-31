@@ -3,6 +3,7 @@
 #include <hfile/status.h>
 #include <hfile/writer_options.h>
 #include <string>
+#include <vector>
 #include <cstdint>
 #include <chrono>
 #include <functional>
@@ -22,6 +23,22 @@ struct ConvertOptions {
     /// Each SEG: "colName,index,isReverse,padLen[,padMode][,padContent]"
     /// Special: "$RND$,index,false,N" → N random digits (0–8)
     std::string row_key_rule;
+
+    // ── Column filtering ──────────────────────────────────────────────────
+    /// Column names to exclude from HBase KV output (exact match, case-sensitive).
+    /// These columns are NOT written as HBase qualifiers.
+    /// Does NOT affect row key construction — row key segments reference columns
+    /// by index (from the original Arrow schema) which remains unchanged.
+    ///
+    /// Example: {"_hoodie_commit_time", "_hoodie_record_key"}
+    std::vector<std::string> excluded_columns;
+
+    /// Column name prefixes to exclude (e.g. "_hoodie" excludes all columns
+    /// whose name starts with "_hoodie").  Takes effect after exact-name exclusions.
+    /// Matching is prefix-only, case-sensitive.
+    ///
+    /// Example: {"_hoodie"}  →  drops all five Hudi metadata columns automatically
+    std::vector<std::string> excluded_column_prefixes;
 
     // ── Column mapping ────────────────────────────────────────────────────
     std::string column_family   = "cf";    // all KVs go into this CF
@@ -44,6 +61,12 @@ struct ConvertResult {
     int64_t     kv_written_count    = 0;
     int64_t     kv_skipped_count    = 0;
     int64_t     hfile_size_bytes    = 0;
+
+    /// Number of HBase row keys that were produced by more than one Arrow source
+    /// row (i.e. rowKeyRule collisions).  Each such group emits one WARN log line.
+    /// Non-zero here means your rowKeyRule is not injective for this dataset;
+    /// review the rule or add a uniqueness-guaranteeing segment (e.g. $RND$).
+    int64_t     duplicate_key_count = 0;
 
     std::chrono::milliseconds elapsed_ms{0};
     std::chrono::milliseconds sort_ms{0};

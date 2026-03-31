@@ -9,13 +9,16 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace hfile {
 namespace jni {
 
 struct JsonConfigValue {
     bool        is_string{false};
-    std::string text;
+    bool        is_array{false};          // true when the JSON value is ["a","b",...]
+    std::string text;                     // used when is_string==true or is_array==false
+    std::vector<std::string> array_items; // used when is_array==true
 };
 
 using JsonConfigObject = std::unordered_map<std::string, JsonConfigValue>;
@@ -126,6 +129,30 @@ inline Status parse_json_config(std::string_view json, JsonConfigObject* out) {
         if (pos < json.size() && json[pos] == '"') {
             value.is_string = true;
             HFILE_RETURN_IF_ERROR(parse_json_string(json, &pos, &value.text));
+        } else if (pos < json.size() && json[pos] == '[') {
+            // String array: ["item1","item2",...]
+            value.is_array = true;
+            ++pos;  // consume '['
+            skip_ws(json, &pos);
+            while (pos < json.size() && json[pos] != ']') {
+                if (json[pos] != '"')
+                    return Status::InvalidArg(
+                        "JSON parse error: array elements must be strings");
+                std::string item;
+                HFILE_RETURN_IF_ERROR(parse_json_string(json, &pos, &item));
+                value.array_items.push_back(std::move(item));
+                skip_ws(json, &pos);
+                if (pos < json.size() && json[pos] == ',') {
+                    ++pos;
+                    skip_ws(json, &pos);
+                } else if (pos < json.size() && json[pos] != ']') {
+                    return Status::InvalidArg(
+                        "JSON parse error: expected ',' or ']' in array");
+                }
+            }
+            if (pos >= json.size())
+                return Status::InvalidArg("JSON parse error: unterminated array");
+            ++pos;  // consume ']'
         } else {
             HFILE_RETURN_IF_ERROR(parse_json_integer(json, &pos, &value.text));
         }
@@ -165,11 +192,21 @@ inline std::optional<int64_t> config_int(
     auto it = obj.find(key);
     if (it == obj.end()) return std::nullopt;
     if (it->second.is_string) return std::nullopt;
+    if (it->second.is_array)  return std::nullopt;
     try {
         return std::stoll(it->second.text);
     } catch (...) {
         return std::nullopt;
     }
+}
+
+/// Return the string array value for `key`, or nullopt if not present / not an array.
+inline std::optional<std::vector<std::string>> config_string_array(
+        const JsonConfigObject& obj, const std::string& key) {
+    auto it = obj.find(key);
+    if (it == obj.end()) return std::nullopt;
+    if (!it->second.is_array) return std::nullopt;
+    return it->second.array_items;
 }
 
 } // namespace jni

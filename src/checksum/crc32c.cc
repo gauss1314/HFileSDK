@@ -54,6 +54,8 @@ static uint32_t crc32c_scalar(uint32_t crc, const uint8_t* data, size_t len) noe
 static uint32_t crc32c_hw(uint32_t crc, const uint8_t* data, size_t len) noexcept {
     // Serial 8-byte lane: one _mm_crc32_u64 per iteration.
     // Latency = 3 cycles, throughput = 1/cycle; this is correct and fast.
+    // _mm_crc32_u64 requires a 64-bit target; on 32-bit we skip the 8-byte loop.
+#if defined(__x86_64__) || defined(_M_X64)
     while (len >= sizeof(uint64_t)) {
         uint64_t v;
         std::memcpy(&v, data, sizeof(uint64_t));
@@ -61,6 +63,7 @@ static uint32_t crc32c_hw(uint32_t crc, const uint8_t* data, size_t len) noexcep
         data += sizeof(uint64_t);
         len  -= sizeof(uint64_t);
     }
+#endif
     // Drain 4-byte tail
     if (len >= sizeof(uint32_t)) {
         uint32_t v;

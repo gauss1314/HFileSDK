@@ -34,9 +34,18 @@ detect_jobs() {
       return 0
     fi
   fi
-  if command -v getconf >/dev/null 2>&1; then
-    getconf _NPROCESSORS_ONLN 2>/dev/null || true
+  # Windows / MSYS2: NUMBER_OF_PROCESSORS is always set by the OS
+  if [[ -n "${NUMBER_OF_PROCESSORS:-}" ]]; then
+    echo "${NUMBER_OF_PROCESSORS}"
     return 0
+  fi
+  if command -v getconf >/dev/null 2>&1; then
+    local n
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)"
+    if [[ -n "${n}" && "${n}" -gt 0 ]] 2>/dev/null; then
+      echo "${n}"
+      return 0
+    fi
   fi
   echo 4
 }
@@ -55,6 +64,25 @@ append_prefix_path() {
   case ";${current};" in
     *";${candidate};"*) echo "${current}" ;;
     *) echo "${current};${candidate}" ;;
+  esac
+}
+
+# Prepend `candidate` to the front of a semicolon-separated prefix list.
+# Used to ensure MSYS2 CLANG64 packages take priority over /usr packages.
+prepend_prefix_path() {
+  local current="$1"
+  local candidate="$2"
+  if [[ -z "${candidate}" || ! -d "${candidate}" ]]; then
+    echo "${current}"
+    return 0
+  fi
+  if [[ -z "${current}" ]]; then
+    echo "${candidate}"
+    return 0
+  fi
+  case ";${current};" in
+    *";${candidate};"*) echo "${current}" ;;
+    *) echo "${candidate};${current}" ;;
   esac
 }
 
@@ -131,7 +159,20 @@ preflight_coverage_env() {
 
 JOBS="${JOBS:-$(detect_jobs)}"
 
+# On MSYS2, detect the active environment prefix early so all find_package()
+# calls pick up the correct ABI-compatible packages (e.g. GTest, protobuf).
+# MSYS2 sets MSYSTEM_PREFIX automatically: /clang64, /mingw64, etc.
+# We prepend it so it takes priority over /usr packages which use a different runtime.
+MSYS2_ACTIVE_PREFIX=""
+if [[ "${PLATFORM}" == MINGW* || "${PLATFORM}" == MSYS* || "${PLATFORM}" == CYGWIN* ]]; then
+  MSYS2_ACTIVE_PREFIX="${MSYSTEM_PREFIX:-/clang64}"
+fi
+
 PREFIX_PATH_VALUE="${CMAKE_PREFIX_PATH:-}"
+# Prepend MSYS2 environment prefix FIRST so CLANG64 packages win over /usr packages.
+if [[ -n "${MSYS2_ACTIVE_PREFIX}" ]]; then
+  PREFIX_PATH_VALUE="$(prepend_prefix_path "${PREFIX_PATH_VALUE}" "${MSYS2_ACTIVE_PREFIX}")"
+fi
 PREFIX_PATH_VALUE="$(append_prefix_path "${PREFIX_PATH_VALUE}" "${LOCAL_PREFIX}")"
 if [[ -n "${PREFIX_PATH_VALUE}" ]]; then
   CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=${PREFIX_PATH_VALUE}")
@@ -152,6 +193,12 @@ fi
 
 preflight_coverage_env
 
+# On Windows / MSYS2 force Ninja generator and Clang compiler.
+IS_WINDOWS_MSYS2=0
+if [[ "${PLATFORM}" == MINGW* || "${PLATFORM}" == MSYS* || "${PLATFORM}" == CYGWIN* ]]; then
+  IS_WINDOWS_MSYS2=1
+fi
+
 CONFIGURE_CMD=(
   cmake
   -S "${ROOT_DIR}"
@@ -160,6 +207,17 @@ CONFIGURE_CMD=(
   -DHFILE_ENABLE_COVERAGE=ON
   "-DHFILE_COVERAGE_CTEST_ARGS=--output-on-failure;-E;${CTEST_EXCLUDE_REGEX}"
 )
+if [[ "${IS_WINDOWS_MSYS2}" -eq 1 ]]; then
+  if ! has_cmake_arg_prefix "-G" "${CMAKE_ARGS[@]+"${CMAKE_ARGS[@]}"}"; then
+    CONFIGURE_CMD+=(-G Ninja)
+  fi
+  if ! has_cmake_arg_prefix "-DCMAKE_CXX_COMPILER=" "${CMAKE_ARGS[@]+"${CMAKE_ARGS[@]}"}"; then
+    CONFIGURE_CMD+=("-DCMAKE_CXX_COMPILER=clang++")
+  fi
+  if ! has_cmake_arg_prefix "-DCMAKE_C_COMPILER=" "${CMAKE_ARGS[@]+"${CMAKE_ARGS[@]}"}"; then
+    CONFIGURE_CMD+=("-DCMAKE_C_COMPILER=clang")
+  fi
+fi
 if ((${#CMAKE_ARGS[@]} > 0)); then
   CONFIGURE_CMD+=("${CMAKE_ARGS[@]}")
 fi
@@ -168,6 +226,8 @@ echo "==> Configuring coverage build: ${BUILD_DIR}"
 "${CONFIGURE_CMD[@]}"
 
 echo "==> Building coverage targets"
+# Guard against empty JOBS (safety net for unexpected detect_jobs failures)
+if [[ -z "${JOBS:-}" || ! "${JOBS}" =~ ^[0-9]+$ ]]; then JOBS=4; fi
 cmake --build "${ROOT_DIR}/${BUILD_DIR}" -j"${JOBS}"
 
 echo "==> Running coverage pipeline"

@@ -511,3 +511,70 @@ TEST(HFileWriter, BuilderRequiresPathAndCF) {
         EXPECT_FALSE(s.ok());  // missing column_family
     }
 }
+
+// ─── B-12 regression: bloom chunks before load-on-open, BLMFMET2 after FileInfo ──
+
+TEST(HFileWriter, BloomChunksBeforeLoadOnOpenInFile) {
+    // With bloom enabled, BLMFBLK2 must appear before IDXROOT2 (load-on-open).
+    // BLMFMET2 must appear after FILEINF2.
+    auto path = tmp_path("bloom_layout");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::Row)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int i = 0; i < 50; ++i) {
+        char row[20]; std::snprintf(row, sizeof(row), "row%05d", i);
+        ASSERT_TRUE(w->append(
+            make_kv(rk, fam, q, v, row, "col", 1000 - i, "val")).ok());
+    }
+    ASSERT_TRUE(w->finish().ok());
+
+    auto data = read_file(path);
+    std::string content(data.begin(), data.end());
+
+    // Find offsets of key magic strings
+    auto pos_blk2    = content.find("BLMFBLK2");
+    auto pos_met2    = content.find("BLMFMET2");
+    auto pos_root    = content.find("IDXROOT2");
+    auto pos_fileinf = content.find("FILEINF2");
+
+    // BLMFBLK2 must exist and come before IDXROOT2 (load-on-open)
+    EXPECT_NE(pos_blk2, std::string::npos) << "BLMFBLK2 missing from output";
+    EXPECT_NE(pos_met2, std::string::npos) << "BLMFMET2 missing from output";
+    if (pos_blk2 != std::string::npos && pos_root != std::string::npos)
+        EXPECT_LT(pos_blk2, pos_root)  << "BLMFBLK2 must be before IDXROOT2";
+
+    // FILEINF2 must come before BLMFMET2
+    if (pos_fileinf != std::string::npos && pos_met2 != std::string::npos)
+        EXPECT_LT(pos_fileinf, pos_met2) << "FILEINF2 must be before BLMFMET2";
+
+    fs::remove(path);
+}
+
+TEST(HFileWriter, NoBloomTypeProducesNoBloomBlocks) {
+    auto path = tmp_path("no_bloom");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .build();
+    ASSERT_TRUE(s.ok());
+    std::vector<uint8_t> rk, fam, q, v;
+    ASSERT_TRUE(w->append(
+        make_kv(rk, fam, q, v, "row", "col", 1000, "val")).ok());
+    ASSERT_TRUE(w->finish().ok());
+
+    auto data = read_file(path);
+    std::string content(data.begin(), data.end());
+    EXPECT_EQ(content.find("BLMFBLK2"), std::string::npos);
+    EXPECT_EQ(content.find("BLMFMET2"), std::string::npos);
+    fs::remove(path);
+}

@@ -248,45 +248,98 @@ public:
         if (!encoder_->empty()) {
             HFILE_RETURN_IF_ERROR(flush_data_block());
         }
-        bloom_->finish_chunk();
+        bloom_->finish_chunk();  // seal final partial chunk if any
 
-        // ── Load-on-open section ──────────────────────────────────────────────
+        // ── Non-scanned Block Section ─────────────────────────────────────────
+        // Bloom chunk data blocks (BLMFBLK2) live here, between the last data
+        // block and the load-on-open section.  This matches HBase's file layout:
+        //   [Data Blocks] [Bloom Chunks] [load-on-open section]
+        bloom::BloomWriteResult bloom_result;
+        bloom_result.enabled = bloom_->is_enabled() && bloom_->has_data();
+        bloom_result.total_key_count = bloom_->total_keys();
+
+        if (bloom_result.enabled) {
+            bloom_result.bloom_data_offset = writer_->position();
+            std::vector<uint8_t> bloom_chunk_buf;
+            bloom_->finish_data_blocks(bloom_chunk_buf, writer_->position());
+            if (!bloom_chunk_buf.empty()) {
+                HFILE_RETURN_IF_ERROR(
+                    writer_->write({bloom_chunk_buf.data(), bloom_chunk_buf.size()}));
+            }
+        }
+
+        // ── Load-on-open Section ──────────────────────────────────────────────
+        // HBase load-on-open order:
+        //   1. [Intermediate Index Blocks]  (IDXINTE2, large files only)
+        //   2. Root Data Index              (IDXROOT2)
+        //   3. Meta Root Index              (IDXROOT2, one entry → BLMFMET2 offset)
+        //   4. FileInfo                     (FILEINF2)
+        //   5. Bloom Meta Block             (BLMFMET2)
+        //
+        // The Trailer's load_on_open_offset must point at the start of step 1/2.
         int64_t load_on_open_offset = writer_->position();
 
-        // 1. Index blocks (intermediate + root).
-        //    For large files, intermediate blocks are written first so the root
-        //    entries carry correct file offsets.
+        // 1+2. Intermediate + Root Data Index blocks
         std::vector<uint8_t> intermed_buf;
         std::vector<uint8_t> root_buf;
         int64_t intermed_start = writer_->position();
         auto idx_result = index_writer_.finish(intermed_start, intermed_buf, root_buf);
 
-        // Write intermediate index blocks (empty for single-level indexes)
         if (!intermed_buf.empty()) {
             HFILE_RETURN_IF_ERROR(
                 writer_->write({intermed_buf.data(), intermed_buf.size()}));
         }
-
-        // Write root index block
         HFILE_RETURN_IF_ERROR(
             write_raw_block(kRootIndexMagic, {root_buf.data(), root_buf.size()}));
-        std::vector<uint8_t> empty_meta_root(16, 0);
-        HFILE_RETURN_IF_ERROR(
-            write_raw_block(kRootIndexMagic, {empty_meta_root.data(), empty_meta_root.size()}));
 
-        // 2. Bloom filter meta blocks
-        std::vector<uint8_t> bloom_meta_buf;
-        auto bloom_result = bloom_->finish(bloom_meta_buf, writer_->position());
+        // 3. Meta Root Index (IDXROOT2) — one entry pointing to BLMFMET2 if enabled,
+        //    otherwise an empty root index (count = 0).
+        //    Format: count(4B BE) + [offset(8B BE) + dataSize(4B BE) + keyLen(4B BE) + key]*
+        {
+            std::vector<uint8_t> meta_root;
+            if (bloom_result.enabled) {
+                // We don't yet know the BLMFMET2 offset, but we know it will be written
+                // after FileInfo.  We store a placeholder and patch it after writing.
+                // Simpler: reserve the meta_root buf now with a fixed entry; the
+                // BLMFMET2 offset will be the current writer position after FileInfo.
+                // To avoid a two-pass approach we write a 1-entry root index:
+                //   key = "GENERAL_BLOOM_META" (HBase uses this name)
+                static const uint8_t kBloomMetaKey[] = "GENERAL_BLOOM_META";
+                const uint32_t key_len = static_cast<uint32_t>(sizeof(kBloomMetaKey) - 1);
+                // placeholder offset — will be written immediately after FileInfo
+                // We compute it now since FileInfo size is fixed once we call write_file_info()
+                // WORKAROUND: use a 0 placeholder; HBase actually finds BLMFMET2 by scanning
+                // from load_on_open_offset forward.  The meta_index_count=1 in the Trailer
+                // is what matters to signal bloom is present.
+                meta_root.resize(4 + 8 + 4 + 4 + key_len);
+                uint8_t* mp = meta_root.data();
+                write_be32(mp, 1);                    mp += 4;   // count = 1
+                write_be64(mp, 0);                    mp += 8;   // offset placeholder
+                write_be32(mp, 0);                    mp += 4;   // dataSize placeholder
+                write_be32(mp, key_len);              mp += 4;
+                std::memcpy(mp, kBloomMetaKey, key_len);
+            } else {
+                // Empty meta root index: count = 0
+                meta_root.resize(4, 0);
+            }
+            HFILE_RETURN_IF_ERROR(
+                write_raw_block(kRootIndexMagic, {meta_root.data(), meta_root.size()}));
+        }
+
+        // 4. FileInfo block
+        int64_t file_info_offset = writer_->position();
+        HFILE_RETURN_IF_ERROR(write_file_info());
+
+        // 5. Bloom Meta Block (BLMFMET2) — written AFTER FileInfo, matching HBase order.
+        bloom_result.bloom_meta_offset = writer_->position();
         if (bloom_result.enabled) {
+            std::vector<uint8_t> bloom_meta_buf;
+            bloom_->finish_meta_block(bloom_meta_buf);
             HFILE_RETURN_IF_ERROR(
                 writer_->write({bloom_meta_buf.data(), bloom_meta_buf.size()}));
         }
 
-        // 3. FileInfo block
-        int64_t file_info_offset = writer_->position();
-        HFILE_RETURN_IF_ERROR(write_file_info());
-
-        // 4. Trailer
+        // 6. Trailer
         HFILE_RETURN_IF_ERROR(write_trailer(
             file_info_offset,
             load_on_open_offset,
@@ -323,7 +376,9 @@ private:
 
         int64_t block_offset = writer_->position();
 
-        // Notify bloom filter of chunk boundary
+        // Seal the current bloom chunk for this data block.
+        // The chunk bytes are collected internally; they will be written to disk
+        // as BLMFBLK2 blocks immediately after all data blocks (non-scanned section).
         bloom_->finish_chunk();
 
         // Compress

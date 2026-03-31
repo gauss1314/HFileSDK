@@ -16,6 +16,7 @@
 #include <arrow/util/byte_size.h>
 
 #include <algorithm>
+#include <unordered_set>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -30,6 +31,80 @@ namespace clog {
 static void info (const std::string& m){ fprintf(stderr,"[INFO]  convert: %s\n",m.c_str()); }
 static void warn (const std::string& m){ fprintf(stderr,"[WARN]  convert: %s\n",m.c_str()); }
 static void err  (const std::string& m){ fprintf(stderr,"[ERROR] convert: %s\n",m.c_str()); }
+}
+
+// ─── Column exclusion helper ──────────────────────────────────────────────────
+
+/// Build the set of column indices that should be excluded from HBase KV output.
+/// Row key segments always reference columns by index from the *original* Arrow
+/// schema, so exclusions never affect row key construction — only the second pass
+/// that writes qualifiers skips these columns.
+///
+/// Logs one INFO line listing the excluded column names.
+// ─── Column exclusion helpers ─────────────────────────────────────────────────
+
+/// Compute the indices (in the ORIGINAL schema) that must be removed,
+/// sorted in DESCENDING order so RemoveColumn() calls preserve earlier indices.
+static std::vector<int> build_removal_indices(
+        const std::shared_ptr<arrow::Schema>&   schema,
+        const std::vector<std::string>&         excluded_names,
+        const std::vector<std::string>&         excluded_prefixes) {
+
+    if (excluded_names.empty() && excluded_prefixes.empty())
+        return {};
+
+    std::unordered_set<std::string> name_set(excluded_names.begin(), excluded_names.end());
+
+    std::vector<int>         indices;
+    std::vector<std::string> matched_names;
+
+    for (int c = 0; c < schema->num_fields(); ++c) {
+        const std::string& col = schema->field(c)->name();
+        bool matched = name_set.count(col) > 0;
+        if (!matched) {
+            for (const auto& pfx : excluded_prefixes) {
+                if (!pfx.empty() && col.size() >= pfx.size() &&
+                    col.compare(0, pfx.size(), pfx) == 0) {
+                    matched = true;
+                    break;
+                }
+            }
+        }
+        if (matched) {
+            indices.push_back(c);
+            matched_names.push_back(col);
+        }
+    }
+
+    // Must be descending so that each RemoveColumn(idx) doesn't shift remaining indices
+    std::sort(indices.begin(), indices.end(), std::greater<int>());
+
+    if (!indices.empty()) {
+        std::string names_str;
+        for (size_t i = 0; i < matched_names.size(); ++i) {
+            if (i) names_str += ", ";
+            names_str += matched_names[i];
+        }
+        clog::info("Column exclusion: dropping " + std::to_string(indices.size()) +
+                   " column(s) before rowKeyRule index mapping: [" + names_str + "]");
+    }
+    return indices;
+}
+
+/// Apply RemoveColumn for each index in `removal_indices` (must be sorted descending).
+/// Returns a new RecordBatch with those columns physically removed.
+/// rowKeyRule indices in the caller then reference the FILTERED schema directly.
+static arrow::Result<std::shared_ptr<arrow::RecordBatch>> apply_column_removal(
+        std::shared_ptr<arrow::RecordBatch>  batch,
+        const std::vector<int>&              removal_indices) {
+    if (removal_indices.empty()) return batch;
+    auto result = std::move(batch);
+    for (int idx : removal_indices) {             // descending — safe to remove one by one
+        if (idx < result->num_columns()) {
+            ARROW_ASSIGN_OR_RAISE(result, result->RemoveColumn(idx));
+        }
+    }
+    return result;
 }
 
 // ─── SortEntry ────────────────────────────────────────────────────────────────
@@ -223,6 +298,7 @@ static Status build_sort_index(
         const std::string&                  arrow_path,
         arrow_convert::RowKeyBuilder&       rkb,
         int                                 max_col_idx,
+        const std::vector<int>&             removal_indices,   // sorted desc, applied per-batch
         std::vector<SortEntry>&             index_out,
         std::vector<std::shared_ptr<arrow::RecordBatch>>& batches_out,
         memory::MemoryBudget*               budget,
@@ -233,46 +309,78 @@ static Status build_sort_index(
         return Status::IoError("Cannot open Arrow file: " + reader_res.status().ToString());
 
     auto reader = reader_res.ValueOrDie();
-    auto schema = reader->schema();
-    int num_cols = schema->num_fields();
 
-    if (max_col_idx >= num_cols) {
+    // Compute the FILTERED schema by applying removals to the original schema.
+    // rowKeyRule indices are validated against this filtered schema.
+    std::shared_ptr<arrow::Schema> filtered_schema;
+    {
+        auto orig = reader->schema();
+        auto tmp_batch = arrow::RecordBatch::Make(
+            orig, 0,
+            std::vector<std::shared_ptr<arrow::Array>>(
+                static_cast<size_t>(orig->num_fields()),
+                nullptr));
+        auto filtered_res = apply_column_removal(tmp_batch, removal_indices);
+        if (!filtered_res.ok())
+            return Status::IoError("Failed to compute filtered schema: " +
+                                   filtered_res.status().ToString());
+        filtered_schema = (*filtered_res)->schema();
+    }
+    int num_filtered_cols = filtered_schema->num_fields();
+
+    // Validate that rowKeyRule indices refer to columns that exist after filtering
+    if (max_col_idx >= num_filtered_cols) {
         return Status::InvalidArg(
             "SCHEMA_MISMATCH: rowKeyRule references column index " +
-            std::to_string(max_col_idx) + " but Arrow schema has only " +
-            std::to_string(num_cols) + " columns");
+            std::to_string(max_col_idx) + " but filtered Arrow schema has only " +
+            std::to_string(num_filtered_cols) + " columns. " +
+            "Note: column indices are based on the schema AFTER excluded columns are removed.");
     }
 
-    std::vector<bool> referenced_cols(static_cast<size_t>(std::max(0, num_cols)), false);
+    std::vector<bool> referenced_cols(static_cast<size_t>(std::max(0, num_filtered_cols)), false);
     for (const auto& seg : rkb.segments()) {
         if (seg.type != arrow_convert::RowKeySegment::Type::ColumnRef &&
             seg.type != arrow_convert::RowKeySegment::Type::EncodedColumn)
             continue;
-        if (seg.col_index >= num_cols) {
+        if (seg.col_index >= num_filtered_cols) {
             return Status::InvalidArg(
                 "SCHEMA_MISMATCH: rowKeyRule references column index " +
-                std::to_string(seg.col_index) + " but Arrow schema has only " +
-                std::to_string(num_cols) + " columns");
+                std::to_string(seg.col_index) + " but filtered Arrow schema has only " +
+                std::to_string(num_filtered_cols) + " columns.");
         }
         referenced_cols[static_cast<size_t>(seg.col_index)] = true;
     }
-    for (int c = 0; c < num_cols; ++c) {
-        if (!referenced_cols[static_cast<size_t>(c)])
-            continue;
-        if (!is_supported_rowkey_type(schema->field(c)->type())) {
+    for (int c = 0; c < num_filtered_cols; ++c) {
+        if (!referenced_cols[static_cast<size_t>(c)]) continue;
+        if (!is_supported_rowkey_type(filtered_schema->field(c)->type())) {
             return Status::InvalidArg(
                 "SCHEMA_MISMATCH: unsupported Arrow type for row key field '" +
-                schema->field(c)->name() + "': " + schema->field(c)->type()->ToString());
+                filtered_schema->field(c)->name() + "': " +
+                filtered_schema->field(c)->type()->ToString());
         }
     }
 
-    std::shared_ptr<arrow::RecordBatch> batch;
+    std::shared_ptr<arrow::RecordBatch> raw_batch;
     int32_t batch_idx = 0;
 
     while (true) {
-        auto s = reader->ReadNext(&batch);
+        auto s = reader->ReadNext(&raw_batch);
         if (!s.ok()) return Status::IoError("Arrow read error: " + s.ToString());
-        if (!batch) break;  // EOS
+        if (!raw_batch) break;  // EOS
+
+        // ── Strip excluded columns from the batch ──────────────────────────
+        // After this call the batch's schema == filtered_schema.
+        // All downstream code (row key building + second pass KV output) uses
+        // the filtered schema, so rowKeyRule indices need no adjustment.
+        std::shared_ptr<arrow::RecordBatch> batch;
+        if (!removal_indices.empty()) {
+            auto stripped = apply_column_removal(raw_batch, removal_indices);
+            if (!stripped.ok())
+                return Status::IoError("Column removal failed: " + stripped.status().ToString());
+            batch = std::move(*stripped);
+        } else {
+            batch = std::move(raw_batch);
+        }
 
         int64_t n_rows = batch->num_rows();
         if (budget) {
@@ -280,25 +388,23 @@ static Status build_sort_index(
                 static_cast<size_t>(std::max<int64_t>(0, arrow::util::TotalBufferSize(*batch))));
             if (!reserve_status.ok()) return reserve_status;
         }
-        batches_out.push_back(batch);
+        batches_out.push_back(batch);    // store the FILTERED batch
 
         for (int64_t r = 0; r < n_rows; ++r) {
             std::vector<std::string> owned_fields(
                 max_col_idx >= 0 ? static_cast<size_t>(max_col_idx + 1) : 0);
             std::vector<std::string_view> fields(owned_fields.size());
             for (int c = 0; c <= max_col_idx; ++c) {
-                if (!referenced_cols[static_cast<size_t>(c)])
-                    continue;
-                auto field_status = scalar_to_string(*batch->column(c), r, &owned_fields[static_cast<size_t>(c)]);
-                if (!field_status.ok())
-                    return field_status;
+                if (!referenced_cols[static_cast<size_t>(c)]) continue;
+                auto field_status = scalar_to_string(*batch->column(c), r,
+                                                     &owned_fields[static_cast<size_t>(c)]);
+                if (!field_status.ok()) return field_status;
                 fields[static_cast<size_t>(c)] = owned_fields[static_cast<size_t>(c)];
             }
             std::string rk = rkb.build(fields);
 
             if (rk.empty()) {
                 result.kv_skipped_count++;
-                // Use empty placeholder so row_idx is preserved
                 rk = "";
             }
 
@@ -307,9 +413,7 @@ static Status build_sort_index(
                 if (!reserve_status.ok()) return reserve_status;
             }
 
-            index_out.push_back({std::move(rk),
-                                  batch_idx,
-                                  static_cast<int32_t>(r)});
+            index_out.push_back({std::move(rk), batch_idx, static_cast<int32_t>(r)});
         }
 
         result.arrow_batches_read++;
@@ -327,6 +431,7 @@ static Status append_grouped_row_cells(
         const std::string&                  row_key,
         const std::string&                  cf,
         int64_t                             default_ts,
+        size_t                              source_row_count,   // how many Arrow rows mapped here
         int64_t*                            kv_written,
         int64_t*                            kv_skipped) {
     std::sort(cells.begin(), cells.end(),
@@ -334,11 +439,29 @@ static Status append_grouped_row_cells(
                   return a.qualifier < b.qualifier;
               });
 
-    for (size_t i = 1; i < cells.size(); ++i) {
-        if (cells[i - 1].qualifier == cells[i].qualifier)
-            return Status::InvalidArg(
-                "DUPLICATE_CELL: duplicate qualifier under row key '" + row_key + "'");
+    // Deduplicate: when the same qualifier appears multiple times under the same
+    // row key (i.e. multiple Arrow source rows mapped to this HBase row key),
+    // keep only the first occurrence (first-in-sort-order wins).
+    //
+    // NOTE: we do NOT log per-qualifier here.  The caller logs ONE group-level
+    // warning via clog::warn before calling this function, so the user sees
+    // exactly one line per row-key collision — not one line per column.
+    {
+        size_t write_pos = 0;
+        for (size_t read_pos = 0; read_pos < cells.size(); ++read_pos) {
+            if (write_pos > 0 &&
+                cells[write_pos - 1].qualifier == cells[read_pos].qualifier) {
+                // Silently count: the group-level warning was already emitted.
+                if (kv_skipped) ++(*kv_skipped);
+                continue;
+            }
+            if (read_pos != write_pos)
+                cells[write_pos] = std::move(cells[read_pos]);
+            ++write_pos;
+        }
+        cells.resize(write_pos);
     }
+    (void)source_row_count;  // available for future per-qualifier logging if needed
 
     int64_t ts = default_ts > 0 ? default_ts
                 : std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -405,7 +528,32 @@ ConvertResult convert(const ConvertOptions& opts) {
     }
     int max_col_idx = rkb.max_col_index();
 
-    // ── 3. First pass: build sort index (load all batches into memory) ────
+    // ── 3. Build column removal list ──────────────────────────────────────
+    // Compute which column indices (in the ORIGINAL Arrow schema) to physically
+    // remove from each RecordBatch before any further processing.
+    //
+    // After removal the stored batches use the FILTERED schema.  rowKeyRule
+    // indices then refer to positions in this filtered schema, so the caller
+    // never needs to account for excluded columns in their index numbers.
+    //
+    // The extra schema-peek open is cheap: Arrow IPC Stream readers read the
+    // schema message first; we never read actual row data here.
+    std::vector<int> removal_indices;  // sorted descending
+    if (!opts.excluded_columns.empty() || !opts.excluded_column_prefixes.empty()) {
+        auto schema_reader_res = open_arrow_stream(opts.arrow_path);
+        if (!schema_reader_res.ok()) {
+            result.error_code = ErrorCode::ARROW_FILE_ERROR;
+            result.error_message = "Cannot open Arrow file for schema read: " +
+                                   schema_reader_res.status().ToString();
+            return result;
+        }
+        removal_indices = build_removal_indices(
+            schema_reader_res.ValueOrDie()->schema(),
+            opts.excluded_columns,
+            opts.excluded_column_prefixes);
+    }
+
+    // ── 4. First pass: build sort index (load all batches into memory) ────
     clog::info("Pass 1: building sort index...");
     std::vector<SortEntry> sort_index;
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
@@ -416,6 +564,7 @@ ConvertResult convert(const ConvertOptions& opts) {
     auto t_sort_start = std::chrono::steady_clock::now();
     {
         Status s = build_sort_index(opts.arrow_path, rkb, max_col_idx,
+                                    removal_indices,
                                     sort_index, batches, budget.get(), result);
         if (!s.ok()) {
             result.error_code = s.message().find("MemoryBudget:") == 0
@@ -429,11 +578,22 @@ ConvertResult convert(const ConvertOptions& opts) {
         }
     }
 
-    // Filter out empty row keys (rows that failed key generation)
-    sort_index.erase(
-        std::remove_if(sort_index.begin(), sort_index.end(),
-                       [](const SortEntry& e){ return e.row_key.empty(); }),
-        sort_index.end());
+    // Filter out empty row keys (rows that failed key generation).
+    // If a memory budget is active, release the quota reserved for each
+    // discarded SortEntry — they were reserved but will never be used.
+    {
+        size_t before = sort_index.size();
+        sort_index.erase(
+            std::remove_if(sort_index.begin(), sort_index.end(),
+                           [](const SortEntry& e){ return e.row_key.empty(); }),
+            sort_index.end());
+        size_t erased = before - sort_index.size();
+        if (budget && erased > 0) {
+            // Each empty-key entry reserved exactly sizeof(SortEntry) + 0 bytes
+            // (rk.size() == 0 at the time of reservation).
+            budget->release(erased * sizeof(SortEntry));
+        }
+    }
 
     // Sort by row key (lexicographic = HBase Row ordering)
     std::stable_sort(sort_index.begin(), sort_index.end(),
@@ -494,6 +654,8 @@ ConvertResult convert(const ConvertOptions& opts) {
             auto schema = batch->schema();
             int num_cols = batch->num_columns();
             for (int c = 0; c < num_cols; ++c) {
+                // No exclusion check needed: stored batches already have
+                // excluded columns removed by apply_column_removal() in Pass 1.
                 if (batch->column(c)->IsNull(entry.row_idx)) continue;
                 auto val = scalar_to_bytes(*batch->column(c), entry.row_idx);
                 if (val.empty()) continue;
@@ -503,19 +665,46 @@ ConvertResult convert(const ConvertOptions& opts) {
 
         int64_t kv_written = 0;
         int64_t kv_skipped = 0;
+        size_t  source_rows = j - i;   // Arrow rows that mapped to this HBase row key
+
+        // Log ONE group-level warning when multiple source rows collapsed into one
+        // HBase row.  This replaces the old per-qualifier warn that fired N times
+        // (once per column) for every collision, flooding the log.
+        if (source_rows > 1) {
+            // Truncate key for readability — raw bytes may not be printable.
+            std::string display_key = row_key.size() > 64
+                ? row_key.substr(0, 64) + "...(+" + std::to_string(row_key.size() - 64) + "B)"
+                : row_key;
+            clog::warn("DUPLICATE_KEY: row key '" + display_key +
+                       "' was produced by " + std::to_string(source_rows) +
+                       " source rows — keeping first, discarding " +
+                       std::to_string(source_rows - 1) +
+                       " duplicate(s). Check your rowKeyRule for uniqueness.");
+            ++result.duplicate_key_count;
+        }
+
         auto s = append_grouped_row_cells(*writer, cells, row_key,
                                           opts.column_family,
                                           opts.default_timestamp,
+                                          source_rows,
                                           &kv_written,
                                           &kv_skipped);
         if (!s.ok()) {
-            result.error_code = s.message().find("SORT_ORDER_VIOLATION") != std::string::npos ||
-                                s.message().find("DUPLICATE_CELL") != std::string::npos
-                ? ErrorCode::SORT_VIOLATION
-                : ErrorCode::IO_ERROR;
-            result.error_message = s.message();
-            clog::err("Pass 2 failed: " + s.message());
-            return result;
+            // Only SORT_ORDER_VIOLATION is fatal — it indicates a logic bug
+            // (the sort index or HFileWriter is broken).  Other errors (I/O,
+            // value-too-large from the HFileWriter's ErrorPolicy) are treated
+            // as per the configured error_policy.
+            if (s.message().find("SORT_ORDER_VIOLATION") != std::string::npos) {
+                result.error_code = ErrorCode::SORT_VIOLATION;
+                result.error_message = s.message();
+                clog::err("Pass 2 aborted: " + s.message());
+                return result;
+            }
+            // Non-fatal: log, count as skipped, continue with next row group
+            clog::warn("Row group skipped (" + row_key + "): " + s.message());
+            result.kv_skipped_count += static_cast<int64_t>(j - i);
+            i = j;
+            continue;
         }
         result.kv_written_count += kv_written;
         result.kv_skipped_count += kv_skipped;

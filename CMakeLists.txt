@@ -36,6 +36,7 @@ endif()
 
 # ─── Options ──────────────────────────────────────────────────────────────────
 option(HFILE_ENABLE_BENCHMARKS "Build benchmark targets" OFF)
+option(HFILE_ENABLE_TESTS      "Build test targets (requires GTest)" ON)
 # io_uring is Linux-only; disable silently on other platforms
 option(HFILE_ENABLE_IO_URING   "Enable io_uring async I/O (Linux only)" ON)
 # libhdfs3 has no official Windows build
@@ -304,7 +305,102 @@ target_include_directories(hfile_chaos PRIVATE
 
 # Tests
 enable_testing()
-find_package(GTest REQUIRED)
+
+if(NOT HFILE_ENABLE_TESTS)
+  message(STATUS "Tests disabled (HFILE_ENABLE_TESTS=OFF). "
+                 "Skip GTest dependency and all test targets.")
+else()
+
+# ── Windows / MSYS2: force GTest from the CLANG64 prefix ─────────────────────
+#
+# Root cause of repeated failures:
+#   cmake.exe on MSYS2 is a NATIVE Windows process.  It does NOT understand
+#   MSYS2 POSIX paths like /clang64.  When we called:
+#       file(TO_CMAKE_PATH "$ENV{MSYSTEM_PREFIX}" ...)
+#   with MSYSTEM_PREFIX=/clang64, cmake kept /clang64 as-is — it has no way
+#   to resolve it to D:/msys64/clang64.  So GTest_DIR was set to a path cmake
+#   could not find, and cmake silently fell back to the first GTest it could
+#   find: D:/msys64/usr/lib (MSYS runtime, ABI-incompatible with LLVM libc++).
+#
+# Correct approach:
+#   Derive the prefix exclusively from CMAKE_CXX_COMPILER, which cmake already
+#   stores as a proper Windows path (D:/msys64/clang64/bin/clang++.exe).
+#   Two get_filename_component(DIRECTORY) calls give D:/msys64/clang64.
+#   This path works for any cmake operation without any further conversion.
+#
+# Additionally, build.sh passes -DGTest_DIR=<windows_path> via cygpath, which
+# provides the highest-priority cmake -D override that defeats any stale cache.
+if(HFILE_PLATFORM_WINDOWS)
+  # ── Step 1: derive the CLANG64 prefix from the compiler path ───────────────
+  # CMAKE_CXX_COMPILER is already a Windows path set by cmake's compiler probe.
+  # Example: D:/msys64/clang64/bin/clang++.exe
+  #   → DIRECTORY once → D:/msys64/clang64/bin
+  #   → DIRECTORY twice → D:/msys64/clang64
+  # This works regardless of how the compiler was specified and regardless of
+  # MSYSTEM_PREFIX, MSYSTEM, or any other MSYS2 environment variable.
+  get_filename_component(_MSYS2_PREFIX "${CMAKE_CXX_COMPILER}" DIRECTORY)
+  get_filename_component(_MSYS2_PREFIX "${_MSYS2_PREFIX}"      DIRECTORY)
+  message(STATUS "MSYS2 CLANG64 prefix (from compiler): ${_MSYS2_PREFIX}")
+
+  # ── Step 2: clear ALL GTest cache variables ─────────────────────────────────
+  # cmake caches results from both module-mode (GTEST_LIBRARY, etc.) and
+  # config-mode (GTest_DIR) find_package calls.  Unsetting only GTest_DIR is
+  # not enough — GTEST_LIBRARY and GTEST_MAIN_LIBRARY also cache the stale
+  # /usr/lib path and cause cmake to skip re-searching entirely.
+  foreach(_gv
+      GTest_DIR        GTest_ROOT       GTEST_ROOT
+      GTEST_INCLUDE_DIR  GTEST_INCLUDE_DIRS
+      GTEST_LIBRARY      GTEST_LIBRARY_DEBUG    GTEST_LIBRARY_RELEASE
+      GTEST_MAIN_LIBRARY GTEST_MAIN_LIBRARY_DEBUG GTEST_MAIN_LIBRARY_RELEASE)
+    unset(${_gv} CACHE)
+  endforeach()
+
+  # ── Step 3: force GTest_DIR to the exact Windows path ──────────────────────
+  # GTest_DIR is the highest-priority input for config-mode find_package.
+  # Setting it here with FORCE overwrites any stale value in CMakeCache.txt
+  # every time cmake re-configures (i.e. whenever CMakeLists.txt changes).
+  # If build.sh also passes -DGTest_DIR on the command line (belt-and-suspenders),
+  # the -D value takes precedence over this set() call.
+  set(GTest_DIR "${_MSYS2_PREFIX}/lib/cmake/GTest"
+      CACHE PATH "GTest cmake config dir (MSYS2 CLANG64, auto-derived)" FORCE)
+  message(STATUS "GTest_DIR → ${GTest_DIR}")
+
+  # Prepend the Windows prefix so all other find_package calls also prefer
+  # CLANG64 packages over /usr packages.
+  list(INSERT CMAKE_PREFIX_PATH 0 "${_MSYS2_PREFIX}")
+endif()
+
+# ── find GTest in CONFIG mode ─────────────────────────────────────────────────
+# CONFIG keyword forces cmake to look for GTestConfig.cmake only, bypassing
+# FindGTest.cmake (module mode).  Module mode caches GTEST_LIBRARY /
+# GTEST_MAIN_LIBRARY separately and is harder to override reliably.
+find_package(GTest REQUIRED CONFIG)
+
+# ── ABI sanity check ─────────────────────────────────────────────────────────
+if(HFILE_PLATFORM_WINDOWS AND TARGET GTest::gtest)
+  get_target_property(_gt_loc GTest::gtest IMPORTED_LOCATION_RELEASE)
+  if(NOT _gt_loc)
+    get_target_property(_gt_loc GTest::gtest IMPORTED_LOCATION)
+  endif()
+  if(_gt_loc AND _gt_loc MATCHES "[/\\\\]usr[/\\\\]")
+    message(FATAL_ERROR
+      "\n"
+      "====================================================================\n"
+      " GTest found at WRONG location (MSYS runtime — ABI mismatch):\n"
+      "   ${_gt_loc}\n"
+      " Expected it under: ${_MSYS2_PREFIX}\n"
+      "\n"
+      " Fix: delete the build directory and rebuild from scratch:\n"
+      "   scripts\\\\clean.bat   (from Windows CMD / build.bat)\n"
+      "   sh scripts/clean.sh  (from MSYS2 terminal)\n"
+      " then:\n"
+      "   sh scripts/build.sh  (or scripts\\\\build.bat)\n"
+      "====================================================================\n")
+  else()
+    message(STATUS "GTest ABI check OK: ${_gt_loc}")
+  endif()
+endif()
+
 set(HFILE_TEST_TARGETS)
 
 set(GTEST_SOURCES
@@ -398,7 +494,12 @@ if(HFILE_ENABLE_JAVA_TESTS)
   )
 endif()
 
+endif() # HFILE_ENABLE_TESTS
+
 if(HFILE_ENABLE_COVERAGE)
+  if(NOT HFILE_ENABLE_TESTS)
+    message(FATAL_ERROR "HFILE_ENABLE_COVERAGE requires HFILE_ENABLE_TESTS=ON")
+  endif()
   set(HFILE_COVERAGE_TARGETS ${HFILE_TEST_TARGETS} hfile_chaos)
   set(HFILE_COVERAGE_OBJECT_TARGETS hfile hfile_chaos)
   if(HFILE_ENABLE_JAVA_TESTS)
@@ -457,6 +558,7 @@ endif()
 
 message(STATUS "HFileSDK configuration:")
 message(STATUS "  Build type:  ${CMAKE_BUILD_TYPE}")
+message(STATUS "  Tests:       ${HFILE_ENABLE_TESTS}")
 message(STATUS "  io_uring:    ${HFILE_ENABLE_IO_URING}")
 message(STATUS "  HDFS:        ${HFILE_ENABLE_HDFS}")
 message(STATUS "  Benchmarks:  ${HFILE_ENABLE_BENCHMARKS}")

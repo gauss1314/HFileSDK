@@ -26,21 +26,25 @@ struct InstanceState {
     WriterOptions writer_opts;
     ConvertResult last_result;
     std::string   last_result_json{"{}"};
+    // Column exclusion settings (set via configure())
+    std::vector<std::string> excluded_columns;
+    std::vector<std::string> excluded_column_prefixes;
 };
 
 static std::string result_to_json(const ConvertResult& r) {
     std::ostringstream oss;
     oss << "{"
-        << "\"error_code\":" << r.error_code << ','
-        << "\"error_message\":\"" << json_escape(r.error_message) << "\","
-        << "\"arrow_batches_read\":" << static_cast<long long>(r.arrow_batches_read) << ','
-        << "\"arrow_rows_read\":" << static_cast<long long>(r.arrow_rows_read) << ','
-        << "\"kv_written_count\":" << static_cast<long long>(r.kv_written_count) << ','
-        << "\"kv_skipped_count\":" << static_cast<long long>(r.kv_skipped_count) << ','
-        << "\"hfile_size_bytes\":" << static_cast<long long>(r.hfile_size_bytes) << ','
-        << "\"elapsed_ms\":" << static_cast<long long>(r.elapsed_ms.count()) << ','
-        << "\"sort_ms\":" << static_cast<long long>(r.sort_ms.count()) << ','
-        << "\"write_ms\":" << static_cast<long long>(r.write_ms.count())
+        << "\"error_code\":"          << r.error_code << ','
+        << "\"error_message\":\""     << json_escape(r.error_message) << "\","
+        << "\"arrow_batches_read\":"  << static_cast<long long>(r.arrow_batches_read) << ','
+        << "\"arrow_rows_read\":"     << static_cast<long long>(r.arrow_rows_read) << ','
+        << "\"kv_written_count\":"    << static_cast<long long>(r.kv_written_count) << ','
+        << "\"kv_skipped_count\":"    << static_cast<long long>(r.kv_skipped_count) << ','
+        << "\"duplicate_key_count\":" << static_cast<long long>(r.duplicate_key_count) << ','
+        << "\"hfile_size_bytes\":"    << static_cast<long long>(r.hfile_size_bytes) << ','
+        << "\"elapsed_ms\":"          << static_cast<long long>(r.elapsed_ms.count()) << ','
+        << "\"sort_ms\":"             << static_cast<long long>(r.sort_ms.count()) << ','
+        << "\"write_ms\":"            << static_cast<long long>(r.write_ms.count())
         << "}";
     return oss.str();
 }
@@ -100,6 +104,19 @@ static void set_instance_result(JNIEnv* env, jobject obj, const hfile::ConvertRe
 static hfile::WriterOptions get_instance_writer_opts(JNIEnv* env, jobject obj) {
     std::lock_guard<std::mutex> lk(g_config_mutex);
     return get_or_create_instance_state_locked(env, obj).writer_opts;
+}
+
+/// Retrieve a snapshot of the full InstanceState (writer_opts + exclusions).
+/// Called once per convert() invocation under the lock, then used without lock.
+struct InstanceSnapshot {
+    hfile::WriterOptions     writer_opts;
+    std::vector<std::string> excluded_columns;
+    std::vector<std::string> excluded_column_prefixes;
+};
+static InstanceSnapshot get_instance_snapshot(JNIEnv* env, jobject obj) {
+    std::lock_guard<std::mutex> lk(g_config_mutex);
+    const auto& s = get_or_create_instance_state_locked(env, obj);
+    return {s.writer_opts, s.excluded_columns, s.excluded_column_prefixes};
 }
 
 // ─── JNI exports ─────────────────────────────────────────────────────────────
@@ -178,10 +195,16 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
         opts.hfile_path   = hfile_path;
         opts.table_name   = table_name;
         opts.row_key_rule = row_key_rule;
-        opts.writer_opts  = get_instance_writer_opts(env, obj);
-        opts.column_family = opts.writer_opts.column_family.empty()
-            ? opts.column_family
-            : opts.writer_opts.column_family;
+
+        auto snap = get_instance_snapshot(env, obj);
+        opts.writer_opts  = snap.writer_opts;
+        opts.excluded_columns         = snap.excluded_columns;
+        opts.excluded_column_prefixes = snap.excluded_column_prefixes;
+
+        // If configure() set a column_family, propagate it into ConvertOptions.
+        // Otherwise leave ConvertOptions::column_family at its default ("cf").
+        if (!opts.writer_opts.column_family.empty())
+            opts.column_family = opts.writer_opts.column_family;
         opts.writer_opts.column_family = opts.column_family;
 
         // ── Execute conversion ────────────────────────────────────────────
@@ -277,7 +300,10 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             "fsync_policy",
             "error_policy",
             "bloom_type",
-            "include_mvcc"
+            "include_mvcc",
+            // Column exclusion — used for Hudi / CDC metadata columns
+            "excluded_columns",          // ["col1","col2",...]  exact names
+            "excluded_column_prefixes"   // ["_hoodie","_cdc_"]  prefix match
         };
         for (const auto& [key, _] : cfg) {
             if (!kAllowedKeys.count(key))
@@ -335,6 +361,16 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         if (auto mvcc = hfile::jni::config_int(cfg, "include_mvcc")) {
             if (*mvcc != 0 && *mvcc != 1) return fail_config("include_mvcc must be 0 or 1");
             next_opts.include_mvcc = (*mvcc != 0);
+        }
+
+        // ── Column exclusion ──────────────────────────────────────────────────
+        // These are stored on InstanceState, not on WriterOptions, because they
+        // are a converter-level concept (applied at Arrow → HFile mapping time).
+        if (auto cols = hfile::jni::config_string_array(cfg, "excluded_columns")) {
+            state.excluded_columns = std::move(*cols);
+        }
+        if (auto pfxs = hfile::jni::config_string_array(cfg, "excluded_column_prefixes")) {
+            state.excluded_column_prefixes = std::move(*pfxs);
         }
 
         state.writer_opts = std::move(next_opts);

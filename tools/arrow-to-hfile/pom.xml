@@ -1,0 +1,125 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+             http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <!--
+    arrow-to-hfile
+    ==============
+    A self-contained module that converts Arrow IPC Stream files to HFile v3
+    by calling the C++ HFileSDK through JNI.
+
+    两个使用场景：
+      1. 独立 CLI 工具
+         mvn package
+         java -jar target/arrow-to-hfile-*.jar \
+              ‑‑native-lib /path/to/libhfilesdk.so \
+              ‑‑arrow     /data/events.arrow \
+              ‑‑hfile     /staging/cf/events.hfile \
+              ‑‑table     events_table \
+              ‑‑rule      "STARTTIME,0,false,10#IMSI,1,true,15"
+
+      2. 生产系统依赖模块
+         mvn install   # 先安装到本地 repo
+         然后在生产工程 pom.xml 中引入：
+         <dependency>
+           <groupId>io.hfilesdk</groupId>
+           <artifactId>arrow-to-hfile</artifactId>
+           <version>4.0.0</version>
+         </dependency>
+  -->
+
+  <groupId>io.hfilesdk</groupId>
+  <artifactId>arrow-to-hfile</artifactId>
+  <version>4.0.0</version>
+  <packaging>jar</packaging>
+
+  <name>HFileSDK Arrow-to-HFile Converter</name>
+  <description>
+    Converts Arrow IPC Stream files to HBase HFile v3 via the C++ HFileSDK JNI library.
+    Can be used as a standalone CLI tool (java -jar) or as a Maven dependency in
+    production Java services.
+  </description>
+
+  <properties>
+    <maven.compiler.source>21</maven.compiler.source>
+    <maven.compiler.target>21</maven.compiler.target>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <main.class>io.hfilesdk.converter.ArrowToHFileConverter</main.class>
+  </properties>
+
+  <dependencies>
+    <!-- CLI argument parsing — bundled into the fat jar -->
+    <dependency>
+      <groupId>commons-cli</groupId>
+      <artifactId>commons-cli</artifactId>
+      <version>1.6.0</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+
+      <!-- 1. 编译插件 -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.12.1</version>
+        <configuration>
+          <release>21</release>
+          <compilerArgs>
+            <!-- Enable preview features if needed in the future -->
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <!--
+        2. Shade 插件：生成包含所有依赖的可执行 fat jar。
+           输出文件: target/arrow-to-hfile-4.0.0.jar
+           原始（不含依赖）jar: target/original-arrow-to-hfile-4.0.0.jar
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <createDependencyReducedPom>false</createDependencyReducedPom>
+          <transformers>
+            <!-- 设置 Main-Class，使 java -jar 可直接执行 -->
+            <transformer implementation=
+              "org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+              <mainClass>${main.class}</mainClass>
+              <!--
+                Add-Opens: 让 NativeLibLoader 可以在运行时动态修改 java.library.path。
+                这样 native-lib 参数无需用户额外传 JVM flag。
+              -->
+              <manifestEntries>
+                <Add-Opens>java.base/java.lang=ALL-UNNAMED</Add-Opens>
+              </manifestEntries>
+            </transformer>
+          </transformers>
+          <!-- 排除签名文件，防止 fat jar 签名冲突 -->
+          <filters>
+            <filter>
+              <artifact>*:*</artifact>
+              <excludes>
+                <exclude>META-INF/*.SF</exclude>
+                <exclude>META-INF/*.DSA</exclude>
+                <exclude>META-INF/*.RSA</exclude>
+              </excludes>
+            </filter>
+          </filters>
+        </configuration>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>shade</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+    </plugins>
+  </build>
+</project>

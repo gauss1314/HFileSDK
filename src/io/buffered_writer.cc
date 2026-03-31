@@ -7,8 +7,9 @@
 // fsync is available on POSIX but not on Windows.
 // We call it on POSIX for durability; on Windows fflush() is sufficient for
 // our purposes (HBase Bulk Load HFiles are read-once, not journalled).
+// NOTE: <io.h> (_fileno) is intentionally NOT included on Windows because
+// HFILE_FSYNC expands to (0) there — _fileno is never actually called.
 #if defined(_WIN32) || defined(_WIN64)
-#  include <io.h>       // _fileno
 #  define HFILE_FSYNC(f) (0)  // no-op; FlushFileBuffers via fflush is enough
 #else
 #  include <unistd.h>   // fsync, fileno

@@ -67,3 +67,76 @@ TEST(BloomFilter, ChunkBoundary) {
     EXPECT_TRUE(result.enabled);
     EXPECT_GT(meta.size(), 0u);
 }
+
+// ─── B-12 regression: finish_data_blocks / finish_meta_block API ─────────────
+
+TEST(BloomFilter, FinishDataBlocksProducesOnlyChunkBlocks) {
+    CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
+    for (int i = 0; i < 30; ++i) {
+        auto k = make_key("key_" + std::to_string(i));
+        bf.add(k);
+    }
+    std::vector<uint8_t> chunk_buf;
+    bool has_data = bf.finish_data_blocks(chunk_buf, /*file_offset=*/0);
+    EXPECT_TRUE(has_data);
+    EXPECT_FALSE(chunk_buf.empty());
+    // chunk_buf must start with BLMFBLK2 magic
+    ASSERT_GE(chunk_buf.size(), 8u);
+    EXPECT_EQ(std::string(chunk_buf.begin(), chunk_buf.begin() + 8), "BLMFBLK2");
+    // chunk_buf must NOT contain BLMFMET2 — that's written separately
+    std::string content(chunk_buf.begin(), chunk_buf.end());
+    EXPECT_EQ(content.find("BLMFMET2"), std::string::npos);
+}
+
+TEST(BloomFilter, FinishMetaBlockProducesOnlyMetaBlock) {
+    CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
+    for (int i = 0; i < 30; ++i) {
+        auto k = make_key("key_" + std::to_string(i));
+        bf.add(k);
+    }
+    std::vector<uint8_t> chunk_buf;
+    bf.finish_data_blocks(chunk_buf, 0);
+
+    std::vector<uint8_t> meta_buf;
+    bf.finish_meta_block(meta_buf);
+    EXPECT_FALSE(meta_buf.empty());
+    // meta_buf must start with BLMFMET2 magic
+    ASSERT_GE(meta_buf.size(), 8u);
+    EXPECT_EQ(std::string(meta_buf.begin(), meta_buf.begin() + 8), "BLMFMET2");
+}
+
+TEST(BloomFilter, IsEnabledAndHasData) {
+    CompoundBloomFilterWriter enabled(BloomType::Row, 0.01);
+    CompoundBloomFilterWriter disabled(BloomType::None);
+    EXPECT_TRUE(enabled.is_enabled());
+    EXPECT_FALSE(disabled.is_enabled());
+    EXPECT_FALSE(enabled.has_data());
+    auto k = make_key("x");
+    enabled.add(k);
+    EXPECT_TRUE(enabled.has_data());
+}
+
+TEST(BloomFilter, DataBlocksAndMetaSeparated) {
+    // Simulate the correct layout: chunk blocks written before load-on-open,
+    // meta block written after FileInfo.
+    CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
+    for (int i = 0; i < 10; ++i) {
+        auto k = make_key("r" + std::to_string(i));
+        bf.add(k);
+    }
+    // Step 1: write chunk blocks at offset 1000
+    std::vector<uint8_t> chunks;
+    bool ok = bf.finish_data_blocks(chunks, 1000);
+    EXPECT_TRUE(ok);
+    // Step 2: write meta block at a later offset
+    std::vector<uint8_t> meta;
+    bf.finish_meta_block(meta);
+    EXPECT_FALSE(meta.empty());
+    // Chunks and meta are separate buffers — no interleaving
+    std::string chunk_str(chunks.begin(), chunks.end());
+    std::string meta_str(meta.begin(), meta.end());
+    EXPECT_NE(chunk_str.find("BLMFBLK2"), std::string::npos);
+    EXPECT_EQ(chunk_str.find("BLMFMET2"), std::string::npos);
+    EXPECT_NE(meta_str.find("BLMFMET2"), std::string::npos);
+    EXPECT_EQ(meta_str.find("BLMFBLK2"), std::string::npos);
+}

@@ -274,6 +274,17 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 | B-9 | `include/hfile/types.h` `decode_varint64` | shift≥64 → C++ UB + 越界读 | 安全 |
 | B-10 | `src/writer.cc` `finish()` | `finished_=true` 设在 I/O 前；失败不清理残留文件 | 资源管理 |
 | B-11 | `src/block/fast_diff_encoder.h` | 固定 4096B 栈缓冲，大 key（>4083B）溢出 | 栈溢出 |
+| B-12 | `src/bloom/compound_bloom_filter_writer.h` + `src/writer.cc` finish() | Bloom chunks 写在 load-on-open section 内（应在 non-scanned section）；BLMFMET2 写在 FileInfo 之前（应在之后）；Meta root index 永远为空但 Trailer 声明 meta_index_count=1 | HBase 兼容性 |
+| B-13 | `src/convert/converter.cc` append_grouped_row_cells() | DUPLICATE\_CELL 硬中止整个转换，无视 error\_policy；改为就地去重（保留第一次）并继续 | 功能 |
+| B-14 | `src/jni/hfile_jni.cc` convert() | column\_family 赋值含死代码（ternary true 分支永远不执行） | 代码质量 |
+| B-15 | `src/convert/converter.cc` build\_sort\_index() | 空 key SortEntry 被 erase 后其 MemoryBudget 预留从未释放 | 资源管理 |
+
+| W-1 | `scripts/_run_msys2_script.bat` | bash.exe 路径探测时未推导 `MSYS2_ROOT`，导致 clang++/cmake 不在 PATH 中 | Windows 构建失败 |
+| W-2 | `scripts/build.sh` / `test.sh` / `coverage.sh` | `detect_jobs()` 在 MSYS2 返回空字符串，`cmake -j""` 报错"Invalid number of jobs" | Windows 构建失败 |
+| W-3 | `scripts/build.sh` / `test.sh` / `coverage.sh` | MSYS2 下未指定 `-G Ninja` 和 `-DCMAKE_CXX_COMPILER=clang++`，cmake 可能选错 Generator | Windows 构建失败 |
+| W-4 | `src/io/buffered_writer.cc` | Windows 路径不必要包含 `<io.h>` (`_fileno` 在 `HFILE_FSYNC=(0)` 时从不调用) | 代码质量 |
+| W-5 | `src/io/atomic_file_writer.cc` | 错误字符串中含 Unicode `→`，在某些 MSYS2 编码配置下产生乱码 | Windows 兼容性 |
+| W-6 | `src/checksum/crc32c.cc` | `_mm_crc32_u64` 无 `_M_X64` / `__x86_64__` 守卫，在 32-bit 目标上编译失败 | 跨平台兼容性 |
 
 已确认**不是 Bug**：`compare_keys` 空 span（`memcmp(p,q,0)` 是 C11 定义行为）。
 

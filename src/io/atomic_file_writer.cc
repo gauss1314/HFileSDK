@@ -95,7 +95,7 @@ Status AtomicFileWriter::commit() {
     std::error_code ec;
     fs::rename(temp_path_, final_path_, ec);
     if (ec)
-        return Status::IoError("rename failed: " + temp_path_ + " → " +
+        return Status::IoError("rename failed: " + temp_path_ + " -> " +
                                final_path_ + ": " + ec.message());
 
     // 4. fsync the final directory so the rename persists
