@@ -590,11 +590,12 @@ TEST(HFileWriter, BloomMetaRootContainsRealOffsetAndSize) {
     ASSERT_EQ(count, 1u);
     uint64_t offset = read_be64(payload + 4);
     uint32_t data_size = read_be32(payload + 12);
-    uint32_t key_len = read_be32(payload + 16);
+    int64_t key_len = 0;
+    int key_len_size = decode_writable_vint(payload + 16, key_len);
     ASSERT_EQ(offset, static_cast<uint64_t>(bloom_meta));
     ASSERT_GT(data_size, 0u);
     ASSERT_EQ(key_len, 18u);
-    EXPECT_EQ(std::string(reinterpret_cast<const char*>(payload + 20), key_len),
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(payload + 16 + key_len_size), key_len),
               "GENERAL_BLOOM_META");
 
     fs::remove(path);

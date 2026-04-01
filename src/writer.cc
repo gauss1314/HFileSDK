@@ -296,7 +296,11 @@ public:
         const int64_t meta_root_offset =
             root_block_offset + static_cast<int64_t>(root_block.size());
         if (bloom_result.enabled) {
-            meta_root_payload.resize(4 + 8 + 4 + 4 + bloom_meta_key_len);
+            uint8_t key_len_buf[10];
+            const int key_len_size = encode_writable_vint(
+                key_len_buf, static_cast<int64_t>(bloom_meta_key_len));
+            meta_root_payload.resize(4 + 8 + 4 + static_cast<size_t>(key_len_size) +
+                                     bloom_meta_key_len);
             auto meta_root_probe = build_raw_block(
                 kRootIndexMagic, {meta_root_payload.data(), meta_root_payload.size()},
                 root_block_offset);
@@ -311,7 +315,8 @@ public:
             write_be32(mp, 1);                              mp += 4;
             write_be64(mp, bloom_meta_offset);             mp += 8;
             write_be32(mp, static_cast<uint32_t>(bloom_meta_block.size())); mp += 4;
-            write_be32(mp, bloom_meta_key_len);            mp += 4;
+            std::memcpy(mp, key_len_buf, static_cast<size_t>(key_len_size));
+            mp += key_len_size;
             std::memcpy(mp, kBloomMetaKey, bloom_meta_key_len);
             bloom_result.bloom_meta_offset = bloom_meta_offset;
         }

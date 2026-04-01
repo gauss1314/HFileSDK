@@ -33,7 +33,7 @@ public class HFileSDKIntegrationTest {
               "compression":"none",
               "column_family":"cf",
               "data_block_encoding":"NONE",
-              "bloom_type":"none",
+              "bloom_type":"row",
               "include_mvcc":0
             }
             """);
@@ -127,7 +127,7 @@ public class HFileSDKIntegrationTest {
               "compression":"none",
               "column_family":"cf",
               "data_block_encoding":"NONE",
-              "bloom_type":"none",
+              "bloom_type":"row",
               "include_mvcc":0
             }
             """);
