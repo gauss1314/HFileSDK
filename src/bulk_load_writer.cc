@@ -204,18 +204,23 @@ public:
     Status write_batch(const ::arrow::RecordBatch& batch, MappingMode mode) {
         auto start = std::chrono::steady_clock::now();
         std::vector<OwnedKeyValue> staged;
-        auto cb = [&staged](const KeyValue& kv) {
-            OwnedKeyValue owned;
-            owned.row.assign(kv.row.begin(), kv.row.end());
-            owned.family.assign(kv.family.begin(), kv.family.end());
-            owned.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
-            owned.timestamp = kv.timestamp;
-            owned.key_type = kv.key_type;
-            owned.value.assign(kv.value.begin(), kv.value.end());
-            owned.tags.assign(kv.tags.begin(), kv.tags.end());
-            owned.memstore_ts = kv.memstore_ts;
-            staged.push_back(std::move(owned));
-            return Status::OK();
+        if (opts_.error_policy == ErrorPolicy::SkipBatch)
+            staged.reserve(static_cast<size_t>(std::max<int64_t>(0, batch.num_rows())));
+        auto cb = [this, &staged](const KeyValue& kv) {
+            if (opts_.error_policy == ErrorPolicy::SkipBatch) {
+                OwnedKeyValue owned;
+                owned.row.assign(kv.row.begin(), kv.row.end());
+                owned.family.assign(kv.family.begin(), kv.family.end());
+                owned.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+                owned.timestamp = kv.timestamp;
+                owned.key_type = kv.key_type;
+                owned.value.assign(kv.value.begin(), kv.value.end());
+                owned.tags.assign(kv.tags.begin(), kv.tags.end());
+                owned.memstore_ts = kv.memstore_ts;
+                staged.push_back(std::move(owned));
+                return Status::OK();
+            }
+            return write_kv(kv);
         };
         Status s;
         switch (mode) {

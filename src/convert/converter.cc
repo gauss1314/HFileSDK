@@ -19,6 +19,7 @@
 #include <unordered_set>
 #include <vector>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <chrono>
 #include <filesystem>
@@ -152,9 +153,21 @@ struct SortEntry {
 };
 
 struct GroupedCell {
-    std::string          qualifier;
+    std::string_view     qualifier;
     std::vector<uint8_t> value;
 };
+
+static std::span<const uint8_t> as_bytes(const std::string& s) {
+    return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+
+static std::span<const uint8_t> as_bytes(std::string_view s) {
+    return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
+}
+
+static Status scalar_to_bytes(const arrow::Array& arr,
+                              int64_t row,
+                              std::vector<uint8_t>* out);
 
 // ─── Arrow scalar → UTF-8 string (for rowValue building) ──────────────────────
 
@@ -202,13 +215,13 @@ static Status scalar_to_string(const arrow::Array& arr, int64_t row, std::string
     case T::STRING: {
         auto& sa = static_cast<const arrow::StringArray&>(arr);
         auto sv = sa.GetView(row);
-        *out = std::string(sv.data(), sv.size());
+        out->assign(sv.data(), sv.size());
         return Status::OK();
     }
     case T::LARGE_STRING: {
         auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
         auto sv = sa.GetView(row);
-        *out = std::string(sv.data(), sv.size());
+        out->assign(sv.data(), sv.size());
         return Status::OK();
     }
     case T::INT8:   *out = std::to_string(static_cast<const arrow::Int8Array&>(arr).Value(row)); return Status::OK();
@@ -236,86 +249,125 @@ static Status scalar_to_string(const arrow::Array& arr, int64_t row, std::string
 
 // ─── Arrow scalar → Big-Endian bytes (for HBase value) ────────────────────────
 
-static std::vector<uint8_t> scalar_to_bytes(const arrow::Array& arr, int64_t row) {
-    if (arr.IsNull(row)) return {};
+static Status scalar_to_bytes(const arrow::Array& arr, int64_t row, std::vector<uint8_t>* out) {
+    out->clear();
+    if (arr.IsNull(row)) return Status::OK();
 
     using T = arrow::Type;
     auto t = arr.type_id();
-
-    auto put8  = [](uint8_t v)  { return std::vector<uint8_t>{v}; };
-    auto put16 = [](uint16_t v) {
-        return std::vector<uint8_t>{
-            static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)};
-    };
-    auto put32 = [](uint32_t v) {
-        return std::vector<uint8_t>{
-            static_cast<uint8_t>(v>>24), static_cast<uint8_t>(v>>16),
-            static_cast<uint8_t>(v>>8),  static_cast<uint8_t>(v)};
-    };
-    auto put64 = [](uint64_t v) {
-        std::vector<uint8_t> b(8);
-        for (int i = 7; i >= 0; --i) { b[i] = v & 0xFF; v >>= 8; }
-        return b;
-    };
 
     switch (t) {
     case T::STRING: {
         auto& sa = static_cast<const arrow::StringArray&>(arr);
         auto sv = sa.GetView(row);
-        return std::vector<uint8_t>(sv.begin(), sv.end());
+        out->assign(sv.begin(), sv.end());
+        return Status::OK();
     }
     case T::LARGE_STRING: {
         auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
         auto sv = sa.GetView(row);
-        return std::vector<uint8_t>(sv.begin(), sv.end());
+        out->assign(sv.begin(), sv.end());
+        return Status::OK();
     }
     case T::BINARY: {
         auto& ba = static_cast<const arrow::BinaryArray&>(arr);
         auto sv = ba.GetView(row);
-        return std::vector<uint8_t>(sv.begin(), sv.end());
+        out->assign(sv.begin(), sv.end());
+        return Status::OK();
     }
     case T::LARGE_BINARY: {
         auto& ba = static_cast<const arrow::LargeBinaryArray&>(arr);
         auto sv = ba.GetView(row);
-        return std::vector<uint8_t>(sv.begin(), sv.end());
+        out->assign(sv.begin(), sv.end());
+        return Status::OK();
     }
-    case T::BOOL:   return put8(static_cast<const arrow::BooleanArray&>(arr).Value(row)?1:0);
-    case T::INT8:   return put8(static_cast<uint8_t>(
-                        static_cast<const arrow::Int8Array&>(arr).Value(row)));
-    case T::INT16:  return put16(static_cast<uint16_t>(
-                        static_cast<const arrow::Int16Array&>(arr).Value(row)));
-    case T::INT32:  return put32(static_cast<uint32_t>(
-                        static_cast<const arrow::Int32Array&>(arr).Value(row)));
-    case T::INT64:  return put64(static_cast<uint64_t>(
-                        static_cast<const arrow::Int64Array&>(arr).Value(row)));
-    case T::UINT8:  return put8(static_cast<const arrow::UInt8Array&>(arr).Value(row));
-    case T::UINT16: return put16(static_cast<const arrow::UInt16Array&>(arr).Value(row));
-    case T::UINT32: return put32(static_cast<const arrow::UInt32Array&>(arr).Value(row));
-    case T::UINT64: return put64(static_cast<const arrow::UInt64Array&>(arr).Value(row));
+    case T::BOOL:
+        out->assign({static_cast<uint8_t>(static_cast<const arrow::BooleanArray&>(arr).Value(row) ? 1 : 0)});
+        return Status::OK();
+    case T::INT8:
+        out->assign({static_cast<uint8_t>(static_cast<const arrow::Int8Array&>(arr).Value(row))});
+        return Status::OK();
+    case T::INT16: {
+        uint16_t v = static_cast<uint16_t>(static_cast<const arrow::Int16Array&>(arr).Value(row));
+        out->resize(2);
+        (*out)[0] = static_cast<uint8_t>(v >> 8);
+        (*out)[1] = static_cast<uint8_t>(v);
+        return Status::OK();
+    }
+    case T::INT32: {
+        uint32_t v = static_cast<uint32_t>(static_cast<const arrow::Int32Array&>(arr).Value(row));
+        out->resize(4);
+        (*out)[0] = static_cast<uint8_t>(v >> 24);
+        (*out)[1] = static_cast<uint8_t>(v >> 16);
+        (*out)[2] = static_cast<uint8_t>(v >> 8);
+        (*out)[3] = static_cast<uint8_t>(v);
+        return Status::OK();
+    }
+    case T::INT64: {
+        uint64_t v = static_cast<uint64_t>(static_cast<const arrow::Int64Array&>(arr).Value(row));
+        out->resize(8);
+        for (int i = 7; i >= 0; --i) { (*out)[i] = v & 0xFF; v >>= 8; }
+        return Status::OK();
+    }
+    case T::UINT8:
+        out->assign({static_cast<const arrow::UInt8Array&>(arr).Value(row)});
+        return Status::OK();
+    case T::UINT16: {
+        uint16_t v = static_cast<const arrow::UInt16Array&>(arr).Value(row);
+        out->resize(2);
+        (*out)[0] = static_cast<uint8_t>(v >> 8);
+        (*out)[1] = static_cast<uint8_t>(v);
+        return Status::OK();
+    }
+    case T::UINT32: {
+        uint32_t v = static_cast<const arrow::UInt32Array&>(arr).Value(row);
+        out->resize(4);
+        (*out)[0] = static_cast<uint8_t>(v >> 24);
+        (*out)[1] = static_cast<uint8_t>(v >> 16);
+        (*out)[2] = static_cast<uint8_t>(v >> 8);
+        (*out)[3] = static_cast<uint8_t>(v);
+        return Status::OK();
+    }
+    case T::UINT64: {
+        uint64_t v = static_cast<const arrow::UInt64Array&>(arr).Value(row);
+        out->resize(8);
+        for (int i = 7; i >= 0; --i) { (*out)[i] = v & 0xFF; v >>= 8; }
+        return Status::OK();
+    }
     case T::FLOAT: {
         float v = static_cast<const arrow::FloatArray&>(arr).Value(row);
         uint32_t bits; std::memcpy(&bits, &v, 4);
-        return put32(bits);
+        out->resize(4);
+        (*out)[0] = static_cast<uint8_t>(bits >> 24);
+        (*out)[1] = static_cast<uint8_t>(bits >> 16);
+        (*out)[2] = static_cast<uint8_t>(bits >> 8);
+        (*out)[3] = static_cast<uint8_t>(bits);
+        return Status::OK();
     }
     case T::DOUBLE: {
         double v = static_cast<const arrow::DoubleArray&>(arr).Value(row);
         uint64_t bits; std::memcpy(&bits, &v, 8);
-        return put64(bits);
+        out->resize(8);
+        for (int i = 7; i >= 0; --i) { (*out)[i] = bits & 0xFF; bits >>= 8; }
+        return Status::OK();
     }
     case T::TIMESTAMP: {
         auto& ta = static_cast<const arrow::TimestampArray&>(arr);
         auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
         int64_t v = normalize_timestamp_to_millis(ta.Value(row), unit);
-        return put64(static_cast<uint64_t>(v));
+        uint64_t bits = static_cast<uint64_t>(v);
+        out->resize(8);
+        for (int i = 7; i >= 0; --i) { (*out)[i] = bits & 0xFF; bits >>= 8; }
+        return Status::OK();
     }
     default: {
-        // Fallback via string
         auto s = arr.GetScalar(row);
         if (s.ok()) {
             auto str = s.ValueOrDie()->ToString();
-            return std::vector<uint8_t>(str.begin(), str.end());
+            out->assign(str.begin(), str.end());
+            return Status::OK();
         }
-        return {};
+        return Status::InvalidArg("cannot materialize Arrow scalar: " + s.status().ToString());
     }
     }
 }
@@ -367,7 +419,7 @@ static Status build_sort_index(
             "Note: column indices are based on the schema AFTER excluded columns are removed.");
     }
 
-    std::vector<bool> referenced_cols(static_cast<size_t>(std::max(0, num_filtered_cols)), false);
+    std::vector<uint8_t> referenced_cols(static_cast<size_t>(std::max(0, num_filtered_cols)), 0);
     for (const auto& seg : rkb.segments()) {
         if (seg.type != arrow_convert::RowKeySegment::Type::ColumnRef &&
             seg.type != arrow_convert::RowKeySegment::Type::EncodedColumn)
@@ -380,8 +432,11 @@ static Status build_sort_index(
         }
         referenced_cols[static_cast<size_t>(seg.col_index)] = true;
     }
+    std::vector<int> referenced_col_indices;
+    referenced_col_indices.reserve(rkb.segments().size());
     for (int c = 0; c < num_filtered_cols; ++c) {
-        if (!referenced_cols[static_cast<size_t>(c)]) continue;
+        if (referenced_cols[static_cast<size_t>(c)] == 0) continue;
+        referenced_col_indices.push_back(c);
         if (!is_supported_rowkey_type(filtered_schema->field(c)->type())) {
             return Status::InvalidArg(
                 "SCHEMA_MISMATCH: unsupported Arrow type for row key field '" +
@@ -392,6 +447,10 @@ static Status build_sort_index(
 
     std::shared_ptr<arrow::RecordBatch> raw_batch;
     int32_t batch_idx = 0;
+
+    std::vector<std::string> owned_fields(
+        max_col_idx >= 0 ? static_cast<size_t>(max_col_idx + 1) : 0);
+    std::vector<std::string_view> fields(owned_fields.size());
 
     while (true) {
         auto s = reader->ReadNext(&raw_batch);
@@ -421,11 +480,8 @@ static Status build_sort_index(
         batches_out.push_back(batch);    // store the FILTERED batch
 
         for (int64_t r = 0; r < n_rows; ++r) {
-            std::vector<std::string> owned_fields(
-                max_col_idx >= 0 ? static_cast<size_t>(max_col_idx + 1) : 0);
-            std::vector<std::string_view> fields(owned_fields.size());
-            for (int c = 0; c <= max_col_idx; ++c) {
-                if (!referenced_cols[static_cast<size_t>(c)]) continue;
+            std::fill(fields.begin(), fields.end(), std::string_view{});
+            for (int c : referenced_col_indices) {
                 auto field_status = scalar_to_string(*batch->column(c), r,
                                                      &owned_fields[static_cast<size_t>(c)]);
                 if (!field_status.ok()) return field_status;
@@ -500,13 +556,12 @@ static Status append_grouped_row_cells(
                 : std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
 
-    std::vector<uint8_t> row_bytes(row_key.begin(), row_key.end());
-    std::vector<uint8_t> cf_bytes(cf.begin(), cf.end());
+    auto row_bytes = as_bytes(row_key);
+    auto cf_bytes = as_bytes(cf);
 
     for (const auto& cell : cells) {
-        std::vector<uint8_t> q_bytes(cell.qualifier.begin(), cell.qualifier.end());
         auto before_entry_count = writer.entry_count();
-        auto s = writer.append(row_bytes, cf_bytes, q_bytes,
+        auto s = writer.append(row_bytes, cf_bytes, as_bytes(cell.qualifier),
                                ts, cell.value);
         if (!s.ok()) return s;
         auto after_entry_count = writer.entry_count();
@@ -671,10 +726,11 @@ ConvertResult convert(const ConvertOptions& opts) {
     int64_t progress_step = std::max(int64_t(1),
         static_cast<int64_t>(sort_index.size()) / 20);
     int64_t rows_done = 0;
+    std::vector<GroupedCell> cells;
 
     for (size_t i = 0; i < sort_index.size();) {
         const std::string& row_key = sort_index[i].row_key;
-        std::vector<GroupedCell> cells;
+        cells.clear();
 
         size_t j = i;
         for (; j < sort_index.size() && sort_index[j].row_key == row_key; ++j) {
@@ -682,11 +738,18 @@ ConvertResult convert(const ConvertOptions& opts) {
             const auto& batch = batches[static_cast<size_t>(entry.batch_idx)];
             auto schema = batch->schema();
             int num_cols = batch->num_columns();
+            if (cells.capacity() < static_cast<size_t>(num_cols))
+                cells.reserve(static_cast<size_t>(num_cols));
             for (int c = 0; c < num_cols; ++c) {
-                // No exclusion check needed: stored batches already have
-                // excluded columns removed by apply_column_removal() in Pass 1.
                 if (batch->column(c)->IsNull(entry.row_idx)) continue;
-                auto val = scalar_to_bytes(*batch->column(c), entry.row_idx);
+                std::vector<uint8_t> val;
+                auto value_status = scalar_to_bytes(*batch->column(c), entry.row_idx, &val);
+                if (!value_status.ok()) {
+                    clog::warn("Cell skipped (" + row_key + "/" + schema->field(c)->name() +
+                               "): " + value_status.message());
+                    ++result.kv_skipped_count;
+                    continue;
+                }
                 if (val.empty()) continue;
                 cells.push_back({schema->field(c)->name(), std::move(val)});
             }
