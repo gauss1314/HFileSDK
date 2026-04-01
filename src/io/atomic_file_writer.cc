@@ -10,6 +10,8 @@
 #if !defined(_WIN32) && !defined(_WIN64)
 #  include <unistd.h>   // fsync, open
 #  include <fcntl.h>
+#else
+#  include <windows.h>
 #endif
 
 namespace hfile {
@@ -126,12 +128,23 @@ void AtomicFileWriter::abort() noexcept {
 
 Status AtomicFileWriter::fsync_directory(const fs::path& dir) noexcept {
 #if defined(_WIN32) || defined(_WIN64)
-    // On Windows, flushing the directory is handled automatically by the FS.
-    (void)dir;
+    auto wide = dir.wstring();
+    HANDLE handle = ::CreateFileW(
+        wide.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+        return Status::IoError("open dir for flush failed: " + dir.string());
+    BOOL ok = ::FlushFileBuffers(handle);
+    ::CloseHandle(handle);
+    if (!ok)
+        return Status::IoError("flush dir failed: " + dir.string());
     return Status::OK();
 #else
-    // Open the directory itself as a file descriptor, then fsync it.
-    // This makes the rename / create visible across a power failure.
     int fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return Status::IoError(std::string("open dir for fsync: ") +

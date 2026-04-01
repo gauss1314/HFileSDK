@@ -557,6 +557,49 @@ TEST(HFileWriter, BloomChunksBeforeLoadOnOpenInFile) {
     fs::remove(path);
 }
 
+TEST(HFileWriter, BloomMetaRootContainsRealOffsetAndSize) {
+    auto path = tmp_path("bloom_meta_root");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::Row)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int i = 0; i < 16; ++i) {
+        char row[20]; std::snprintf(row, sizeof(row), "row%05d", i);
+        ASSERT_TRUE(w->append(
+            make_kv(rk, fam, q, v, row, "col", 1000 - i, "val")).ok());
+    }
+    ASSERT_TRUE(w->finish().ok());
+
+    auto data = read_file(path);
+    std::string content(data.begin(), data.end());
+    auto first_root = content.find("IDXROOT2");
+    ASSERT_NE(first_root, std::string::npos);
+    auto second_root = content.find("IDXROOT2", first_root + 1);
+    ASSERT_NE(second_root, std::string::npos);
+    auto bloom_meta = content.find("BLMFMET2");
+    ASSERT_NE(bloom_meta, std::string::npos);
+
+    const uint8_t* payload = data.data() + second_root + kBlockHeaderSize;
+    uint32_t count = read_be32(payload);
+    ASSERT_EQ(count, 1u);
+    uint64_t offset = read_be64(payload + 4);
+    uint32_t data_size = read_be32(payload + 12);
+    uint32_t key_len = read_be32(payload + 16);
+    ASSERT_EQ(offset, static_cast<uint64_t>(bloom_meta));
+    ASSERT_GT(data_size, 0u);
+    ASSERT_EQ(key_len, 18u);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(payload + 20), key_len),
+              "GENERAL_BLOOM_META");
+
+    fs::remove(path);
+}
+
 TEST(HFileWriter, NoBloomTypeProducesNoBloomBlocks) {
     auto path = tmp_path("no_bloom");
     auto [w, s] = HFileWriter::builder()

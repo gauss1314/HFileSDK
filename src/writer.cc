@@ -39,18 +39,14 @@ static void error(const std::string& msg) { fprintf(stderr, "[ERROR] hfile: %s\n
 
 // ─── Disk space helper ────────────────────────────────────────────────────────
 static int64_t free_disk_bytes(const std::string& path) {
-#if defined(_WIN32) || defined(_WIN64)
-    (void)path; return INT64_MAX;   // not implemented on Windows
-#else
     namespace fs = std::filesystem;
     fs::path probe{path};
     std::error_code ec;
     if (!fs::exists(probe, ec))
         probe = probe.has_parent_path() ? probe.parent_path() : fs::current_path();
-    struct statvfs st{};
-    if (::statvfs(probe.c_str(), &st) != 0) return INT64_MAX;  // can't check = don't block
-    return static_cast<int64_t>(st.f_bavail) * static_cast<int64_t>(st.f_frsize);
-#endif
+    auto space_info = fs::space(probe, ec);
+    if (ec) return INT64_MAX;
+    return static_cast<int64_t>(space_info.available);
 }
 
 // ─── Input validation helper ──────────────────────────────────────────────────
@@ -284,59 +280,58 @@ public:
         std::vector<uint8_t> root_buf;
         int64_t intermed_start = writer_->position();
         auto idx_result = index_writer_.finish(intermed_start, intermed_buf, root_buf);
+        const int64_t root_block_offset =
+            load_on_open_offset + static_cast<int64_t>(intermed_buf.size());
+        auto root_block = build_raw_block(
+            kRootIndexMagic, {root_buf.data(), root_buf.size()}, prev_block_offset_);
+        std::vector<uint8_t> bloom_meta_block;
+        std::vector<uint8_t> file_info_block;
+        if (bloom_result.enabled) {
+            bloom_->finish_meta_block(bloom_meta_block);
+        }
+
+        static const uint8_t kBloomMetaKey[] = "GENERAL_BLOOM_META";
+        const uint32_t bloom_meta_key_len = static_cast<uint32_t>(sizeof(kBloomMetaKey) - 1);
+        std::vector<uint8_t> meta_root_payload(4, 0);
+        const int64_t meta_root_offset =
+            root_block_offset + static_cast<int64_t>(root_block.size());
+        if (bloom_result.enabled) {
+            meta_root_payload.resize(4 + 8 + 4 + 4 + bloom_meta_key_len);
+            auto meta_root_probe = build_raw_block(
+                kRootIndexMagic, {meta_root_payload.data(), meta_root_payload.size()},
+                root_block_offset);
+            const int64_t file_info_offset =
+                meta_root_offset + static_cast<int64_t>(meta_root_probe.size());
+            std::vector<uint8_t> file_info_block_probe;
+            HFILE_RETURN_IF_ERROR(
+                build_file_info_block(meta_root_offset, &file_info_block_probe));
+            const int64_t bloom_meta_offset =
+                file_info_offset + static_cast<int64_t>(file_info_block_probe.size());
+            uint8_t* mp = meta_root_payload.data();
+            write_be32(mp, 1);                              mp += 4;
+            write_be64(mp, bloom_meta_offset);             mp += 8;
+            write_be32(mp, static_cast<uint32_t>(bloom_meta_block.size())); mp += 4;
+            write_be32(mp, bloom_meta_key_len);            mp += 4;
+            std::memcpy(mp, kBloomMetaKey, bloom_meta_key_len);
+            bloom_result.bloom_meta_offset = bloom_meta_offset;
+        }
+        auto meta_root_block = build_raw_block(
+            kRootIndexMagic, {meta_root_payload.data(), meta_root_payload.size()},
+            root_block_offset);
+        HFILE_RETURN_IF_ERROR(build_file_info_block(meta_root_offset, &file_info_block));
 
         if (!intermed_buf.empty()) {
             HFILE_RETURN_IF_ERROR(
                 writer_->write({intermed_buf.data(), intermed_buf.size()}));
         }
-        HFILE_RETURN_IF_ERROR(
-            write_raw_block(kRootIndexMagic, {root_buf.data(), root_buf.size()}));
+        HFILE_RETURN_IF_ERROR(writer_->write(root_block));
+        HFILE_RETURN_IF_ERROR(writer_->write(meta_root_block));
 
-        // 3. Meta Root Index (IDXROOT2) — one entry pointing to BLMFMET2 if enabled,
-        //    otherwise an empty root index (count = 0).
-        //    Format: count(4B BE) + [offset(8B BE) + dataSize(4B BE) + keyLen(4B BE) + key]*
-        {
-            std::vector<uint8_t> meta_root;
-            if (bloom_result.enabled) {
-                // We don't yet know the BLMFMET2 offset, but we know it will be written
-                // after FileInfo.  We store a placeholder and patch it after writing.
-                // Simpler: reserve the meta_root buf now with a fixed entry; the
-                // BLMFMET2 offset will be the current writer position after FileInfo.
-                // To avoid a two-pass approach we write a 1-entry root index:
-                //   key = "GENERAL_BLOOM_META" (HBase uses this name)
-                static const uint8_t kBloomMetaKey[] = "GENERAL_BLOOM_META";
-                const uint32_t key_len = static_cast<uint32_t>(sizeof(kBloomMetaKey) - 1);
-                // placeholder offset — will be written immediately after FileInfo
-                // We compute it now since FileInfo size is fixed once we call write_file_info()
-                // WORKAROUND: use a 0 placeholder; HBase actually finds BLMFMET2 by scanning
-                // from load_on_open_offset forward.  The meta_index_count=1 in the Trailer
-                // is what matters to signal bloom is present.
-                meta_root.resize(4 + 8 + 4 + 4 + key_len);
-                uint8_t* mp = meta_root.data();
-                write_be32(mp, 1);                    mp += 4;   // count = 1
-                write_be64(mp, 0);                    mp += 8;   // offset placeholder
-                write_be32(mp, 0);                    mp += 4;   // dataSize placeholder
-                write_be32(mp, key_len);              mp += 4;
-                std::memcpy(mp, kBloomMetaKey, key_len);
-            } else {
-                // Empty meta root index: count = 0
-                meta_root.resize(4, 0);
-            }
-            HFILE_RETURN_IF_ERROR(
-                write_raw_block(kRootIndexMagic, {meta_root.data(), meta_root.size()}));
-        }
-
-        // 4. FileInfo block
         int64_t file_info_offset = writer_->position();
-        HFILE_RETURN_IF_ERROR(write_file_info());
+        HFILE_RETURN_IF_ERROR(writer_->write(file_info_block));
 
-        // 5. Bloom Meta Block (BLMFMET2) — written AFTER FileInfo, matching HBase order.
-        bloom_result.bloom_meta_offset = writer_->position();
         if (bloom_result.enabled) {
-            std::vector<uint8_t> bloom_meta_buf;
-            bloom_->finish_meta_block(bloom_meta_buf);
-            HFILE_RETURN_IF_ERROR(
-                writer_->write({bloom_meta_buf.data(), bloom_meta_buf.size()}));
+            HFILE_RETURN_IF_ERROR(writer_->write(bloom_meta_block));
         }
 
         // 6. Trailer
@@ -457,6 +452,15 @@ private:
     // ── Write any raw block (index, meta, etc.) with header ───────────────────
     Status write_raw_block(const std::array<uint8_t, 8>& magic,
                             std::span<const uint8_t> data) {
+        auto block = build_raw_block(magic, data, prev_block_offset_);
+        prev_block_offset_ = writer_->position();
+        HFILE_RETURN_IF_ERROR(writer_->write(block));
+        return Status::OK();
+    }
+
+    std::vector<uint8_t> build_raw_block(const std::array<uint8_t, 8>& magic,
+                                         std::span<const uint8_t> data,
+                                         int64_t prev_block_offset) const {
         uint32_t on_disk_data_with_header =
             static_cast<uint32_t>(kBlockHeaderSize + data.size());
         size_t n_chunks = (on_disk_data_with_header + opts_.bytes_per_checksum - 1)
@@ -469,31 +473,24 @@ private:
         uint32_t on_disk_size_without_header = static_cast<uint32_t>(data.size() + checksum_buf.size());
         write_be32(p, on_disk_size_without_header); p += 4;
         write_be32(p, static_cast<uint32_t>(data.size())); p += 4;
-        write_be64(p, static_cast<uint64_t>(prev_block_offset_)); p += 8;
+        write_be64(p, static_cast<uint64_t>(prev_block_offset)); p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, opts_.bytes_per_checksum); p += 4;
         write_be32(p, on_disk_data_with_header); p += 4;
 
-        std::vector<uint8_t> checksummed_block;
-        checksummed_block.reserve(kBlockHeaderSize + data.size());
-        checksummed_block.insert(checksummed_block.end(), hdr, hdr + kBlockHeaderSize);
-        checksummed_block.insert(checksummed_block.end(), data.begin(), data.end());
+        std::vector<uint8_t> block;
+        block.reserve(kBlockHeaderSize + data.size() + checksum_buf.size());
+        block.insert(block.end(), hdr, hdr + kBlockHeaderSize);
+        block.insert(block.end(), data.begin(), data.end());
         checksum::compute_hfile_checksums(
-            checksummed_block.data(), checksummed_block.size(),
+            block.data(), block.size(),
             opts_.bytes_per_checksum, checksum_buf.data());
-
-        prev_block_offset_ = writer_->position();
-        HFILE_RETURN_IF_ERROR(writer_->write({hdr, kBlockHeaderSize}));
-        HFILE_RETURN_IF_ERROR(writer_->write(data));
-        HFILE_RETURN_IF_ERROR(writer_->write({checksum_buf.data(), checksum_buf.size()}));
-        return Status::OK();
+        block.insert(block.end(), checksum_buf.begin(), checksum_buf.end());
+        return block;
     }
 
-    // ── Write FileInfo block ──────────────────────────────────────────────────
-    Status write_file_info() {
+    Status build_file_info_block(int64_t prev_block_offset, std::vector<uint8_t>* out) {
         meta::FileInfoBuilder fib;
-
-        // All mandatory fields per DESIGN.md §2.3
         fib.set_last_key({last_key_.data(), last_key_.size()});
         fib.set_avg_key_len(entry_count_ > 0
             ? static_cast<uint32_t>(total_key_bytes_ / entry_count_) : 0);
@@ -510,7 +507,9 @@ private:
 
         std::vector<uint8_t> fi_bytes;
         fib.finish(fi_bytes);
-        return write_raw_block(kFileInfoMagic, {fi_bytes.data(), fi_bytes.size()});
+        *out = build_raw_block(kFileInfoMagic, {fi_bytes.data(), fi_bytes.size()},
+                               prev_block_offset);
+        return Status::OK();
     }
 
     // ── Write ProtoBuf Trailer ────────────────────────────────────────────────
