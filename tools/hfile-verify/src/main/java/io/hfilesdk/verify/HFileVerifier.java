@@ -353,7 +353,7 @@ public class HFileVerifier {
             "hfile.AVG_VALUE_LEN",
             "hfile.MAX_TAGS_LEN",
             "hfile.COMPARATOR",
-            "hfile.DATA_BLOCK_ENCODING",
+            "DATA_BLOCK_ENCODING",
             "hfile.KEY_VALUE_VERSION",
             "hfile.MAX_MEMSTORE_TS_KEY",
             "hfile.CREATE_TIME_TS",

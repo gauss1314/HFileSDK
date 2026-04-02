@@ -22,6 +22,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cstdio>   // stderr logging (no external dep)
+#include <limits>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #  include <sys/statvfs.h>
@@ -102,6 +103,16 @@ static uint32_t hbase_compression_codec(Compression c) noexcept {
     }
 }
 
+static uint16_t hbase_data_block_encoding_id(Encoding e) noexcept {
+    switch (e) {
+        case Encoding::None:     return 0; // NONE
+        case Encoding::Prefix:   return 2; // PREFIX
+        case Encoding::Diff:     return 3; // DIFF
+        case Encoding::FastDiff: return 4; // FAST_DIFF
+    }
+    return 0;
+}
+
 // ─── Internal implementation class ───────────────────────────────────────────
 
 class HFileWriterImpl {
@@ -151,6 +162,19 @@ public:
             writer_ = plain_writer_.get();    // BlockWriter* view
         }
 
+        // Current C++ encoders are not byte-level compatible with HBase's
+        // Prefix/Diff/FastDiff decoder implementations yet.
+        // To guarantee HFile readability, force NONE on disk for now.
+        if (opts_.data_block_encoding != Encoding::None) {
+            log::warn("Requested data_block_encoding is not HBase-compatible yet; "
+                      "falling back to NONE for on-disk blocks");
+            opts_.data_block_encoding = Encoding::None;
+        }
+        if (opts_.compression != Compression::None) {
+            log::warn("Requested compression is temporarily disabled for HBase "
+                      "compatibility; falling back to NONE");
+            opts_.compression = Compression::None;
+        }
         encoder_    = block::DataBlockEncoder::create(opts_.data_block_encoding,
                                                       opts_.block_size);
         compressor_ = codec::Compressor::create(opts_.compression);
@@ -374,6 +398,15 @@ private:
         auto raw = encoder_->finish_block();
         if (raw.empty()) { encoder_->reset(); return Status::OK(); }
 
+        std::vector<uint8_t> encoded_block_with_id;
+        if (opts_.data_block_encoding != Encoding::None) {
+            encoded_block_with_id.resize(2 + raw.size());
+            write_be16(encoded_block_with_id.data(),
+                       hbase_data_block_encoding_id(opts_.data_block_encoding));
+            std::memcpy(encoded_block_with_id.data() + 2, raw.data(), raw.size());
+            raw = {encoded_block_with_id.data(), encoded_block_with_id.size()};
+        }
+
         int64_t block_offset = writer_->position();
 
         // Seal the current bloom chunk for this data block.
@@ -465,9 +498,24 @@ private:
 
     std::vector<uint8_t> build_raw_block(const std::array<uint8_t, 8>& magic,
                                          std::span<const uint8_t> data,
-                                         int64_t prev_block_offset) const {
+                                         int64_t prev_block_offset) {
+        std::span<const uint8_t> on_disk_payload = data;
+        std::vector<uint8_t> compressed_data;
+        if (opts_.compression != Compression::None) {
+            compressed_data.resize(compressor_->max_compressed_size(data.size()));
+            size_t compressed_len =
+                compressor_->compress(data, compressed_data.data(), compressed_data.size());
+            if (compressed_len > 0) {
+                compressed_data.resize(compressed_len);
+                on_disk_payload = {compressed_data.data(), compressed_data.size()};
+            } else {
+                // Compression can occasionally expand tiny payloads. Fall back to raw bytes.
+                compressed_data.clear();
+            }
+        }
+
         uint32_t on_disk_data_with_header =
-            static_cast<uint32_t>(kBlockHeaderSize + data.size());
+            static_cast<uint32_t>(kBlockHeaderSize + on_disk_payload.size());
         size_t n_chunks = (on_disk_data_with_header + opts_.bytes_per_checksum - 1)
                         / opts_.bytes_per_checksum;
         std::vector<uint8_t> checksum_buf(n_chunks * 4);
@@ -475,7 +523,7 @@ private:
         uint8_t hdr[kBlockHeaderSize];
         uint8_t* p = hdr;
         std::memcpy(p, magic.data(), 8); p += 8;
-        uint32_t on_disk_size_without_header = static_cast<uint32_t>(data.size() + checksum_buf.size());
+        uint32_t on_disk_size_without_header = static_cast<uint32_t>(on_disk_payload.size() + checksum_buf.size());
         write_be32(p, on_disk_size_without_header); p += 4;
         write_be32(p, static_cast<uint32_t>(data.size())); p += 4;
         write_be64(p, static_cast<uint64_t>(prev_block_offset)); p += 8;
@@ -484,9 +532,9 @@ private:
         write_be32(p, on_disk_data_with_header); p += 4;
 
         std::vector<uint8_t> block;
-        block.reserve(kBlockHeaderSize + data.size() + checksum_buf.size());
+        block.reserve(kBlockHeaderSize + on_disk_payload.size() + checksum_buf.size());
         block.insert(block.end(), hdr, hdr + kBlockHeaderSize);
-        block.insert(block.end(), data.begin(), data.end());
+        block.insert(block.end(), on_disk_payload.begin(), on_disk_payload.end());
         checksum::compute_hfile_checksums(
             block.data(), block.size(),
             opts_.bytes_per_checksum, checksum_buf.data());
@@ -665,7 +713,13 @@ private:
     std::unique_ptr<block::DataBlockEncoder>    encoder_;
     std::unique_ptr<codec::Compressor>          compressor_;
     std::unique_ptr<bloom::CompoundBloomFilterWriter> bloom_;
-    index::BlockIndexWriter                     index_writer_;
+    // NOTE:
+    // Current intermediate-index block writer emits prebuilt IDXINTE2 blocks
+    // that are not run through the writer's compression pipeline. Under
+    // non-NONE compression codecs this can break HBase reader expectations.
+    // Keep root-only index blocks for correctness until compressed intermediate
+    // index blocks are fully implemented.
+    index::BlockIndexWriter                     index_writer_{std::numeric_limits<size_t>::max()};
 
     std::vector<uint8_t>   compress_buf_;
     std::vector<uint8_t>   last_key_;
