@@ -283,7 +283,7 @@ TEST(HFileWriter, FileInfoContainsMandatoryFields) {
     EXPECT_NE(content.find("hfile.KEY_VALUE_VERSION"), std::string::npos);
     EXPECT_NE(content.find("hfile.MAX_MEMSTORE_TS_KEY"), std::string::npos);
     EXPECT_NE(content.find("hfile.COMPARATOR"),        std::string::npos);
-    EXPECT_NE(content.find("hfile.DATA_BLOCK_ENCODING"), std::string::npos);
+    EXPECT_NE(content.find("DATA_BLOCK_ENCODING"), std::string::npos);
     EXPECT_NE(content.find("hfile.CREATE_TIME_TS"), std::string::npos);
     EXPECT_NE(content.find("hfile.LEN_OF_BIGGEST_CELL"), std::string::npos);
 

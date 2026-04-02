@@ -236,7 +236,7 @@ inline constexpr std::string_view kLenOfBiggestCell  = "hfile.LEN_OF_BIGGEST_CEL
 inline constexpr std::string_view kKeyValueVersion   = "hfile.KEY_VALUE_VERSION";
 inline constexpr std::string_view kMaxMemstoreTsKey  = "hfile.MAX_MEMSTORE_TS_KEY";
 inline constexpr std::string_view kComparator        = "hfile.COMPARATOR";
-inline constexpr std::string_view kDataBlockEncoding = "hfile.DATA_BLOCK_ENCODING";
+inline constexpr std::string_view kDataBlockEncoding = "DATA_BLOCK_ENCODING";
 } // namespace fileinfo
 
 // ─── Comparator class names ───────────────────────────────────────────────────
