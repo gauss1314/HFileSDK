@@ -332,7 +332,7 @@ public:
                 meta_root_offset + static_cast<int64_t>(meta_root_probe.size());
             std::vector<uint8_t> file_info_block_probe;
             HFILE_RETURN_IF_ERROR(
-                build_file_info_block(meta_root_offset, &file_info_block_probe));
+                build_file_info_block(meta_root_offset, bloom_result, &file_info_block_probe));
             const int64_t bloom_meta_offset =
                 file_info_offset + static_cast<int64_t>(file_info_block_probe.size());
             uint8_t* mp = meta_root_payload.data();
@@ -347,7 +347,7 @@ public:
         auto meta_root_block = build_raw_block(
             kRootIndexMagic, {meta_root_payload.data(), meta_root_payload.size()},
             root_block_offset);
-        HFILE_RETURN_IF_ERROR(build_file_info_block(meta_root_offset, &file_info_block));
+        HFILE_RETURN_IF_ERROR(build_file_info_block(meta_root_offset, bloom_result, &file_info_block));
 
         if (!intermed_buf.empty()) {
             HFILE_RETURN_IF_ERROR(
@@ -542,7 +542,9 @@ private:
         return block;
     }
 
-    Status build_file_info_block(int64_t prev_block_offset, std::vector<uint8_t>* out) {
+    Status build_file_info_block(int64_t prev_block_offset,
+                                 const bloom::BloomWriteResult& bloom_result,
+                                 std::vector<uint8_t>* out) {
         meta::FileInfoBuilder fib;
         fib.set_last_key({last_key_.data(), last_key_.size()});
         fib.set_avg_key_len(entry_count_ > 0
@@ -556,6 +558,10 @@ private:
         fib.set_data_block_encoding(opts_.data_block_encoding);
         fib.set_create_time();
         fib.set_len_of_biggest_cell(static_cast<uint64_t>(max_cell_size_));
+        if (bloom_result.enabled) {
+            fib.set_bloom_filter_type(opts_.bloom_type);
+            fib.set_last_bloom_key({last_bloom_key_.data(), last_bloom_key_.size()});
+        }
         HFILE_RETURN_IF_ERROR(fib.validate_required_fields());
 
         std::vector<uint8_t> fi_bytes;
@@ -668,6 +674,16 @@ private:
         bloom_->add(kv.row);
         if (opts_.bloom_type == BloomType::RowCol)
             bloom_->add_row_col(kv.row, kv.qualifier);
+        if (opts_.bloom_type == BloomType::Row) {
+            last_bloom_key_.assign(kv.row.begin(), kv.row.end());
+        } else if (opts_.bloom_type == BloomType::RowCol) {
+            last_bloom_key_.resize(kv.row.size() + kv.qualifier.size());
+            std::memcpy(last_bloom_key_.data(), kv.row.data(), kv.row.size());
+            std::memcpy(last_bloom_key_.data() + kv.row.size(),
+                        kv.qualifier.data(), kv.qualifier.size());
+        } else {
+            last_bloom_key_.clear();
+        }
 
         if (record_stats) record_cell_stats(kv);
         if (written_entry_count_ == 0) save_first_key(kv);
@@ -723,6 +739,7 @@ private:
 
     std::vector<uint8_t>   compress_buf_;
     std::vector<uint8_t>   last_key_;
+    std::vector<uint8_t>   last_bloom_key_;
     std::vector<uint8_t>   first_key_;
     OwnedKeyValue          last_kv_;
     std::vector<OwnedKeyValue> auto_sorted_kvs_;

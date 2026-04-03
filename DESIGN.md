@@ -140,7 +140,7 @@ Arrow RecordBatch → HFile v3 → 本地/HDFS → BulkLoadHFilesTool → HBase 
 | `hfile.KEY_VALUE_VERSION` | int32 BE | = 1，表示包含 MemstoreTS |
 | `hfile.MAX_MEMSTORE_TS_KEY` | int64 BE | Bulk Load 场景为 0 |
 | `hfile.COMPARATOR` | UTF-8 | `org.apache.hadoop.hbase.CellComparatorImpl` |
-| `hfile.DATA_BLOCK_ENCODING` | UTF-8 | `NONE`/`PREFIX`/`DIFF`/`FAST_DIFF` |
+| `DATA_BLOCK_ENCODING` | UTF-8 | `NONE`/`PREFIX`/`DIFF`/`FAST_DIFF` |
 | `hfile.CREATE_TIME_TS` | int64 BE | 文件创建时间戳（毫秒） |
 | `hfile.LEN_OF_BIGGEST_CELL` | int64 BE | 最大 Cell 的字节数 |
 

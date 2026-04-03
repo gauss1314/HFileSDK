@@ -237,6 +237,8 @@ inline constexpr std::string_view kKeyValueVersion   = "hfile.KEY_VALUE_VERSION"
 inline constexpr std::string_view kMaxMemstoreTsKey  = "hfile.MAX_MEMSTORE_TS_KEY";
 inline constexpr std::string_view kComparator        = "hfile.COMPARATOR";
 inline constexpr std::string_view kDataBlockEncoding = "DATA_BLOCK_ENCODING";
+inline constexpr std::string_view kBloomFilterType   = "BLOOM_FILTER_TYPE";
+inline constexpr std::string_view kLastBloomKey      = "LAST_BLOOM_KEY";
 } // namespace fileinfo
 
 // ─── Comparator class names ───────────────────────────────────────────────────

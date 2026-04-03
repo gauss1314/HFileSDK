@@ -622,3 +622,31 @@ TEST(HFileWriter, NoBloomTypeProducesNoBloomBlocks) {
     EXPECT_EQ(content.find("BLMFMET2"), std::string::npos);
     fs::remove(path);
 }
+
+TEST(HFileWriter, BloomFileInfoContainsBloomTypeAndLastBloomKey) {
+    auto path = tmp_path("bloom_fileinfo_keys");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::Row)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    ASSERT_TRUE(w->append(
+        make_kv(rk, fam, q, v, "row01", "col", 1000, "v1")).ok());
+    ASSERT_TRUE(w->append(
+        make_kv(rk, fam, q, v, "row99", "col", 1001, "v2")).ok());
+    ASSERT_TRUE(w->finish().ok());
+
+    auto data = read_file(path);
+    std::string content(data.begin(), data.end());
+    EXPECT_NE(content.find("BLOOM_FILTER_TYPE"), std::string::npos);
+    EXPECT_NE(content.find("LAST_BLOOM_KEY"), std::string::npos);
+    EXPECT_NE(content.find("ROW"), std::string::npos);
+    EXPECT_NE(content.find("row99"), std::string::npos);
+
+    fs::remove(path);
+}
