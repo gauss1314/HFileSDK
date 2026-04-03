@@ -66,6 +66,21 @@ public:
                   {reinterpret_cast<const uint8_t*>(name), strlen(name)});
     }
 
+    void set_bloom_filter_type(BloomType type) {
+        const char* name = "";
+        switch (type) {
+        case BloomType::None:   name = "NONE"; break;
+        case BloomType::Row:    name = "ROW"; break;
+        case BloomType::RowCol: name = "ROWCOL"; break;
+        }
+        set_bytes(std::string(fileinfo::kBloomFilterType),
+                  {reinterpret_cast<const uint8_t*>(name), strlen(name)});
+    }
+
+    void set_last_bloom_key(std::span<const uint8_t> key) {
+        set_bytes(std::string(fileinfo::kLastBloomKey), key);
+    }
+
     void set_create_time(int64_t ts_ms = -1) {
         if (ts_ms < 0) {
             ts_ms = static_cast<int64_t>(

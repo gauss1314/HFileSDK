@@ -140,3 +140,45 @@ TEST(BloomFilter, DataBlocksAndMetaSeparated) {
     EXPECT_NE(meta_str.find("BLMFMET2"), std::string::npos);
     EXPECT_EQ(meta_str.find("BLMFBLK2"), std::string::npos);
 }
+
+TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
+    CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
+    for (int i = 0; i < 30; ++i) {
+        auto k = make_key("row_" + std::to_string(i));
+        bf.add(k);
+    }
+    std::vector<uint8_t> chunks;
+    ASSERT_TRUE(bf.finish_data_blocks(chunks, 4096));
+
+    std::vector<uint8_t> meta;
+    bf.finish_meta_block(meta);
+    ASSERT_GT(meta.size(), kBlockHeaderSize + 40);
+
+    const uint8_t* p = meta.data() + kBlockHeaderSize;
+    const uint8_t* end = meta.data() + meta.size();
+
+    ASSERT_LE(p + 4, end);
+    EXPECT_EQ(read_be32(p), 3u); p += 4; // version
+    ASSERT_LE(p + 8, end);
+    EXPECT_GT(read_be64(p), 0u); p += 8; // total byte size
+    ASSERT_LE(p + 4, end);
+    EXPECT_EQ(read_be32(p), 5u); p += 4; // hash count
+    ASSERT_LE(p + 4, end);
+    EXPECT_EQ(read_be32(p), 1u); p += 4; // hash type (murmur)
+    ASSERT_LE(p + 8, end);
+    EXPECT_EQ(read_be64(p), 30u); p += 8; // total key count
+    ASSERT_LE(p + 8, end);
+    EXPECT_GE(read_be64(p), 30u); p += 8; // total max keys
+    ASSERT_LE(p + 4, end);
+    const uint32_t num_chunks = read_be32(p); p += 4;
+    EXPECT_GT(num_chunks, 0u);
+
+    int64_t comparator_len = 0;
+    const int len_bytes = decode_writable_vint(p, comparator_len);
+    ASSERT_GT(len_bytes, 0);
+    p += len_bytes;
+    EXPECT_EQ(comparator_len, 0); // ROW bloom has null comparator
+
+    ASSERT_LE(p + 4, end);
+    EXPECT_EQ(read_be32(p), num_chunks); p += 4; // index entry count
+}

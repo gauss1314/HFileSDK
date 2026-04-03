@@ -10,8 +10,11 @@ import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.io.hfile.*;
 import org.apache.hadoop.hbase.io.hfile.HFile.Reader;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.BloomFilter;
+import org.apache.hadoop.hbase.util.BloomFilterFactory;
 
 import java.io.File;
+import java.io.DataInput;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -243,6 +246,7 @@ public class HFileVerifier {
 
             // ── Validate FileInfo mandatory fields ─────────────────────────
             validateFileInfo(reader);
+            validateBloomMeta(reader);
 
             // ── Scan all KVs and check sort order ─────────────────────────
             HFileScanner scanner = reader.getScanner(conf, false, false);
@@ -378,5 +382,28 @@ public class HFileVerifier {
                 "Unexpected comparator: " + comparator);
         }
         System.out.printf("  Comparator      : %s%n", comparator);
+    }
+
+    private void validateBloomMeta(Reader reader) throws Exception {
+        DataInput bloomMeta = reader.getGeneralBloomFilterMetadata();
+        if (reader.getTrailer().getMetaIndexCount() > 0 && bloomMeta == null) {
+            throw new RuntimeException("Trailer indicates meta index, but bloom metadata is missing");
+        }
+        if (bloomMeta != null) {
+            HFileInfo fileInfo = ((HFileReaderImpl) reader).getHFileInfo();
+            if (fileInfo.get(Bytes.toBytes("BLOOM_FILTER_TYPE")) == null) {
+                throw new RuntimeException("Missing FileInfo key: BLOOM_FILTER_TYPE");
+            }
+            if (fileInfo.get(Bytes.toBytes("LAST_BLOOM_KEY")) == null) {
+                throw new RuntimeException("Missing FileInfo key: LAST_BLOOM_KEY");
+            }
+            BloomFilter bloom = BloomFilterFactory.createFromMeta(bloomMeta, reader);
+            if (bloom == null) {
+                throw new RuntimeException("Failed to parse bloom metadata");
+            }
+            System.out.printf("  Bloom meta      : %s%n", bloom.getClass().getSimpleName());
+        } else {
+            System.out.printf("  Bloom meta      : NONE%n");
+        }
     }
 }
