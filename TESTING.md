@@ -24,17 +24,17 @@ bash scripts/build.sh
 bash scripts/test.sh -- -R test_arrow_converter
 ```
 
-Windows + MSYS2 Clang 下对应入口：
+Windows + MSYS2 Clang64 下对应入口：
 
-```bat
-scripts\build.bat
-scripts\test.bat
+```bash
+bash scripts/build.sh
+bash scripts/test.sh
 ```
 
 ## 覆盖率报表
 
 当前仓库已接入基于 Clang 工具链的 `llvm-cov` 覆盖率流程；在 macOS、Linux 以及 Windows + MSYS2 Clang 环境下，只要 `llvm-cov` / `llvm-profdata` 可用，都可以走同一套覆盖率目标。
-在 Windows + MSYS2 Clang 环境下，统一通过 `scripts\coverage.bat` 进入，它会转调 `coverage.sh`；脚本会在配置前检查 `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata`，并提示 `MSYSTEM=CLANG64` 等推荐前置条件。
+在 Windows + MSYS2 Clang64 环境下，请直接执行 `bash scripts/coverage.sh`；脚本会在配置前检查 `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata`，并提示 `MSYSTEM=CLANG64` 等推荐前置条件。
 
 ```bash
 cmake -B build-coverage \
@@ -50,10 +50,10 @@ cmake --build build-coverage --target hfile_coverage
 bash scripts/coverage.sh
 ```
 
-Windows + MSYS2 Clang 下对应入口：
+Windows + MSYS2 Clang64 下对应入口：
 
-```bat
-scripts\coverage.bat
+```bash
+bash scripts/coverage.sh
 ```
 
 生成结果：

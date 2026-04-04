@@ -20,6 +20,7 @@
 
 按需阅读：
 
+- [07_WRITER_DEEP_DIVE.md](07_WRITER_DEEP_DIVE.md) — **writer.cc 的逐层拆解**：从 Builder 到 open()、append() 三道关卡、flush_data_block 物理写入、finish() 的偏移量依赖链求解、析构安全网、全部状态变量解析
 - [04_ROW_KEY_ENGINE.md](04_ROW_KEY_ENGINE.md) — rowKeyRule 编译与执行引擎，列排除机制，与 Arrow Schema 的交互
 - [05_BLOCK_ENCODERS.md](05_BLOCK_ENCODERS.md) — 四种数据块编码器（None/Prefix/Diff/FastDiff）的实现原理与二进制格式
 - [06_PRODUCTION_FEATURES.md](06_PRODUCTION_FEATURES.md) — 崩溃安全、内存控制、输入校验、JNI 异常隔离、可观测性
@@ -27,6 +28,8 @@
 ## 最短路径
 
 只想快速了解项目？读前两份就够了：CODE_MAP + CONVERSION_PIPELINE。
+
+想修改 HFile 写入逻辑？在前两份基础上加读 07_WRITER_DEEP_DIVE.md，它逐行拆解了 writer.cc 的设计。
 
 想修改某个模块？先读 CODE_MAP 定位文件，再读 CONVERSION_PIPELINE 理解该模块在流水线中的位置，然后按需读对应的深入文档。
 

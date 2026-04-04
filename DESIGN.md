@@ -760,7 +760,7 @@ submit_active() 协议：
 
 **Windows 注意事项**：
 - CMake 自动检测平台，Windows 上 `io_uring` 和 `HDFS` 选项自动关闭
-- Windows 构建入口统一约定为 `MSYS2 + clang/clang++ + scripts/*.bat -> scripts/*.sh`
+- Windows 构建入口统一约定为 `MSYS2 + clang/clang++ + 直接执行 scripts/*.sh`
 - `BufferedFileWriter` 使用标准 C `FILE*`，Windows 完全支持
 - SSE4.2 intrinsics 在 Clang 中可用
 - `__builtin_ctz`、`__builtin_expect` 在 Clang 中可用

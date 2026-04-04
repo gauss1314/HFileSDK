@@ -13,11 +13,11 @@
 | Linux x86-64       | GCC 12+               | ✅ **完整支持** | 所有功能，含 io\_uring、SSE4.2                  |
 | Linux x86-64       | Clang 16+             | ✅ **完整支持** | 同上                                       |
 | macOS x86-64/arm64 | Apple Clang 15+       | ✅ **完整支持** | 除 io\_uring（Apple Silicon 含 CRC32C 硬件指令） |
-| Windows x86-64     | Clang 17+（MSYS2 `clang/clang++`） | ✅ **核心功能** | 通过 `scripts/*.bat` 进入 MSYS2 脚本工作流 |
+| Windows x86-64     | Clang 17+（MSYS2 `clang/clang++`） | ✅ **核心功能** | 在 MSYS2 `CLANG64` 环境中直接执行 `scripts/*.sh` |
 
 ### Windows + MSYS2 Clang 支持说明
 
-核心编码、压缩、索引、Bloom Filter 等模块**完全跨平台**，当前 Windows 路径统一约定为 **MSYS2 + clang/clang++ + .bat/.sh**。
+核心编码、压缩、索引、Bloom Filter 等模块**完全跨平台**，当前 Windows 路径统一约定为 **MSYS2 + clang/clang++ + 直接执行 `.sh` 脚本**。
 
 以下功能在 Windows 上**自动禁用**（CMake 自动检测，无需手动配置）：
 
@@ -54,18 +54,18 @@ bash scripts/build.sh -DCMAKE_CXX_FLAGS="-O3 -march=native"
 bash scripts/test.sh
 ```
 
-### Windows（MSYS2 Clang + 脚本入口）
+### Windows（MSYS2 Clang64）
 
-Windows 下当前只维护 **MSYS2 内的 Clang/LLVM 工具链** 这一路径，仓库提供对应的脚本入口：
+Windows 下当前只维护 **MSYS2 内的 Clang/LLVM 工具链** 这一路径。请先进入 **MSYS2 Clang64 Shell**，再直接执行仓库中的 `.sh` 脚本：
 
-```bat
-scripts\build.bat
-scripts\test.bat
-scripts\coverage.bat
-scripts\bench-runner.bat --skip-hbase --skip-java --iterations 1
+```bash
+bash scripts/build.sh
+bash scripts/test.sh
+bash scripts/coverage.sh
+bash scripts/bench-runner.sh --skip-hbase --skip-java --iterations 1
 ```
 
-命令顺序与 Linux / macOS 侧保持一致：**build → test → coverage → bench-runner**。这些 `.bat` 会转调 `scripts/*.sh`，并自动查找 MSYS2 `bash.exe`。推荐前提：
+命令顺序与 Linux / macOS 侧保持一致：**build → test → coverage → bench-runner**。推荐前提：
 
 - `MSYSTEM=CLANG64`
 - `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata` 在该 MSYS2 环境中可见
