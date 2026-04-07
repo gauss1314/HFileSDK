@@ -179,6 +179,20 @@ TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
     p += len_bytes;
     EXPECT_EQ(comparator_len, 0); // ROW bloom has null comparator
 
-    ASSERT_LE(p + 4, end);
-    EXPECT_EQ(read_be32(p), num_chunks); p += 4; // index entry count
+    for (uint32_t i = 0; i < num_chunks; ++i) {
+        ASSERT_LE(p + 12, end);
+        EXPECT_GE(read_be64(p), 4096u);
+        p += 8;
+        EXPECT_GT(read_be32(p), 0u);
+        p += 4;
+
+        int64_t key_len = 0;
+        const int key_len_bytes = decode_writable_vint(p, key_len);
+        ASSERT_GT(key_len_bytes, 0);
+        p += key_len_bytes;
+        ASSERT_GE(key_len, 0);
+        ASSERT_LE(p + key_len, end);
+        EXPECT_GT(key_len, 0);
+        p += static_cast<size_t>(key_len);
+    }
 }

@@ -206,20 +206,17 @@ private:
         // + totalKeyCount(8B BE) + totalMaxKeys(8B BE) + numChunks(4B BE)
         // + comparatorClassName(bytes with writable-vint length prefix)
         // + bloom index root payload:
-        //   entryCount(4B BE) + secondaryIndexOffsets((N+1)*4B BE)
-        //   + [chunkOffset(8B BE) + chunkByteSize(4B BE) + firstKey] * N
+        //   [chunkOffset(8B BE) + chunkByteSize(4B BE) + firstKey(bytes with writable-vint length prefix)] * N
         size_t off = out.size();
-        std::vector<uint32_t> secondary_offsets;
-        secondary_offsets.reserve(chunks_.size() + 1);
-        uint32_t entry_offset = 0;
-        secondary_offsets.push_back(entry_offset);
-        for (size_t i = 0; i < chunks_.size(); ++i) {
-            entry_offset += static_cast<uint32_t>(8 + 4 + chunk_first_keys_[i].size());
-            secondary_offsets.push_back(entry_offset);
-        }
         uint8_t comparator_len_buf[10];
         const int comparator_len_size = encode_writable_vint(comparator_len_buf, 0);
-        const size_t index_payload_size = 4 + secondary_offsets.size() * 4 + entry_offset;
+        size_t index_payload_size = 0;
+        for (const auto& first_key : chunk_first_keys_) {
+            uint8_t key_len_buf[10];
+            const int key_len_size = encode_writable_vint(
+                key_len_buf, static_cast<int64_t>(first_key.size()));
+            index_payload_size += 8 + 4 + static_cast<size_t>(key_len_size) + first_key.size();
+        }
         size_t data_size = 4 + 8 + 4 + 4 + 8 + 8 + 4
                          + static_cast<size_t>(comparator_len_size)
                          + index_payload_size;
@@ -255,14 +252,14 @@ private:
         std::memcpy(p, comparator_len_buf, static_cast<size_t>(comparator_len_size));
         p += comparator_len_size;
 
-        write_be32(p, static_cast<uint32_t>(chunks_.size())); p += 4;
-        for (uint32_t mark : secondary_offsets) {
-            write_be32(p, mark);
-            p += 4;
-        }
         for (size_t i = 0; i < chunks_.size(); ++i) {
+            uint8_t key_len_buf[10];
+            const int key_len_size = encode_writable_vint(
+                key_len_buf, static_cast<int64_t>(chunk_first_keys_[i].size()));
             write_be64(p, static_cast<uint64_t>(chunk_offsets_[i])); p += 8;
             write_be32(p, static_cast<uint32_t>(chunks_[i].size())); p += 4;
+            std::memcpy(p, key_len_buf, static_cast<size_t>(key_len_size));
+            p += key_len_size;
             std::memcpy(p, chunk_first_keys_[i].data(), chunk_first_keys_[i].size());
             p += chunk_first_keys_[i].size();
         }
