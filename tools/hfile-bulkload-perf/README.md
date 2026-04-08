@@ -6,15 +6,17 @@
 2. 复用 `tools/arrow-to-hfile` 的最新自适应批量转换逻辑
 3. 当单个 Arrow 文件平均大小大于等于 `100MB` 时，走 Java 多线程 + 多次 JNI 调用
 4. 当单个 Arrow 文件平均大小小于 `100MB` 时，先合并 Arrow 再转换为 HFile
-3. 执行 `hbase org.apache.hadoop.hbase.tool.BulkLoadHFilesTool <staging_dir> <table>`
-4. 记录各阶段耗时并计算吞吐量
-5. 可选调用 `hfile-bulkload-verify` 做 BulkLoad 后行数校验
+5. 创建 HDFS staging 目录并上传 HFile
+6. 执行 `hbase org.apache.hadoop.hbase.tool.BulkLoadHFilesTool <hdfs_staging_dir> <table>`
+7. 记录各阶段耗时并计算吞吐量
+8. 可选调用 `hfile-bulkload-verify` 做 BulkLoad 后行数校验
 
 默认假设：
 
 - 一批 Arrow 文件都属于同一个 HBase 表
 - `target-size-mb` 表示单个 Arrow 文件目标大小
 - BulkLoad staging 目录默认为 `/tmp/hbase_bulkload`
+- HDFS staging 根目录默认 `/hbase/staging/<table>`
 
 ## 构建
 
@@ -33,6 +35,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
   --table perf_single_table \
   --work-dir /tmp/hfilesdk-bulkload-perf \
   --bulkload-dir /tmp/hbase_bulkload \
+  --hdfs-staging-dir /hbase/staging/perf_single_table \
   --iterations 1 \
   --arrow-file-count 4 \
   --target-size-mb 256 \
@@ -50,6 +53,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
   --table perf_small_files \
   --work-dir /tmp/hfilesdk-bulkload-perf-small \
   --bulkload-dir /tmp/hbase_bulkload_small \
+  --hdfs-staging-dir /hbase/staging/perf_small_files \
   --arrow-file-count 16 \
   --target-size-mb 32 \
   --merge-threshold 100 \
@@ -59,10 +63,12 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
   --cf cf
 ```
 
-两种场景最终都会执行：
+两种场景最终都会执行与手工流程一致的三步：
 
 ```bash
-hbase org.apache.hadoop.hbase.tool.BulkLoadHFilesTool /tmp/hbase_bulkload perf_single_table
+hdfs dfs -mkdir -p /hbase/staging/perf_single_table/cf
+hdfs dfs -put -f /tmp/hbase_bulkload/cf/*.hfile /hbase/staging/perf_single_table/cf/
+hbase org.apache.hadoop.hbase.tool.BulkLoadHFilesTool /hbase/staging/perf_single_table perf_single_table
 ```
 
 ## BulkLoad 后校验
@@ -102,6 +108,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 - `--native-lib`：`libhfilesdk` 动态库绝对路径
 - `--work-dir`：Arrow 文件与报告输出目录
 - `--bulkload-dir`：BulkLoad staging 目录
+- `--hdfs-staging-dir`：HDFS 侧 BulkLoad staging 根目录
 - `--arrow-file-count`：生成的 Arrow 文件数量，默认 `1`
 - `--target-size-mb`：每个 Arrow 文件目标大小，默认 `1024`
 - `--parallelism`：大文件并行转换线程数，默认 CPU 核数
@@ -110,6 +117,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 - `--trigger-count`：小文件合并策略的攒批文件数阈值，默认 `500`
 - `--trigger-interval`：小文件合并策略的时间阈值，默认 `180`
 - `--iterations`：完整端到端执行轮数，默认 `1`
+- `--hdfs-bin`：HDFS 命令路径，默认 `hdfs`
 - `--payload-bytes`：每行 `PAYLOAD` 列的字节数，默认 `768`
 - `--batch-rows`：每个 Arrow RecordBatch 的行数，默认 `8192`
 - `--rule`：rowKeyRule，默认 `USER_ID,0,false,0#long(),1,false,0`
@@ -130,6 +138,8 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 - HFile 总大小
 - Arrow 生成耗时与吞吐
 - 自适应转换耗时与吞吐
+- HDFS staging 准备耗时
+- HDFS 上传耗时
 - BulkLoad 耗时与吞吐
 - Verify 耗时
 - 端到端总耗时与吞吐

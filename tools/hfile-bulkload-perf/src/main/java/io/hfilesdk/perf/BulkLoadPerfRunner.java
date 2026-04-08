@@ -53,6 +53,7 @@ public final class BulkLoadPerfRunner {
     private static final String DEFAULT_ERROR_POLICY = "skip_row";
     private static final int DEFAULT_BLOCK_SIZE = 65536;
     private static final String DEFAULT_HBASE_BIN = "hbase";
+    private static final String DEFAULT_HDFS_BIN = "hdfs";
     private static final String DEFAULT_WORK_DIR = "/tmp/hfilesdk-bulkload-perf";
     private static final String DEFAULT_BULKLOAD_DIR = "/tmp/hbase_bulkload";
     private static final String DEFAULT_STRATEGY_PARALLEL = "PARALLEL-CONVERT";
@@ -141,6 +142,8 @@ public final class BulkLoadPerfRunner {
     private static PerfResult runSingleIteration(RunConfig config) throws Exception {
         GenerationStats generationStats = GenerationStats.empty();
         ConversionStats conversionStats = ConversionStats.notStarted();
+        HdfsStageStats hdfsPrepareStats = HdfsStageStats.notStarted();
+        HdfsUploadStats hdfsUploadStats = HdfsUploadStats.notStarted();
         BulkLoadStats bulkLoadStats = BulkLoadStats.notStarted();
         VerifyStats verifyStats = VerifyStats.notStarted();
         Throwable failure = null;
@@ -152,9 +155,21 @@ public final class BulkLoadPerfRunner {
             if (!conversionStats.success()) {
                 throw new IllegalStateException(conversionStats.errorMessage());
             }
-            bulkLoadStats = config.skipBulkLoad()
-                ? BulkLoadStats.skippedResult()
-                : runBulkLoad(config);
+            if (config.skipBulkLoad()) {
+                hdfsPrepareStats = HdfsStageStats.skippedResult();
+                hdfsUploadStats = HdfsUploadStats.skippedResult();
+                bulkLoadStats = BulkLoadStats.skippedResult();
+            } else {
+                hdfsPrepareStats = runHdfsPrepare(config);
+                if (!hdfsPrepareStats.success()) {
+                    throw new IllegalStateException(hdfsPrepareStats.errorMessage());
+                }
+                hdfsUploadStats = runHdfsUpload(config);
+                if (!hdfsUploadStats.success()) {
+                    throw new IllegalStateException(hdfsUploadStats.errorMessage());
+                }
+                bulkLoadStats = runBulkLoad(config);
+            }
             if (!bulkLoadStats.success()) {
                 throw new IllegalStateException(bulkLoadStats.errorMessage());
             }
@@ -182,9 +197,19 @@ public final class BulkLoadPerfRunner {
             conversionStats.totalHfileSizeBytes(),
             generationStats.elapsedNanos(),
             conversionStats.elapsedNanos(),
+            hdfsPrepareStats.elapsedNanos(),
+            hdfsUploadStats.elapsedNanos(),
             bulkLoadStats.elapsedNanos(),
             verifyStats.elapsedNanos(),
             totalNanos,
+            hdfsPrepareStats.skipped(),
+            hdfsPrepareStats.command(),
+            hdfsPrepareStats.exitCode(),
+            hdfsPrepareStats.output(),
+            hdfsUploadStats.skipped(),
+            hdfsUploadStats.command(),
+            hdfsUploadStats.exitCode(),
+            hdfsUploadStats.output(),
             bulkLoadStats.skipped(),
             bulkLoadStats.command(),
             bulkLoadStats.exitCode(),
@@ -224,6 +249,8 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("error-policy").hasArg().argName("POLICY").desc("错误策略，默认 skip_row").build());
         options.addOption(Option.builder().longOpt("block-size").hasArg().argName("BYTES").desc("HFile block size，默认 65536").build());
         options.addOption(Option.builder().longOpt("hbase-bin").hasArg().argName("BIN").desc("hbase 命令路径，默认 hbase").build());
+        options.addOption(Option.builder().longOpt("hdfs-bin").hasArg().argName("BIN").desc("hdfs 命令路径，默认 hdfs").build());
+        options.addOption(Option.builder().longOpt("hdfs-staging-dir").hasArg().argName("PATH").desc("HDFS 侧 BulkLoad staging 根目录").build());
         options.addOption(Option.builder().longOpt("verify-bulkload").desc("BulkLoad 完成后执行行数校验").build());
         options.addOption(Option.builder().longOpt("verify-jar").hasArg().argName("PATH").desc("BulkLoad 校验工具 jar 路径").build());
         options.addOption(Option.builder().longOpt("zookeeper").hasArg().argName("HOST:PORT").desc("BulkLoad 校验用 ZooKeeper 地址").build());
@@ -258,6 +285,7 @@ public final class BulkLoadPerfRunner {
         String fsyncPolicy = cmd.getOptionValue("fsync-policy", DEFAULT_FSYNC_POLICY);
         String errorPolicy = cmd.getOptionValue("error-policy", DEFAULT_ERROR_POLICY);
         String hbaseBin = cmd.getOptionValue("hbase-bin", DEFAULT_HBASE_BIN);
+        String hdfsBin = cmd.getOptionValue("hdfs-bin", DEFAULT_HDFS_BIN);
         boolean verifyBulkLoad = cmd.hasOption("verify-bulkload");
         String zookeeper = cmd.getOptionValue("zookeeper", "");
         Path verifyJar = Path.of(cmd.getOptionValue("verify-jar", DEFAULT_VERIFY_JAR.toString())).toAbsolutePath().normalize();
@@ -272,6 +300,9 @@ public final class BulkLoadPerfRunner {
         Path arrowDir = workDir.resolve("arrow");
         Path mergeTmpDir = workDir.resolve("merge-tmp");
         Path hfileDir = bulkloadDir.resolve(columnFamily);
+        Path hdfsStagingDir = Path.of(cmd.getOptionValue(
+            "hdfs-staging-dir",
+            "/hbase/staging/" + sanitize(tableName)));
         Path reportJson = Path.of(cmd.getOptionValue("report-json", workDir.resolve(tableName + "-perf-report.json").toString()))
             .toAbsolutePath()
             .normalize();
@@ -304,6 +335,8 @@ public final class BulkLoadPerfRunner {
             fsyncPolicy,
             errorPolicy,
             hbaseBin,
+            hdfsBin,
+            hdfsStagingDir,
             verifyBulkLoad,
             verifyJar,
             zookeeper,
@@ -490,11 +523,97 @@ public final class BulkLoadPerfRunner {
         );
     }
 
+    private static HdfsStageStats runHdfsPrepare(RunConfig config) throws IOException, InterruptedException {
+        List<String> removeCommand = List.of(
+            config.hdfsBin(),
+            "dfs",
+            "-rm",
+            "-r",
+            "-f",
+            config.hdfsStagingDir().toString()
+        );
+        CommandExecResult removeExec = runExternalCommand(removeCommand);
+        List<String> mkdirCommand = List.of(
+            config.hdfsBin(),
+            "dfs",
+            "-mkdir",
+            "-p",
+            config.hdfsStagingCfDir().toString()
+        );
+        CommandExecResult mkdirExec = runExternalCommand(mkdirCommand);
+        boolean success = mkdirExec.exitCode() == 0;
+        String command = String.join(" ", removeCommand) + " && " + String.join(" ", mkdirCommand);
+        String output = removeExec.output() + mkdirExec.output();
+        return new HdfsStageStats(
+            removeExec.elapsedNanos() + mkdirExec.elapsedNanos(),
+            false,
+            command,
+            mkdirExec.exitCode(),
+            output,
+            success,
+            success ? "" : "HDFS staging prepare failed with code " + mkdirExec.exitCode()
+        );
+    }
+
+    private static HdfsUploadStats runHdfsUpload(RunConfig config) throws IOException, InterruptedException {
+        List<Path> hfiles = listLocalHFiles(config.hfileDir());
+        if (hfiles.isEmpty()) {
+            return new HdfsUploadStats(
+                0L,
+                false,
+                "",
+                -1,
+                "",
+                false,
+                "no local HFiles found under " + config.hfileDir()
+            );
+        }
+        long elapsed = 0L;
+        int lastExitCode = 0;
+        StringBuilder output = new StringBuilder();
+        List<String> commands = new ArrayList<>();
+        for (Path hfile : hfiles) {
+            List<String> command = List.of(
+                config.hdfsBin(),
+                "dfs",
+                "-put",
+                "-f",
+                hfile.toString(),
+                config.hdfsStagingCfDir().toString()
+            );
+            CommandExecResult exec = runExternalCommand(command);
+            elapsed += exec.elapsedNanos();
+            lastExitCode = exec.exitCode();
+            commands.add(String.join(" ", command));
+            output.append(exec.output());
+            if (exec.exitCode() != 0) {
+                return new HdfsUploadStats(
+                    elapsed,
+                    false,
+                    String.join(" && ", commands),
+                    lastExitCode,
+                    output.toString(),
+                    false,
+                    "HDFS upload failed with code " + lastExitCode
+                );
+            }
+        }
+        return new HdfsUploadStats(
+            elapsed,
+            false,
+            String.join(" && ", commands),
+            lastExitCode,
+            output.toString(),
+            true,
+            ""
+        );
+    }
+
     private static BulkLoadStats runBulkLoad(RunConfig config) throws IOException, InterruptedException {
         List<String> command = List.of(
             config.hbaseBin(),
             "org.apache.hadoop.hbase.tool.BulkLoadHFilesTool",
-            config.bulkloadDir().toString(),
+            config.hdfsStagingDir().toString(),
             config.tableName()
         );
         CommandExecResult exec = runExternalCommand(command);
@@ -583,6 +702,7 @@ public final class BulkLoadPerfRunner {
         System.out.println("  table                 : " + result.config().tableName());
         System.out.println("  arrow_dir             : " + result.config().arrowDir());
         System.out.println("  hfile_dir             : " + result.config().hfileDir());
+        System.out.println("  hdfs_staging_dir      : " + result.config().hdfsStagingDir());
         System.out.println("  report_json           : " + result.config().reportJson());
         System.out.println("  strategy              : " + result.conversionStrategy());
         System.out.println("  arrow_files           : " + result.arrowFileCount());
@@ -594,6 +714,8 @@ public final class BulkLoadPerfRunner {
         System.out.println("  status                : " + (result.success() ? "SUCCESS" : "FAILED"));
         System.out.println("  generate_ms           : " + nanosToMillis(result.generateNanos()));
         System.out.println("  convert_ms            : " + nanosToMillis(result.convertNanos()));
+        System.out.println("  hdfs_prepare_ms       : " + (result.hdfsPrepareSkipped() ? "SKIPPED" : nanosToMillis(result.hdfsPrepareNanos())));
+        System.out.println("  hdfs_upload_ms        : " + (result.hdfsUploadSkipped() ? "SKIPPED" : nanosToMillis(result.hdfsUploadNanos())));
         System.out.println("  bulkload_ms           : " + (result.bulkLoadSkipped() ? "SKIPPED" : nanosToMillis(result.bulkLoadNanos())));
         System.out.println("  verify_ms             : " + (result.verifySkipped() ? "SKIPPED" : nanosToMillis(result.verifyNanos())));
         System.out.println("  total_ms              : " + nanosToMillis(result.totalNanos()));
@@ -601,6 +723,12 @@ public final class BulkLoadPerfRunner {
         System.out.println("  convert_mb_per_sec    : " + formatRate(result.arrowSizeBytes(), result.convertNanos()));
         System.out.println("  bulkload_mb_per_sec   : " + (result.bulkLoadSkipped() ? "SKIPPED" : formatRate(result.hfileSizeBytes(), result.bulkLoadNanos())));
         System.out.println("  end_to_end_mb_per_sec : " + formatRate(result.arrowSizeBytes(), result.totalNanos()));
+        if (!result.hdfsPrepareSkipped()) {
+            System.out.println("  hdfs_prepare_command  : " + result.hdfsPrepareCommand());
+        }
+        if (!result.hdfsUploadSkipped()) {
+            System.out.println("  hdfs_upload_command   : " + result.hdfsUploadCommand());
+        }
         if (!result.bulkLoadSkipped()) {
             System.out.println("  bulkload_command      : " + result.bulkLoadCommand());
         }
@@ -623,6 +751,8 @@ public final class BulkLoadPerfRunner {
         if (!report.iterationResults().isEmpty()) {
             System.out.println("  avg_generate_ms       : " + formatDouble(report.averageGenerateMs()));
             System.out.println("  avg_convert_ms        : " + formatDouble(report.averageConvertMs()));
+            System.out.println("  avg_hdfs_prepare_ms   : " + formatOptionalDouble(report.averageHdfsPrepareMs(), report.anyHdfsPrepareExecuted()));
+            System.out.println("  avg_hdfs_upload_ms    : " + formatOptionalDouble(report.averageHdfsUploadMs(), report.anyHdfsUploadExecuted()));
             System.out.println("  avg_bulkload_ms       : " + formatOptionalDouble(report.averageBulkLoadMs(), report.anyBulkLoadExecuted()));
             System.out.println("  avg_verify_ms         : " + formatOptionalDouble(report.averageVerifyMs(), report.anyVerifyExecuted()));
             System.out.println("  avg_e2e_ms            : " + formatDouble(report.averageTotalMs()));
@@ -648,6 +778,18 @@ public final class BulkLoadPerfRunner {
         deleteRecursively(config.arrowDir());
         deleteRecursively(config.mergeTmpDir());
         deleteRecursively(config.bulkloadDir());
+    }
+
+    private static List<Path> listLocalHFiles(Path hfileDir) throws IOException {
+        if (!Files.exists(hfileDir)) {
+            return List.of();
+        }
+        try (var stream = Files.list(hfileDir)) {
+            return stream
+                .filter(path -> Files.isRegularFile(path) && path.getFileName().toString().endsWith(".hfile"))
+                .sorted(Comparator.comparing(Path::getFileName))
+                .toList();
+        }
     }
 
     private static void deleteRecursively(Path path) throws IOException {
@@ -937,6 +1079,8 @@ public final class BulkLoadPerfRunner {
         String fsyncPolicy,
         String errorPolicy,
         String hbaseBin,
+        String hdfsBin,
+        Path hdfsStagingDir,
         boolean verifyBulkLoad,
         Path verifyJar,
         String zookeeper,
@@ -945,6 +1089,10 @@ public final class BulkLoadPerfRunner {
     ) {
         private Path baseReportJson() {
             return reportJson;
+        }
+
+        private Path hdfsStagingCfDir() {
+            return hdfsStagingDir.resolve(columnFamily);
         }
 
         private RunConfig forIteration(int iteration) {
@@ -957,6 +1105,7 @@ public final class BulkLoadPerfRunner {
             Path iterationArrowDir = iterationWorkDir.resolve("arrow");
             Path iterationMergeTmpDir = iterationWorkDir.resolve("merge-tmp");
             Path iterationHfileDir = iterationBulkloadDir.resolve(columnFamily);
+            Path iterationHdfsStagingDir = Path.of(hdfsStagingDir.toString() + "/" + suffix);
             Path iterationReportPath = workDir.resolve(tableName + "-" + suffix + "-perf-report.json");
             return new RunConfig(
                 tableName,
@@ -987,6 +1136,8 @@ public final class BulkLoadPerfRunner {
                 fsyncPolicy,
                 errorPolicy,
                 hbaseBin,
+                hdfsBin,
+                iterationHdfsStagingDir,
                 verifyBulkLoad,
                 verifyJar,
                 zookeeper,
@@ -1028,6 +1179,26 @@ public final class BulkLoadPerfRunner {
         }
     }
 
+    private record HdfsStageStats(long elapsedNanos, boolean skipped, String command, int exitCode, String output, boolean success, String errorMessage) {
+        private static HdfsStageStats skippedResult() {
+            return new HdfsStageStats(0L, true, "", 0, "", true, "");
+        }
+
+        private static HdfsStageStats notStarted() {
+            return new HdfsStageStats(0L, true, "", 0, "", true, "");
+        }
+    }
+
+    private record HdfsUploadStats(long elapsedNanos, boolean skipped, String command, int exitCode, String output, boolean success, String errorMessage) {
+        private static HdfsUploadStats skippedResult() {
+            return new HdfsUploadStats(0L, true, "", 0, "", true, "");
+        }
+
+        private static HdfsUploadStats notStarted() {
+            return new HdfsUploadStats(0L, true, "", 0, "", true, "");
+        }
+    }
+
     private record BulkLoadStats(long elapsedNanos, boolean skipped, String command, int exitCode, String output, boolean success, String errorMessage) {
         private static BulkLoadStats skippedResult() {
             return new BulkLoadStats(0L, true, "", 0, "", true, "");
@@ -1065,9 +1236,19 @@ public final class BulkLoadPerfRunner {
         long hfileSizeBytes,
         long generateNanos,
         long convertNanos,
+        long hdfsPrepareNanos,
+        long hdfsUploadNanos,
         long bulkLoadNanos,
         long verifyNanos,
         long totalNanos,
+        boolean hdfsPrepareSkipped,
+        String hdfsPrepareCommand,
+        int hdfsPrepareExitCode,
+        String hdfsPrepareOutput,
+        boolean hdfsUploadSkipped,
+        String hdfsUploadCommand,
+        int hdfsUploadExitCode,
+        String hdfsUploadOutput,
         boolean bulkLoadSkipped,
         String bulkLoadCommand,
         int bulkLoadExitCode,
@@ -1105,11 +1286,21 @@ public final class BulkLoadPerfRunner {
                 + "  \"hfile_size_bytes\": " + hfileSizeBytes + ",\n"
                 + "  \"generate_ms\": " + nanosToMillis(generateNanos) + ",\n"
                 + "  \"convert_ms\": " + nanosToMillis(convertNanos) + ",\n"
+                + "  \"hdfs_prepare_ms\": " + (hdfsPrepareSkipped ? 0 : nanosToMillis(hdfsPrepareNanos)) + ",\n"
+                + "  \"hdfs_upload_ms\": " + (hdfsUploadSkipped ? 0 : nanosToMillis(hdfsUploadNanos)) + ",\n"
                 + "  \"bulkload_ms\": " + (bulkLoadSkipped ? 0 : nanosToMillis(bulkLoadNanos)) + ",\n"
                 + "  \"verify_ms\": " + (verifySkipped ? 0 : nanosToMillis(verifyNanos)) + ",\n"
                 + "  \"total_ms\": " + nanosToMillis(totalNanos) + ",\n"
                 + "  \"generate_mb_per_sec\": " + formatRate(arrowSizeBytes, generateNanos) + ",\n"
                 + "  \"convert_mb_per_sec\": " + formatRate(arrowSizeBytes, convertNanos) + ",\n"
+                + "  \"hdfs_prepare_skipped\": " + hdfsPrepareSkipped + ",\n"
+                + "  \"hdfs_prepare_exit_code\": " + hdfsPrepareExitCode + ",\n"
+                + "  \"hdfs_prepare_command\": \"" + jsonEscape(hdfsPrepareCommand) + "\",\n"
+                + "  \"hdfs_prepare_output\": \"" + jsonEscape(hdfsPrepareOutput) + "\",\n"
+                + "  \"hdfs_upload_skipped\": " + hdfsUploadSkipped + ",\n"
+                + "  \"hdfs_upload_exit_code\": " + hdfsUploadExitCode + ",\n"
+                + "  \"hdfs_upload_command\": \"" + jsonEscape(hdfsUploadCommand) + "\",\n"
+                + "  \"hdfs_upload_output\": \"" + jsonEscape(hdfsUploadOutput) + "\",\n"
                 + "  \"bulkload_mb_per_sec\": " + (bulkLoadSkipped ? "\"SKIPPED\"" : formatRate(hfileSizeBytes, bulkLoadNanos)) + ",\n"
                 + "  \"end_to_end_mb_per_sec\": " + formatRate(arrowSizeBytes, totalNanos) + ",\n"
                 + "  \"bulkload_skipped\": " + bulkLoadSkipped + ",\n"
@@ -1144,12 +1335,16 @@ public final class BulkLoadPerfRunner {
 
         private double averageGenerateMs() { return averageMillis(iterationResults, PerfResult::generateNanos); }
         private double averageConvertMs() { return averageMillis(iterationResults, PerfResult::convertNanos); }
+        private double averageHdfsPrepareMs() { return averageMillis(iterationResults, PerfResult::hdfsPrepareNanos, r -> !r.hdfsPrepareSkipped()); }
+        private double averageHdfsUploadMs() { return averageMillis(iterationResults, PerfResult::hdfsUploadNanos, r -> !r.hdfsUploadSkipped()); }
         private double averageBulkLoadMs() { return averageMillis(iterationResults, PerfResult::bulkLoadNanos, r -> !r.bulkLoadSkipped()); }
         private double averageVerifyMs() { return averageMillis(iterationResults, PerfResult::verifyNanos, r -> !r.verifySkipped()); }
         private double averageTotalMs() { return averageMillis(iterationResults, PerfResult::totalNanos); }
         private double averageEndToEndMbps() { return averageDouble(iterationResults, r -> mbPerSec(r.arrowSizeBytes(), r.totalNanos())); }
         private double minEndToEndMbps() { return extremumDouble(iterationResults, r -> mbPerSec(r.arrowSizeBytes(), r.totalNanos()), true); }
         private double maxEndToEndMbps() { return extremumDouble(iterationResults, r -> mbPerSec(r.arrowSizeBytes(), r.totalNanos()), false); }
+        private boolean anyHdfsPrepareExecuted() { return iterationResults.stream().anyMatch(r -> !r.hdfsPrepareSkipped()); }
+        private boolean anyHdfsUploadExecuted() { return iterationResults.stream().anyMatch(r -> !r.hdfsUploadSkipped()); }
         private boolean anyBulkLoadExecuted() { return iterationResults.stream().anyMatch(r -> !r.bulkLoadSkipped()); }
         private boolean anyVerifyExecuted() { return iterationResults.stream().anyMatch(r -> !r.verifySkipped()); }
 
@@ -1164,6 +1359,8 @@ public final class BulkLoadPerfRunner {
             builder.append("  \"aggregate\": {\n");
             builder.append("    \"avg_generate_ms\": ").append(formatDouble(averageGenerateMs())).append(",\n");
             builder.append("    \"avg_convert_ms\": ").append(formatDouble(averageConvertMs())).append(",\n");
+            builder.append("    \"avg_hdfs_prepare_ms\": ").append(anyHdfsPrepareExecuted() ? formatDouble(averageHdfsPrepareMs()) : "\"SKIPPED\"").append(",\n");
+            builder.append("    \"avg_hdfs_upload_ms\": ").append(anyHdfsUploadExecuted() ? formatDouble(averageHdfsUploadMs()) : "\"SKIPPED\"").append(",\n");
             builder.append("    \"avg_bulkload_ms\": ").append(anyBulkLoadExecuted() ? formatDouble(averageBulkLoadMs()) : "\"SKIPPED\"").append(",\n");
             builder.append("    \"avg_verify_ms\": ").append(anyVerifyExecuted() ? formatDouble(averageVerifyMs()) : "\"SKIPPED\"").append(",\n");
             builder.append("    \"avg_e2e_ms\": ").append(formatDouble(averageTotalMs())).append(",\n");
