@@ -198,6 +198,12 @@ public class ArrowToHFileConverter {
             return;
         }
 
+        // ── Batch mode: --batch-dir takes priority over single-file mode ──────
+        if (cmd.hasOption("batch-dir")) {
+            runBatchMode(cmd);
+            return;
+        }
+
         // ── Validate required arguments ────────────────────────────────────
         String[] required = {"arrow", "hfile", "rule"};
         for (String r : required) {
@@ -323,25 +329,171 @@ public class ArrowToHFileConverter {
         }
     }
 
+    // ── Batch mode ────────────────────────────────────────────────────────────
+
+    private static void runBatchMode(CommandLine cmd) {
+        if (!cmd.hasOption("rule")) {
+            System.err.println("Error: --rule is required in batch mode.");
+            System.exit(1); return;
+        }
+        if (!cmd.hasOption("batch-hfile-dir")) {
+            System.err.println("Error: --batch-hfile-dir is required in batch mode.");
+            System.exit(1); return;
+        }
+
+        Path arrowDir  = Paths.get(cmd.getOptionValue("batch-dir"));
+        Path hfileDir  = Paths.get(cmd.getOptionValue("batch-hfile-dir"));
+        String rule    = cmd.getOptionValue("rule");
+        String table   = cmd.getOptionValue("table", "");
+        String nativeLib = cmd.getOptionValue("native-lib");
+        String cf          = cmd.getOptionValue("cf",           "cf");
+        String compression = cmd.getOptionValue("compression",  "lz4");
+        String encoding    = cmd.getOptionValue("encoding",     "FAST_DIFF");
+        String bloomType   = cmd.getOptionValue("bloom",        "row");
+        String errorPolicy = cmd.getOptionValue("error-policy", "skip_row");
+        int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
+        int    parallelism = parseInt(cmd.getOptionValue("parallelism",
+            String.valueOf(Runtime.getRuntime().availableProcessors())),
+            Runtime.getRuntime().availableProcessors());
+        boolean skipExisting = cmd.hasOption("skip-existing");
+
+        // ── Adaptive strategy parameters ──────────────────────────────────────
+        long mergeThresholdMib      = parseLong(cmd.getOptionValue("merge-threshold", "100"), 100);
+        long triggerSizeMib         = parseLong(cmd.getOptionValue("trigger-size",    "512"), 512);
+        int  triggerCount           = parseInt (cmd.getOptionValue("trigger-count",   "500"), 500);
+        long triggerIntervalSeconds = parseLong(cmd.getOptionValue("trigger-interval","180"), 180);
+        Path mergeTmpDir = cmd.hasOption("merge-tmp-dir")
+            ? Paths.get(cmd.getOptionValue("merge-tmp-dir")) : null;
+
+        if (!Files.isDirectory(arrowDir)) {
+            System.err.println("Error: --batch-dir is not a directory: " + arrowDir);
+            System.exit(1); return;
+        }
+
+        BatchConvertOptions.Builder b = BatchConvertOptions.builder()
+            .arrowDir(arrowDir)
+            .hfileDir(hfileDir)
+            .tableName(table)
+            .rowKeyRule(rule)
+            .columnFamily(cf)
+            .compression(compression)
+            .dataBlockEncoding(encoding)
+            .bloomType(bloomType)
+            .errorPolicy(errorPolicy)
+            .blockSize(blockSize)
+            .parallelism(parallelism)
+            .skipExisting(skipExisting)
+            .nativeLibPath(nativeLib);
+
+        if (cmd.hasOption("exclude-cols")) {
+            b.excludedColumns(java.util.Arrays.stream(
+                cmd.getOptionValue("exclude-cols").split(","))
+                .map(String::trim).filter(s -> !s.isEmpty()).toList());
+        }
+        if (cmd.hasOption("exclude-prefix")) {
+            b.excludedColumnPrefixes(java.util.Arrays.stream(
+                cmd.getOptionValue("exclude-prefix").split(","))
+                .map(String::trim).filter(s -> !s.isEmpty()).toList());
+        }
+
+        BatchConvertOptions opts = b.build();
+
+        AdaptiveBatchConverter.Policy policy = AdaptiveBatchConverter.Policy.builder()
+            .mergeThresholdMib(mergeThresholdMib)
+            .triggerSizeMib(triggerSizeMib)
+            .triggerCount(triggerCount)
+            .triggerIntervalSeconds(triggerIntervalSeconds)
+            .mergeTmpDir(mergeTmpDir)
+            .build();
+
+        System.out.printf(
+            "Batch mode (adaptive)%n" +
+            "  arrow-dir       : %s%n  hfile-dir       : %s%n" +
+            "  table           : %s%n  rule            : %s%n" +
+            "  parallelism     : %d%n  merge-threshold : %dMiB%n" +
+            "  trigger-size    : %dMiB%n  trigger-count   : %d%n" +
+            "  trigger-interval: %ds%n",
+            arrowDir, hfileDir,
+            table.isBlank() ? "(none)" : table, rule,
+            parallelism, mergeThresholdMib,
+            triggerSizeMib, triggerCount, triggerIntervalSeconds);
+
+        // Load native library before anything else
+        try {
+            NativeLibLoader.load(nativeLib);
+        } catch (NativeLibLoadException e) {
+            System.err.println("Error loading native lib: " + e.getMessage());
+            System.exit(2); return;
+        }
+
+        try {
+            BatchConvertResult batch = new AdaptiveBatchConverter().convertAll(opts, policy);
+            if (batch.isFullSuccess()) {
+                System.out.println("\nAll conversions completed successfully.");
+                if (batch.totalElapsedMs > 0) {
+                    System.out.printf("Overall throughput: %.1f MB/s%n",
+                        batch.totalHfileSizeBytes / 1024.0 / 1024.0 /
+                        (batch.totalElapsedMs / 1000.0));
+                }
+            } else {
+                System.err.printf("%n%d batch(es) failed.%n", batch.failed.size());
+                System.exit(3);
+            }
+        } catch (Exception e) {
+            System.err.println("Batch error: " + e.getMessage());
+            e.printStackTrace();
+            System.exit(1);
+        }
+    }
+
     // ── CLI helpers ────────────────────────────────────────────────────────────
 
     private static Options buildCliOptions() {
         Options o = new Options();
 
-        // Required
+        // ── 单文件模式（与批量模式互斥）──────────────────────────────────────
         o.addOption(Option.builder().longOpt("arrow")
-            .desc("Path to the Arrow IPC Stream input file  [required]")
+            .desc("Path to the Arrow IPC Stream input file  [required for single-file mode]")
             .hasArg().argName("PATH").build());
         o.addOption(Option.builder().longOpt("hfile")
-            .desc("Path for the output HFile v3 file        [required]")
+            .desc("Path for the output HFile v3 file        [required for single-file mode]")
             .hasArg().argName("PATH").build());
-        o.addOption(Option.builder().longOpt("rule")
+
+        // ── 批量模式 ──────────────────────────────────────────────────────────
+        o.addOption(Option.builder().longOpt("batch-dir")
+            .desc("Directory containing *.arrow files        [enables batch mode]")
+            .hasArg().argName("DIR").build());
+        o.addOption(Option.builder().longOpt("batch-hfile-dir")
+            .desc("Output directory for HFile files in batch mode  [required with --batch-dir]")
+            .hasArg().argName("DIR").build());
+        o.addOption(Option.builder().longOpt("parallelism")
+            .desc("Concurrent conversions in batch mode     [default: CPU count]")
+            .hasArg().argName("N").build());
+        o.addOption(Option.builder().longOpt("skip-existing")
+            .desc("Skip Arrow files whose HFile output already exists").build());
+
+        // ── 自适应策略参数 ─────────────────────────────────────────────────────
+        o.addOption(Option.builder().longOpt("merge-threshold")
+            .desc("Avg file size threshold in MiB. Below this → merge strategy. [default: 100]")
+            .hasArg().argName("MiB").build());
+        o.addOption(Option.builder().longOpt("trigger-size")
+            .desc("Merge batch trigger: accumulated size in MiB.    [default: 512]")
+            .hasArg().argName("MiB").build());
+        o.addOption(Option.builder().longOpt("trigger-count")
+            .desc("Merge batch trigger: accumulated file count.      [default: 500]")
+            .hasArg().argName("N").build());
+        o.addOption(Option.builder().longOpt("trigger-interval")
+            .desc("Merge batch trigger: elapsed seconds (time fence). [default: 180]")
+            .hasArg().argName("SEC").build());
+        o.addOption(Option.builder().longOpt("merge-tmp-dir")
+            .desc("Temp dir for merged Arrow files.  [default: system temp]")
+            .hasArg().argName("DIR").build());
+
+        o.addOption(Option.builder().longOpt("exclude-cols")
             .desc("Row Key rule expression                  [required]\n" +
                   "  Format: \"name,index,isReverse,padLen[,padMode][,padContent]#...\"\n" +
-                  "  Example: \"STARTTIME,0,false,10#IMSI,1,true,15\"")
+                  "  Example: \"REFID,0,false,15\"")
             .hasArg().argName("RULE").build());
-
-        // Optional — common
         o.addOption(Option.builder().longOpt("table")
             .desc("HBase table name (for logging)           [default: (empty)]")
             .hasArg().argName("NAME").build());
@@ -351,8 +503,6 @@ public class ArrowToHFileConverter {
         o.addOption(Option.builder().longOpt("native-lib")
             .desc("Absolute path to libhfilesdk.so/.dll     [default: from env/library.path]")
             .hasArg().argName("PATH").build());
-
-        // Optional — HFile tuning
         o.addOption(Option.builder().longOpt("compression")
             .desc("Compression: none|lz4|zstd|snappy|gzip  [default: lz4]")
             .hasArg().argName("ALG").build());
@@ -371,21 +521,14 @@ public class ArrowToHFileConverter {
         o.addOption(Option.builder().longOpt("error-policy")
             .desc("Row errors: strict|skip_row|skip_batch   [default: skip_row]")
             .hasArg().argName("POLICY").build());
-
-        o.addOption(Option.builder().longOpt("help")
-            .desc("Print this help message").build());
-
-        // Column exclusion
         o.addOption(Option.builder().longOpt("exclude-cols")
-            .desc("Comma-separated column names to exclude from HBase output.\n" +
-                  "  Example: --exclude-cols _hoodie_commit_time,_hoodie_file_name\n" +
-                  "  Does NOT affect row key column indices.")
+            .desc("Comma-separated column names to exclude from HBase output.")
             .hasArg().argName("COL1,COL2,...").build());
         o.addOption(Option.builder().longOpt("exclude-prefix")
-            .desc("Comma-separated column name prefixes to exclude.\n" +
-                  "  Example: --exclude-prefix _hoodie  (drops all 5 Hudi meta columns)\n" +
-                  "  Does NOT affect row key column indices.")
+            .desc("Comma-separated column name prefixes to exclude.")
             .hasArg().argName("PFX1,PFX2,...").build());
+        o.addOption(Option.builder().longOpt("help")
+            .desc("Print this help message").build());
 
         return o;
     }
@@ -394,30 +537,31 @@ public class ArrowToHFileConverter {
         System.out.println();
         new HelpFormatter().printHelp(
             "java -jar arrow-to-hfile-4.0.0.jar",
-            "\nConvert an Arrow IPC Stream file to HBase HFile v3 via HFileSDK.\n\n",
+            "\nConvert Arrow IPC Stream file(s) to HBase HFile v3.\n\n",
             options,
-            "\nExamples:\n" +
-            "  # Basic conversion:\n" +
+            "\nExamples:\n\n" +
+            "  # Single-file conversion:\n" +
             "  java -jar arrow-to-hfile-4.0.0.jar \\\n" +
-            "    --native-lib /opt/hfilesdk/libhfilesdk.so \\\n" +
-            "    --arrow /data/events.arrow \\\n" +
-            "    --hfile /staging/cf/events.hfile \\\n" +
-            "    --rule  \"STARTTIME,0,false,10#IMSI,1,true,15\"\n\n" +
-            "  # Hudi / DeltaLake: drop _hoodie_* metadata columns:\n" +
+            "    --native-lib ./libhfilesdk.so \\\n" +
+            "    --arrow /data/tdr_20550.arrow \\\n" +
+            "    --hfile /staging/job_20550/cf/tdr_20550.hfile \\\n" +
+            "    --rule  \"REFID,0,false,15\"\n\n" +
+            "  # Batch conversion (all *.arrow in a directory, 4 threads):\n" +
             "  java -jar arrow-to-hfile-4.0.0.jar \\\n" +
-            "    --native-lib /opt/hfilesdk/libhfilesdk.so \\\n" +
-            "    --arrow  /data/hudi_events.arrow \\\n" +
-            "    --hfile  /staging/cf/events.hfile \\\n" +
-            "    --rule   \"STARTTIME,0,false,10#IMSI,1,true,15\" \\\n" +
-            "    --exclude-prefix _hoodie\n\n" +
-            "  Hudi original schema:  [0]_hoodie_commit_time ... [4]_hoodie_file_name [5]STARTTIME [6]IMSI\n" +
-            "  After --exclude-prefix _hoodie: [0]STARTTIME [1]IMSI ...\n" +
-            "  So --rule uses index 0 for STARTTIME, 1 for IMSI — no offset needed.\n",
+            "    --native-lib ./libhfilesdk.so \\\n" +
+            "    --batch-dir      /data/arrow/ \\\n" +
+            "    --batch-hfile-dir /staging/job_20550/cf/ \\\n" +
+            "    --rule       \"REFID,0,false,15\" \\\n" +
+            "    --table      tdr_signal_stor_20550 \\\n" +
+            "    --parallelism 4\n\n" +
+            "  # Then bulk load all HFiles in one shot:\n" +
+            "  hdfs dfs -mkdir -p /hbase/staging/job_20550/cf/\n" +
+            "  hdfs dfs -put /staging/job_20550/cf/*.hfile /hbase/staging/job_20550/cf/\n" +
+            "  hbase org.apache.hadoop.hbase.tool.BulkLoadHFilesTool \\\n" +
+            "        /hbase/staging/job_20550 tdr_signal_stor_20550\n",
             true);
     }
 
-    private static int parseInt(String s, int defaultValue) {
-        try { return Integer.parseInt(s); }
-        catch (NumberFormatException e) { return defaultValue; }
-    }
+    private static int  parseInt (String s, int  def) { try { return Integer.parseInt(s.trim());  } catch (Exception e) { return def; } }
+    private static long parseLong (String s, long def) { try { return Long.parseLong(s.trim());    } catch (Exception e) { return def; } }
 }

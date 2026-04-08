@@ -72,9 +72,7 @@ package com.hfile;
 public class HFileSDK {
 
     static {
-        if (!Boolean.getBoolean("hfilesdk.native.loaded")) {
-            System.loadLibrary("hfilesdk");
-        }
+        System.loadLibrary("hfilesdk");
     }
 
     // ── Error codes (mirror hfile::ErrorCode in convert_options.h) ──────────
@@ -208,10 +206,7 @@ public class HFileSDK {
                 "{\"compression\":\"%s\",\"block_size\":%d," +
                 "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\"}",
                 compression, blockSize, columnFamily, dataBlockEncoding);
-            int rc = sdk.configure(cfg);
-            if (rc != OK) {
-                throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());
-            }
+            sdk.configure(cfg);
             return sdk;
         }
     }

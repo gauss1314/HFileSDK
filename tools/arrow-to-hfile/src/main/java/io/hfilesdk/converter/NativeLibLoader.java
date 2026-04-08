@@ -121,9 +121,18 @@ public final class NativeLibLoader {
 
         String absolutePath = file.getAbsolutePath();
 
+        // Step A: System.load() — loads the .so by absolute path.
+        // The JVM's native library deduplication uses canonical paths, so a
+        // subsequent System.loadLibrary("hfilesdk") from the same ClassLoader
+        // that resolves to the same file will be a no-op.
         System.load(absolutePath);
-        System.setProperty("hfilesdk.native.loaded", "true");
 
+        // Step B: Append the directory to the JVM's internal usr_paths list so
+        // that System.loadLibrary("hfilesdk") in HFileSDK's static block succeeds.
+        // This uses reflection on ClassLoader's private field — requires
+        //   --add-opens java.base/java.lang=ALL-UNNAMED
+        // which the fat jar sets via MANIFEST.MF Add-Opens, and the shell scripts
+        // pass explicitly.
         String dir = file.getParent();
         if (dir != null) {
             appendToUsrPaths(dir);
