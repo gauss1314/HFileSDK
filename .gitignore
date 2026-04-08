@@ -26,3 +26,5 @@ build/
 build-*/
 .conda-hfilesdk
 data/
+.release*
+release/

@@ -3,9 +3,11 @@ package io.hfilesdk.converter;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
-import org.apache.arrow.vector.util.VectorBatchAppender;
+import org.apache.arrow.vector.VectorLoader;
+import org.apache.arrow.vector.VectorUnloader;
 
 import java.io.*;
 import java.nio.channels.Channels;
@@ -20,7 +22,7 @@ import java.util.List;
  *   <li>逐个读取每个输入文件，每次一个 RecordBatch，追加到输出文件</li>
  *   <li>所有输入文件必须具有相同的 Arrow Schema（列名、类型完全一致）</li>
  *   <li>内存占用：固定上限 ≈ 1 个 RecordBatch（通常几MB~几十MB），与输入总大小无关</li>
- *   <li>零拷贝：Arrow 列数据通过 {@link VectorBatchAppender} 直接追加，不做类型转换</li>
+ *   <li>不做类型转换：每个 RecordBatch 按原始 Arrow Schema 原样写入输出文件</li>
  * </ul>
  *
  * <h3>使用示例</h3>
@@ -71,67 +73,51 @@ public final class ArrowFileMerger {
         Path tmpPath = outputPath.resolveSibling(outputPath.getFileName() + ".tmp");
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE)) {
-            // ── Step 1: read schema from the first file ──────────────────────
-            // Open all readers; the schema must match across files.
-            // We open readers lazily (one at a time) to avoid holding too many
-            // file descriptors — but we read the first one's schema up front
-            // to initialise the writer.
-
-            long totalRows = 0;
-
             try (OutputStream fos = new BufferedOutputStream(
                      Files.newOutputStream(tmpPath), 256 * 1024);
-                 // Use the first file to bootstrap the VectorSchemaRoot + writer
                  ArrowStreamReader firstReader = new ArrowStreamReader(
                      new BufferedInputStream(Files.newInputStream(inputFiles.get(0))),
-                     allocator);
-                 VectorSchemaRoot root = firstReader.getVectorSchemaRoot()) {
+                     allocator)) {
+                var expectedSchema = firstReader.getVectorSchemaRoot().getSchema();
 
-                ArrowStreamWriter writer = new ArrowStreamWriter(
-                    root, /*DictionaryProvider=*/null,
-                    Channels.newChannel(fos));
-                writer.start();
+                try (VectorSchemaRoot outputRoot = VectorSchemaRoot.create(expectedSchema, allocator);
+                     ArrowStreamWriter writer = new ArrowStreamWriter(
+                         outputRoot, null, Channels.newChannel(fos))) {
+                    VectorLoader loader = new VectorLoader(outputRoot);
 
-                // ── Step 2: drain first file ──────────────────────────────────
-                while (firstReader.loadNextBatch()) {
-                    if (root.getRowCount() > 0) {
-                        writer.writeBatch();
-                        totalRows += root.getRowCount();
-                    }
-                }
+                    writer.start();
 
-                // ── Step 3: drain remaining files ──────────────────────────────
-                for (int i = 1; i < inputFiles.size(); i++) {
-                    Path file = inputFiles.get(i);
-                    try (ArrowStreamReader reader = new ArrowStreamReader(
-                             new BufferedInputStream(Files.newInputStream(file)),
-                             allocator)) {
-
-                        // Schema compatibility check
-                        VectorSchemaRoot fileRoot = reader.getVectorSchemaRoot();
-                        if (!schemasCompatible(root.getSchema(), fileRoot.getSchema())) {
-                            throw new IOException(
-                                "Schema mismatch: file[0] schema differs from " +
-                                file.getFileName() + ".\n" +
-                                "  Expected: " + root.getSchema() + "\n" +
-                                "  Got:      " + fileRoot.getSchema());
-                        }
-
-                        while (reader.loadNextBatch()) {
-                            if (fileRoot.getRowCount() <= 0) continue;
-
-                            // Copy each column from fileRoot → root, then write
-                            VectorBatchAppender.batchAppend(root, fileRoot);
-                            root.setRowCount(fileRoot.getRowCount());
-                            writer.writeBatch();
-                            totalRows += fileRoot.getRowCount();
-                            root.clear();
+                    while (firstReader.loadNextBatch()) {
+                        VectorSchemaRoot batchRoot = firstReader.getVectorSchemaRoot();
+                        if (batchRoot.getRowCount() > 0) {
+                            writeBatch(batchRoot, loader, outputRoot, writer);
                         }
                     }
-                }
 
-                writer.end();
-                writer.close();
+                    for (int i = 1; i < inputFiles.size(); i++) {
+                        Path file = inputFiles.get(i);
+                        try (ArrowStreamReader reader = new ArrowStreamReader(
+                                 new BufferedInputStream(Files.newInputStream(file)),
+                                 allocator)) {
+                            VectorSchemaRoot fileRoot = reader.getVectorSchemaRoot();
+                            if (!schemasCompatible(expectedSchema, fileRoot.getSchema())) {
+                                throw new IOException(
+                                    "Schema mismatch: file[0] schema differs from " +
+                                    file.getFileName() + ".\n" +
+                                    "  Expected: " + expectedSchema + "\n" +
+                                    "  Got:      " + fileRoot.getSchema());
+                            }
+
+                            while (reader.loadNextBatch()) {
+                                if (fileRoot.getRowCount() > 0) {
+                                    writeBatch(fileRoot, loader, outputRoot, writer);
+                                }
+                            }
+                        }
+                    }
+
+                    writer.end();
+                }
             }
         }
 
@@ -158,6 +144,18 @@ public final class ArrowFileMerger {
             if (!fa.getType().equals(fb.getType()))  return false;
         }
         return true;
+    }
+
+    private static void writeBatch(
+            VectorSchemaRoot batchRoot,
+            VectorLoader loader,
+            VectorSchemaRoot outputRoot,
+            ArrowStreamWriter writer) throws IOException {
+        try (ArrowRecordBatch batch = new VectorUnloader(batchRoot).getRecordBatch()) {
+            loader.load(batch);
+        }
+        outputRoot.setRowCount(batchRoot.getRowCount());
+        writer.writeBatch();
     }
 
     /**
