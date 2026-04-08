@@ -6,6 +6,7 @@
 - `test.sh`：本地标准测试入口，执行 `cmake` 配置、构建，再运行 `ctest --output-on-failure`
 - `coverage.sh`：覆盖率入口，按 OS 类型探测并发数，生成 `llvm-cov` 文本摘要与 HTML 报表；默认排除时间敏感的 `hfile_chaos_kill`
 - `bench-runner.sh`：基准与可选 HBase bulk load 流水线；会按 Linux/macOS 自动切换模式，在无 `taskset` 时退化为普通执行，找不到 `google-benchmark` 时给出提示并跳过
+- `hfile-bulkload-perf-runner.sh`：集群环境下的 bulkload perf 包装入口，可选执行 `source` + `kinit`，然后调用 `tools/hfile-bulkload-perf` fat jar
 - Windows 下同样使用上述 `.sh` 脚本；请在 MSYS2 `CLANG64` Shell 中通过 `bash scripts/*.sh` 执行
 
 ## 常用命令
@@ -17,6 +18,7 @@ bash scripts/build.sh
 bash scripts/test.sh
 bash scripts/coverage.sh
 bash scripts/bench-runner.sh --skip-hbase --skip-java --iterations 1
+bash scripts/hfile-bulkload-perf-runner.sh --help
 ```
 
 Windows + MSYS2 `CLANG64`:
@@ -26,6 +28,7 @@ bash scripts/build.sh
 bash scripts/test.sh
 bash scripts/coverage.sh
 bash scripts/bench-runner.sh --skip-hbase --skip-java --iterations 1
+bash scripts/hfile-bulkload-perf-runner.sh --help
 ```
 
 ## 常用参数

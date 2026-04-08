@@ -25,6 +25,32 @@ mvn -q -f tools/arrow-to-hfile/pom.xml -DskipTests install
 mvn -q -f tools/hfile-bulkload-perf/pom.xml -DskipTests package
 ```
 
+## 集群脚本入口
+
+如果你需要按集群上的实际操作流程执行，可以直接使用仓库脚本：
+
+```bash
+bash scripts/hfile-bulkload-perf-runner.sh \
+  --env-script /opt/client/bigdata_env \
+  --principal ossuser \
+  --keytab /opt/client/keytab/ossuser.keytab \
+  --native-lib ./release/libhfilesdk.so \
+  --table tdr_signal_stor_20550 \
+  --hdfs-staging-dir /hbase/staging/job_20550 \
+  -- \
+  --cf cf \
+  --arrow-file-count 8 \
+  --target-size-mb 256 \
+  --parallelism 4
+```
+
+这个脚本会顺序执行：
+
+- `source /opt/client/bigdata_env`
+- `kinit -kt <keytab> <principal>`
+- 调用 `hfile-bulkload-perf` fat jar
+- 由 perf 工具内部完成 Arrow 生成、Arrow→HFile、自适应分流、HDFS staging 创建、HFile 上传与 BulkLoad
+
 ## 大文件场景
 
 单个 Arrow 文件大于等于 `100MB` 时，转换阶段会自动选择并行策略：
