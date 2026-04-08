@@ -1,6 +1,9 @@
 package io.hfilesdk.perf;
 
-import com.hfile.HFileSDK;
+import io.hfilesdk.converter.AdaptiveBatchConverter;
+import io.hfilesdk.converter.BatchConvertOptions;
+import io.hfilesdk.converter.BatchConvertResult;
+import io.hfilesdk.converter.ConvertResult;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
 import org.apache.arrow.vector.BigIntVector;
@@ -27,14 +30,20 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
 public final class BulkLoadPerfRunner {
 
     private static final int DEFAULT_ITERATIONS = 1;
+    private static final int DEFAULT_ARROW_FILE_COUNT = 1;
     private static final int DEFAULT_TARGET_SIZE_MB = 1024;
     private static final int DEFAULT_BATCH_ROWS = 8192;
     private static final int DEFAULT_PAYLOAD_BYTES = 768;
+    private static final int DEFAULT_MERGE_THRESHOLD_MB = 100;
+    private static final int DEFAULT_TRIGGER_SIZE_MB = 512;
+    private static final int DEFAULT_TRIGGER_COUNT = 500;
+    private static final int DEFAULT_TRIGGER_INTERVAL_SECONDS = 180;
     private static final String DEFAULT_RULE = "USER_ID,0,false,0#long(),1,false,0";
     private static final String DEFAULT_CF = "cf";
     private static final String DEFAULT_COMPRESSION = "lz4";
@@ -46,6 +55,8 @@ public final class BulkLoadPerfRunner {
     private static final String DEFAULT_HBASE_BIN = "hbase";
     private static final String DEFAULT_WORK_DIR = "/tmp/hfilesdk-bulkload-perf";
     private static final String DEFAULT_BULKLOAD_DIR = "/tmp/hbase_bulkload";
+    private static final String DEFAULT_STRATEGY_PARALLEL = "PARALLEL-CONVERT";
+    private static final String DEFAULT_STRATEGY_MERGE = "MERGE-THEN-CONVERT";
     private static final Path DEFAULT_VERIFY_JAR = Path.of(
         "tools", "hfile-bulkload-verify", "target", "hfile-bulkload-verify-1.0.0.jar"
     ).toAbsolutePath().normalize();
@@ -56,7 +67,7 @@ public final class BulkLoadPerfRunner {
     private BulkLoadPerfRunner() {}
 
     public static void main(String[] args) throws Exception {
-        if (ensureJavaNioOpen(args)) {
+        if (ensureRequiredOpens(args)) {
             return;
         }
 
@@ -91,7 +102,9 @@ public final class BulkLoadPerfRunner {
         Throwable failure = null;
         try {
             Files.createDirectories(config.workDir());
-            Files.createDirectories(config.reportJson().getParent());
+            if (config.reportJson().getParent() != null) {
+                Files.createDirectories(config.reportJson().getParent());
+            }
             if (!config.skipBulkLoad()) {
                 TableCheckStats tableCheckStats = checkTableExists(config);
                 if (!tableCheckStats.success()) {
@@ -134,8 +147,8 @@ public final class BulkLoadPerfRunner {
         long totalStart = System.nanoTime();
         try {
             prepareDirectories(config);
-            generationStats = generateArrowFile(config);
-            conversionStats = convertToHFile(config);
+            generationStats = generateArrowFiles(config);
+            conversionStats = convertToHFiles(config, generationStats);
             if (!conversionStats.success()) {
                 throw new IllegalStateException(conversionStats.errorMessage());
             }
@@ -162,8 +175,11 @@ public final class BulkLoadPerfRunner {
             failure == null ? "" : messageOf(failure),
             generationStats.rows(),
             generationStats.batches(),
-            Files.exists(config.arrowPath()) ? Files.size(config.arrowPath()) : 0L,
-            Files.exists(config.hfilePath()) ? Files.size(config.hfilePath()) : 0L,
+            generationStats.arrowFileCount(),
+            conversionStats.generatedHfileCount(),
+            conversionStats.strategy(),
+            generationStats.arrowSizeBytes(),
+            conversionStats.totalHfileSizeBytes(),
             generationStats.elapsedNanos(),
             conversionStats.elapsedNanos(),
             bulkLoadStats.elapsedNanos(),
@@ -177,7 +193,7 @@ public final class BulkLoadPerfRunner {
             verifyStats.command(),
             verifyStats.exitCode(),
             verifyStats.output(),
-            conversionStats.sdkResultJson()
+            conversionStats.resultJson()
         );
         writeIterationReport(result);
         return result;
@@ -190,7 +206,13 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("work-dir").hasArg().argName("PATH").desc("Arrow 文件与报告输出目录").build());
         options.addOption(Option.builder().longOpt("bulkload-dir").hasArg().argName("PATH").desc("BulkLoad HFile staging 目录").build());
         options.addOption(Option.builder().longOpt("iterations").hasArg().argName("N").desc("完整端到端执行轮数，默认 1").build());
-        options.addOption(Option.builder().longOpt("target-size-mb").hasArg().argName("MB").desc("目标 Arrow 文件大小，默认 1024").build());
+        options.addOption(Option.builder().longOpt("arrow-file-count").hasArg().argName("N").desc("生成的 Arrow 文件数量，默认 1").build());
+        options.addOption(Option.builder().longOpt("target-size-mb").hasArg().argName("MB").desc("每个 Arrow 文件目标大小，默认 1024").build());
+        options.addOption(Option.builder().longOpt("parallelism").hasArg().argName("N").desc("大文件并行转换线程数，默认 CPU 核数").build());
+        options.addOption(Option.builder().longOpt("merge-threshold").hasArg().argName("MB").desc("单文件平均大小小于该阈值时先合并再转换，默认 100").build());
+        options.addOption(Option.builder().longOpt("trigger-size").hasArg().argName("MB").desc("小文件合并策略的攒批大小阈值，默认 512").build());
+        options.addOption(Option.builder().longOpt("trigger-count").hasArg().argName("N").desc("小文件合并策略的攒批文件数阈值，默认 500").build());
+        options.addOption(Option.builder().longOpt("trigger-interval").hasArg().argName("SEC").desc("小文件合并策略的时间阈值，默认 180").build());
         options.addOption(Option.builder().longOpt("batch-rows").hasArg().argName("N").desc("每个 Arrow batch 的行数，默认 8192").build());
         options.addOption(Option.builder().longOpt("payload-bytes").hasArg().argName("BYTES").desc("每行 PAYLOAD 列长度，默认 768").build());
         options.addOption(Option.builder().longOpt("cf").hasArg().argName("CF").desc("列族名，默认 cf").build());
@@ -206,8 +228,8 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("verify-jar").hasArg().argName("PATH").desc("BulkLoad 校验工具 jar 路径").build());
         options.addOption(Option.builder().longOpt("zookeeper").hasArg().argName("HOST:PORT").desc("BulkLoad 校验用 ZooKeeper 地址").build());
         options.addOption(Option.builder().longOpt("report-json").hasArg().argName("PATH").desc("性能报告 JSON 路径").build());
-        options.addOption(Option.builder().longOpt("skip-bulkload").desc("仅生成 Arrow 并完成 JNI 转换，不执行 BulkLoad").build());
-        options.addOption(Option.builder().longOpt("keep-generated-files").desc("保留 Arrow 文件与 staging HFile").build());
+        options.addOption(Option.builder().longOpt("skip-bulkload").desc("仅生成 Arrow 并完成 HFile 转换，不执行 BulkLoad").build());
+        options.addOption(Option.builder().longOpt("keep-generated-files").desc("保留 Arrow 文件、merge 临时文件与 staging HFile").build());
         options.addOption(Option.builder().longOpt("help").desc("显示帮助").build());
         return options;
     }
@@ -218,7 +240,13 @@ public final class BulkLoadPerfRunner {
         Path workDir = Path.of(cmd.getOptionValue("work-dir", DEFAULT_WORK_DIR)).toAbsolutePath().normalize();
         Path bulkloadDir = Path.of(cmd.getOptionValue("bulkload-dir", DEFAULT_BULKLOAD_DIR)).toAbsolutePath().normalize();
         int iterations = parsePositiveInt(cmd.getOptionValue("iterations", Integer.toString(DEFAULT_ITERATIONS)), "iterations");
+        int arrowFileCount = parsePositiveInt(cmd.getOptionValue("arrow-file-count", Integer.toString(DEFAULT_ARROW_FILE_COUNT)), "arrow-file-count");
         int targetSizeMb = parsePositiveInt(cmd.getOptionValue("target-size-mb", Integer.toString(DEFAULT_TARGET_SIZE_MB)), "target-size-mb");
+        int parallelism = parsePositiveInt(cmd.getOptionValue("parallelism", Integer.toString(Runtime.getRuntime().availableProcessors())), "parallelism");
+        int mergeThresholdMb = parsePositiveInt(cmd.getOptionValue("merge-threshold", Integer.toString(DEFAULT_MERGE_THRESHOLD_MB)), "merge-threshold");
+        int triggerSizeMb = parsePositiveInt(cmd.getOptionValue("trigger-size", Integer.toString(DEFAULT_TRIGGER_SIZE_MB)), "trigger-size");
+        int triggerCount = parsePositiveInt(cmd.getOptionValue("trigger-count", Integer.toString(DEFAULT_TRIGGER_COUNT)), "trigger-count");
+        int triggerIntervalSeconds = parsePositiveInt(cmd.getOptionValue("trigger-interval", Integer.toString(DEFAULT_TRIGGER_INTERVAL_SECONDS)), "trigger-interval");
         int batchRows = parsePositiveInt(cmd.getOptionValue("batch-rows", Integer.toString(DEFAULT_BATCH_ROWS)), "batch-rows");
         int payloadBytes = parsePositiveInt(cmd.getOptionValue("payload-bytes", Integer.toString(DEFAULT_PAYLOAD_BYTES)), "payload-bytes");
         int blockSize = parsePositiveInt(cmd.getOptionValue("block-size", Integer.toString(DEFAULT_BLOCK_SIZE)), "block-size");
@@ -241,8 +269,9 @@ public final class BulkLoadPerfRunner {
         if (verifyBulkLoad && zookeeper.isBlank()) {
             throw new IllegalArgumentException("--verify-bulkload 时必须提供 --zookeeper");
         }
-        Path arrowPath = workDir.resolve(tableName + ".arrow");
-        Path hfilePath = bulkloadDir.resolve(columnFamily).resolve("part-00000.hfile");
+        Path arrowDir = workDir.resolve("arrow");
+        Path mergeTmpDir = workDir.resolve("merge-tmp");
+        Path hfileDir = bulkloadDir.resolve(columnFamily);
         Path reportJson = Path.of(cmd.getOptionValue("report-json", workDir.resolve(tableName + "-perf-report.json").toString()))
             .toAbsolutePath()
             .normalize();
@@ -253,13 +282,20 @@ public final class BulkLoadPerfRunner {
             bulkloadDir,
             iterations,
             1,
-            arrowPath,
-            hfilePath,
+            arrowDir,
+            mergeTmpDir,
+            hfileDir,
             reportJson,
+            arrowFileCount,
             targetSizeMb,
             batchRows,
             payloadBytes,
             blockSize,
+            parallelism,
+            mergeThresholdMb,
+            triggerSizeMb,
+            triggerCount,
+            triggerIntervalSeconds,
             columnFamily,
             rowKeyRule,
             compression,
@@ -278,20 +314,53 @@ public final class BulkLoadPerfRunner {
 
     private static void prepareDirectories(RunConfig config) throws IOException {
         Files.createDirectories(config.workDir());
-        if (Files.exists(config.arrowPath())) {
-            Files.delete(config.arrowPath());
-        }
+        deleteRecursively(config.arrowDir());
+        deleteRecursively(config.mergeTmpDir());
         deleteRecursively(config.bulkloadDir());
-        Files.createDirectories(config.hfilePath().getParent());
-        Files.createDirectories(config.reportJson().getParent());
+        Files.createDirectories(config.arrowDir());
+        Files.createDirectories(config.mergeTmpDir());
+        Files.createDirectories(config.hfileDir());
+        if (config.reportJson().getParent() != null) {
+            Files.createDirectories(config.reportJson().getParent());
+        }
     }
 
-    private static GenerationStats generateArrowFile(RunConfig config) throws Exception {
+    private static GenerationStats generateArrowFiles(RunConfig config) throws Exception {
         long start = System.nanoTime();
-        long targetBytes = config.targetSizeMb() * 1024L * 1024L;
         byte[] payloadSuffix = buildPayloadSuffix(config.payloadBytes());
+        long totalRows = 0;
+        int totalBatches = 0;
+        long totalArrowSizeBytes = 0;
+        List<Path> arrowFiles = new ArrayList<>();
+        long nextRowOffset = 0;
+        for (int i = 0; i < config.arrowFileCount(); ++i) {
+            Path arrowFile = config.arrowDir().resolve(
+                String.format(Locale.ROOT, "%s-part-%05d.arrow", sanitize(config.tableName()), i + 1));
+            SingleFileGenerationStats fileStats = writeArrowFile(config, arrowFile, nextRowOffset, payloadSuffix);
+            arrowFiles.add(arrowFile);
+            totalRows += fileStats.rows();
+            totalBatches += fileStats.batches();
+            totalArrowSizeBytes += fileStats.sizeBytes();
+            nextRowOffset += fileStats.rows();
+        }
+        return new GenerationStats(
+            totalRows,
+            totalBatches,
+            arrowFiles.size(),
+            totalArrowSizeBytes,
+            List.copyOf(arrowFiles),
+            System.nanoTime() - start
+        );
+    }
+
+    private static SingleFileGenerationStats writeArrowFile(RunConfig config,
+                                                            Path arrowFile,
+                                                            long rowOffset,
+                                                            byte[] payloadSuffix) throws Exception {
+        long targetBytes = config.targetSizeMb() * 1024L * 1024L;
         long rows = 0;
         int batches = 0;
+        long eventBase = 1_775_000_000L;
 
         try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
              VarCharVector userIdVector = new VarCharVector("USER_ID", allocator);
@@ -311,14 +380,13 @@ public final class BulkLoadPerfRunner {
              ArrowStreamWriter writer = new ArrowStreamWriter(
                  root,
                  null,
-                 Channels.newChannel(Files.newOutputStream(config.arrowPath())))) {
+                 Channels.newChannel(Files.newOutputStream(arrowFile)))) {
 
             allocateVectors(config, userIdVector, eventTimeVector, deviceIdVector, regionVector, scoreVector, payloadVector);
             writer.start();
 
-            long eventBase = 1_775_000_000L;
-            while (!Files.exists(config.arrowPath()) || Files.size(config.arrowPath()) < targetBytes) {
-                fillBatch(config, rows, payloadSuffix, eventBase, userIdVector, eventTimeVector, deviceIdVector, regionVector, scoreVector, payloadVector);
+            while (!Files.exists(arrowFile) || Files.size(arrowFile) < targetBytes) {
+                fillBatch(config, rowOffset + rows, payloadSuffix, eventBase, userIdVector, eventTimeVector, deviceIdVector, regionVector, scoreVector, payloadVector);
                 root.setRowCount(config.batchRows());
                 writer.writeBatch();
                 rows += config.batchRows();
@@ -327,7 +395,7 @@ public final class BulkLoadPerfRunner {
             writer.end();
         }
 
-        return new GenerationStats(rows, batches, System.nanoTime() - start);
+        return new SingleFileGenerationStats(rows, batches, Files.size(arrowFile));
     }
 
     private static void allocateVectors(RunConfig config,
@@ -374,35 +442,51 @@ public final class BulkLoadPerfRunner {
         payloadVector.setValueCount(batchRows);
     }
 
-    private static ConversionStats convertToHFile(RunConfig config) {
+    private static ConversionStats convertToHFiles(RunConfig config, GenerationStats generationStats)
+            throws IOException, InterruptedException {
         long start = System.nanoTime();
-        NativeLibLoader.load(config.nativeLib());
-        HFileSDK sdk = new HFileSDK();
-        int configureRc = sdk.configure(buildConfigJson(config));
-        if (configureRc != HFileSDK.OK) {
-            long elapsed = System.nanoTime() - start;
-            return new ConversionStats(
-                elapsed,
-                sdk.getLastResult(),
-                configureRc,
-                false,
-                "configure failed: " + sdk.getLastResult()
-            );
-        }
-        int rc = sdk.convert(
-            config.arrowPath().toString(),
-            config.hfilePath().toString(),
-            config.tableName(),
-            config.rowKeyRule()
-        );
-        String sdkResultJson = sdk.getLastResult();
-        long elapsed = System.nanoTime() - start;
+        String strategy = decideStrategy(generationStats.arrowFiles(), config.mergeThresholdMb());
+        BatchConvertOptions options = BatchConvertOptions.builder()
+            .arrowFiles(generationStats.arrowFiles())
+            .hfileDir(config.hfileDir())
+            .tableName(config.tableName())
+            .rowKeyRule(config.rowKeyRule())
+            .columnFamily(config.columnFamily())
+            .compression(config.compression())
+            .dataBlockEncoding(config.encoding())
+            .bloomType(config.bloom())
+            .errorPolicy(config.errorPolicy())
+            .blockSize(config.blockSize())
+            .parallelism(config.parallelism())
+            .nativeLibPath(config.nativeLib())
+            .build();
+        AdaptiveBatchConverter.Policy policy = AdaptiveBatchConverter.Policy.builder()
+            .mergeThresholdMib(config.mergeThresholdMb())
+            .triggerSizeMib(config.triggerSizeMb())
+            .triggerCount(config.triggerCount())
+            .triggerIntervalSeconds(config.triggerIntervalSeconds())
+            .mergeTmpDir(config.mergeTmpDir())
+            .build();
+        BatchConvertResult batchResult = new AdaptiveBatchConverter().convertAll(options, policy);
+        boolean success = batchResult.isFullSuccess();
+        String errorMessage = success
+            ? ""
+            : "conversion failed for " + batchResult.failed.size() + " batch output(s): "
+                + batchResult.failed.stream()
+                    .map(path -> path.getFileName().toString())
+                    .sorted()
+                    .toList();
         return new ConversionStats(
-            elapsed,
-            sdkResultJson,
-            rc,
-            rc == HFileSDK.OK,
-            rc == HFileSDK.OK ? "" : "convert failed: " + sdkResultJson
+            System.nanoTime() - start,
+            batchConvertResultToJson(strategy, batchResult),
+            success,
+            errorMessage,
+            strategy,
+            batchResult.results.size(),
+            batchResult.succeeded.size(),
+            batchResult.failed.size(),
+            batchResult.totalKvWritten,
+            batchResult.totalHfileSizeBytes
         );
     }
 
@@ -497,13 +581,16 @@ public final class BulkLoadPerfRunner {
         System.out.println("Bulk load performance summary");
         System.out.println("  iteration             : " + iteration + "/" + totalIterations);
         System.out.println("  table                 : " + result.config().tableName());
-        System.out.println("  arrow_file            : " + result.config().arrowPath());
-        System.out.println("  hfile_path            : " + result.config().hfilePath());
+        System.out.println("  arrow_dir             : " + result.config().arrowDir());
+        System.out.println("  hfile_dir             : " + result.config().hfileDir());
         System.out.println("  report_json           : " + result.config().reportJson());
+        System.out.println("  strategy              : " + result.conversionStrategy());
+        System.out.println("  arrow_files           : " + result.arrowFileCount());
+        System.out.println("  generated_hfiles      : " + result.generatedHfileCount());
         System.out.println("  rows                  : " + result.rows());
         System.out.println("  batches               : " + result.batches());
-        System.out.println("  arrow_size_mb         : " + formatMiB(result.arrowSizeBytes()));
-        System.out.println("  hfile_size_mb         : " + formatMiB(result.hfileSizeBytes()));
+        System.out.println("  arrow_total_size_mb   : " + formatMiB(result.arrowSizeBytes()));
+        System.out.println("  hfile_total_size_mb   : " + formatMiB(result.hfileSizeBytes()));
         System.out.println("  status                : " + (result.success() ? "SUCCESS" : "FAILED"));
         System.out.println("  generate_ms           : " + nanosToMillis(result.generateNanos()));
         System.out.println("  convert_ms            : " + nanosToMillis(result.convertNanos()));
@@ -552,39 +639,15 @@ public final class BulkLoadPerfRunner {
         if (config.iterations() > 1) {
             for (int i = 1; i <= config.iterations(); ++i) {
                 RunConfig iterationConfig = config.forIteration(i);
-                deleteRecursively(iterationConfig.workDir());
+                deleteRecursively(iterationConfig.arrowDir());
+                deleteRecursively(iterationConfig.mergeTmpDir());
                 deleteRecursively(iterationConfig.bulkloadDir());
             }
             return;
         }
-        if (Files.exists(config.arrowPath())) {
-            Files.delete(config.arrowPath());
-        }
-        if (Files.exists(config.hfilePath())) {
-            Files.delete(config.hfilePath());
-        }
-        deleteEmptyParents(config.hfilePath().getParent(), config.bulkloadDir());
-    }
-
-    private static void deleteEmptyParents(Path path, Path stopAt) throws IOException {
-        Path current = path;
-        while (current != null && !current.equals(stopAt.getParent())) {
-            if (Files.isDirectory(current) && isDirectoryEmpty(current)) {
-                Files.deleteIfExists(current);
-            } else {
-                break;
-            }
-            if (current.equals(stopAt)) {
-                break;
-            }
-            current = current.getParent();
-        }
-    }
-
-    private static boolean isDirectoryEmpty(Path dir) throws IOException {
-        try (var stream = Files.list(dir)) {
-            return stream.findAny().isEmpty();
-        }
+        deleteRecursively(config.arrowDir());
+        deleteRecursively(config.mergeTmpDir());
+        deleteRecursively(config.bulkloadDir());
     }
 
     private static void deleteRecursively(Path path) throws IOException {
@@ -607,26 +670,17 @@ public final class BulkLoadPerfRunner {
         }
     }
 
-    private static String buildConfigJson(RunConfig config) {
-        return "{"
-            + "\"compression\":\"" + jsonEscape(config.compression()) + "\","
-            + "\"block_size\":" + config.blockSize() + ","
-            + "\"column_family\":\"" + jsonEscape(config.columnFamily()) + "\","
-            + "\"data_block_encoding\":\"" + jsonEscape(config.encoding()) + "\","
-            + "\"bloom_type\":\"" + jsonEscape(config.bloom()) + "\","
-            + "\"fsync_policy\":\"" + jsonEscape(config.fsyncPolicy()) + "\","
-            + "\"error_policy\":\"" + jsonEscape(config.errorPolicy()) + "\""
-            + "}";
-    }
-
-    private static boolean ensureJavaNioOpen(String[] args) throws Exception {
-        if (Buffer.class.getModule().isOpen("java.nio", BulkLoadPerfRunner.class.getModule())) {
+    private static boolean ensureRequiredOpens(String[] args) throws Exception {
+        boolean nioOpen = Buffer.class.getModule().isOpen("java.nio", BulkLoadPerfRunner.class.getModule());
+        boolean langOpen = ClassLoader.class.getModule().isOpen("java.lang", BulkLoadPerfRunner.class.getModule());
+        if (nioOpen && langOpen) {
             return false;
         }
         Path self = Path.of(BulkLoadPerfRunner.class.getProtectionDomain().getCodeSource().getLocation().toURI());
         List<String> command = new ArrayList<>();
         command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
         command.add("--add-opens=java.base/java.nio=ALL-UNNAMED");
+        command.add("--add-opens=java.base/java.lang=ALL-UNNAMED");
         if (self.toString().endsWith(".jar")) {
             command.add("-jar");
             command.add(self.toString());
@@ -700,6 +754,53 @@ public final class BulkLoadPerfRunner {
         return out;
     }
 
+    private static String decideStrategy(List<Path> arrowFiles, int mergeThresholdMb) {
+        if (arrowFiles.isEmpty()) {
+            return "NONE";
+        }
+        long totalBytes = 0L;
+        for (Path arrowFile : arrowFiles) {
+            try {
+                totalBytes += Files.size(arrowFile);
+            } catch (IOException ignored) {
+            }
+        }
+        long avgBytes = totalBytes / arrowFiles.size();
+        long thresholdBytes = mergeThresholdMb * 1024L * 1024L;
+        return avgBytes < thresholdBytes ? DEFAULT_STRATEGY_MERGE : DEFAULT_STRATEGY_PARALLEL;
+    }
+
+    private static String batchConvertResultToJson(String strategy, BatchConvertResult batchResult) {
+        StringBuilder builder = new StringBuilder();
+        builder.append("{");
+        builder.append("\"strategy\":\"").append(jsonEscape(strategy)).append("\",");
+        builder.append("\"task_count\":").append(batchResult.results.size()).append(",");
+        builder.append("\"success_count\":").append(batchResult.succeeded.size()).append(",");
+        builder.append("\"failed_count\":").append(batchResult.failed.size()).append(",");
+        builder.append("\"total_elapsed_ms\":").append(batchResult.totalElapsedMs).append(",");
+        builder.append("\"total_kv_written\":").append(batchResult.totalKvWritten).append(",");
+        builder.append("\"total_hfile_size_bytes\":").append(batchResult.totalHfileSizeBytes).append(",");
+        builder.append("\"results\":[");
+        int index = 0;
+        for (Map.Entry<Path, ConvertResult> entry : batchResult.results.entrySet()) {
+            if (index++ > 0) {
+                builder.append(",");
+            }
+            ConvertResult result = entry.getValue();
+            builder.append("{");
+            builder.append("\"source\":\"").append(jsonEscape(entry.getKey().toString())).append("\",");
+            builder.append("\"error_code\":").append(result.errorCode).append(",");
+            builder.append("\"error_message\":\"").append(jsonEscape(result.errorMessage)).append("\",");
+            builder.append("\"arrow_rows_read\":").append(result.arrowRowsRead).append(",");
+            builder.append("\"kv_written_count\":").append(result.kvWrittenCount).append(",");
+            builder.append("\"hfile_size_bytes\":").append(result.hfileSizeBytes).append(",");
+            builder.append("\"elapsed_ms\":").append(result.elapsedMs);
+            builder.append("}");
+        }
+        builder.append("]}");
+        return builder.toString();
+    }
+
     private static byte[] utf8(String value) {
         return value.getBytes(StandardCharsets.UTF_8);
     }
@@ -708,6 +809,10 @@ public final class BulkLoadPerfRunner {
         return value
             .replace("\\", "\\\\")
             .replace("\"", "\\\"");
+    }
+
+    private static String sanitize(String value) {
+        return value.replaceAll("[^a-zA-Z0-9_-]", "_");
     }
 
     private static String formatMiB(long bytes) {
@@ -810,13 +915,20 @@ public final class BulkLoadPerfRunner {
         Path bulkloadDir,
         int iterations,
         int iterationIndex,
-        Path arrowPath,
-        Path hfilePath,
+        Path arrowDir,
+        Path mergeTmpDir,
+        Path hfileDir,
         Path reportJson,
+        int arrowFileCount,
         int targetSizeMb,
         int batchRows,
         int payloadBytes,
         int blockSize,
+        int parallelism,
+        int mergeThresholdMb,
+        int triggerSizeMb,
+        int triggerCount,
+        int triggerIntervalSeconds,
         String columnFamily,
         String rowKeyRule,
         String compression,
@@ -842,8 +954,9 @@ public final class BulkLoadPerfRunner {
             String suffix = String.format(Locale.ROOT, "iter-%03d", iteration);
             Path iterationWorkDir = workDir.resolve(suffix);
             Path iterationBulkloadDir = bulkloadDir.resolve(suffix);
-            Path iterationArrowPath = iterationWorkDir.resolve(tableName + ".arrow");
-            Path iterationHfilePath = iterationBulkloadDir.resolve(columnFamily).resolve("part-00000.hfile");
+            Path iterationArrowDir = iterationWorkDir.resolve("arrow");
+            Path iterationMergeTmpDir = iterationWorkDir.resolve("merge-tmp");
+            Path iterationHfileDir = iterationBulkloadDir.resolve(columnFamily);
             Path iterationReportPath = workDir.resolve(tableName + "-" + suffix + "-perf-report.json");
             return new RunConfig(
                 tableName,
@@ -852,13 +965,20 @@ public final class BulkLoadPerfRunner {
                 iterationBulkloadDir,
                 iterations,
                 iteration,
-                iterationArrowPath,
-                iterationHfilePath,
+                iterationArrowDir,
+                iterationMergeTmpDir,
+                iterationHfileDir,
                 iterationReportPath,
+                arrowFileCount,
                 targetSizeMb,
                 batchRows,
                 payloadBytes,
                 blockSize,
+                parallelism,
+                mergeThresholdMb,
+                triggerSizeMb,
+                triggerCount,
+                triggerIntervalSeconds,
                 columnFamily,
                 rowKeyRule,
                 compression,
@@ -876,15 +996,35 @@ public final class BulkLoadPerfRunner {
         }
     }
 
-    private record GenerationStats(long rows, int batches, long elapsedNanos) {
+    private record SingleFileGenerationStats(long rows, int batches, long sizeBytes) {}
+
+    private record GenerationStats(
+        long rows,
+        int batches,
+        int arrowFileCount,
+        long arrowSizeBytes,
+        List<Path> arrowFiles,
+        long elapsedNanos
+    ) {
         private static GenerationStats empty() {
-            return new GenerationStats(0L, 0, 0L);
+            return new GenerationStats(0L, 0, 0, 0L, List.of(), 0L);
         }
     }
 
-    private record ConversionStats(long elapsedNanos, String sdkResultJson, int exitCode, boolean success, String errorMessage) {
+    private record ConversionStats(
+        long elapsedNanos,
+        String resultJson,
+        boolean success,
+        String errorMessage,
+        String strategy,
+        int taskCount,
+        int generatedHfileCount,
+        int failedTaskCount,
+        long totalKvWritten,
+        long totalHfileSizeBytes
+    ) {
         private static ConversionStats notStarted() {
-            return new ConversionStats(0L, "", 0, true, "");
+            return new ConversionStats(0L, "", true, "", "NONE", 0, 0, 0, 0L, 0L);
         }
     }
 
@@ -918,6 +1058,9 @@ public final class BulkLoadPerfRunner {
         String errorMessage,
         long rows,
         int batches,
+        int arrowFileCount,
+        int generatedHfileCount,
+        String conversionStrategy,
         long arrowSizeBytes,
         long hfileSizeBytes,
         long generateNanos,
@@ -933,7 +1076,7 @@ public final class BulkLoadPerfRunner {
         String verifyCommand,
         int verifyExitCode,
         String verifyOutput,
-        String sdkResultJson
+        String conversionResultJson
     ) {
         String toJson() {
             return "{\n"
@@ -942,12 +1085,20 @@ public final class BulkLoadPerfRunner {
                 + "  \"error_message\": \"" + jsonEscape(errorMessage) + "\",\n"
                 + "  \"table_name\": \"" + jsonEscape(config.tableName()) + "\",\n"
                 + "  \"column_family\": \"" + jsonEscape(config.columnFamily()) + "\",\n"
-                + "  \"arrow_path\": \"" + jsonEscape(config.arrowPath().toString()) + "\",\n"
-                + "  \"hfile_path\": \"" + jsonEscape(config.hfilePath().toString()) + "\",\n"
+                + "  \"arrow_dir\": \"" + jsonEscape(config.arrowDir().toString()) + "\",\n"
+                + "  \"hfile_dir\": \"" + jsonEscape(config.hfileDir().toString()) + "\",\n"
                 + "  \"report_json\": \"" + jsonEscape(config.reportJson().toString()) + "\",\n"
+                + "  \"arrow_file_count\": " + arrowFileCount + ",\n"
+                + "  \"generated_hfile_count\": " + generatedHfileCount + ",\n"
                 + "  \"target_size_mb\": " + config.targetSizeMb() + ",\n"
+                + "  \"merge_threshold_mb\": " + config.mergeThresholdMb() + ",\n"
+                + "  \"trigger_size_mb\": " + config.triggerSizeMb() + ",\n"
+                + "  \"trigger_count\": " + config.triggerCount() + ",\n"
+                + "  \"trigger_interval_seconds\": " + config.triggerIntervalSeconds() + ",\n"
+                + "  \"parallelism\": " + config.parallelism() + ",\n"
                 + "  \"payload_bytes\": " + config.payloadBytes() + ",\n"
                 + "  \"batch_rows\": " + config.batchRows() + ",\n"
+                + "  \"conversion_strategy\": \"" + jsonEscape(conversionStrategy) + "\",\n"
                 + "  \"rows\": " + rows + ",\n"
                 + "  \"batches\": " + batches + ",\n"
                 + "  \"arrow_size_bytes\": " + arrowSizeBytes + ",\n"
@@ -969,7 +1120,7 @@ public final class BulkLoadPerfRunner {
                 + "  \"verify_exit_code\": " + verifyExitCode + ",\n"
                 + "  \"verify_command\": \"" + jsonEscape(verifyCommand) + "\",\n"
                 + "  \"verify_output\": \"" + jsonEscape(verifyOutput) + "\",\n"
-                + "  \"sdk_result\": " + (sdkResultJson == null || sdkResultJson.isBlank() ? "\"\"" : sdkResultJson) + "\n"
+                + "  \"conversion_result\": " + (conversionResultJson == null || conversionResultJson.isBlank() ? "\"\"" : conversionResultJson) + "\n"
                 + "}\n";
         }
     }

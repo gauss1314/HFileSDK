@@ -42,6 +42,11 @@
       <artifactId>arrow-memory-unsafe</artifactId>
       <version>${arrow.version}</version>
     </dependency>
+    <dependency>
+      <groupId>io.hfilesdk</groupId>
+      <artifactId>arrow-to-hfile</artifactId>
+      <version>4.0.0</version>
+    </dependency>
   </dependencies>
 
   <build>
