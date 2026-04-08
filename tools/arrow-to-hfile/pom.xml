@@ -49,6 +49,7 @@
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <main.class>io.hfilesdk.converter.ArrowToHFileConverter</main.class>
     <arrow.version>16.1.0</arrow.version>
+    <junit.version>5.10.2</junit.version>
   </properties>
 
   <dependencies>
@@ -74,6 +75,12 @@
       <artifactId>arrow-memory-unsafe</artifactId>
       <version>${arrow.version}</version>
     </dependency>
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
   </dependencies>
 
   <build>
@@ -89,6 +96,15 @@
           <compilerArgs>
             <!-- Enable preview features if needed in the future -->
           </compilerArgs>
+        </configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+        <configuration>
+          <useModulePath>false</useModulePath>
+          <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
         </configuration>
       </plugin>
 
