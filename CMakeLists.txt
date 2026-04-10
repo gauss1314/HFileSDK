@@ -55,6 +55,24 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT HFILE_ENABLE_COVERAGE)
     if(NOT APPLE)   # Apple's ld64 does not support -flto in the same way
       add_compile_options(-flto)
       add_link_options(-flto)
+      # LTO produces IR bitcode .o files that /usr/bin/ar cannot index.
+      # Use gcc-ar / gcc-ranlib (or llvm-ar / llvm-ranlib) which have
+      # the LTO plugin and can build correct symbol tables in .a archives.
+      if(HFILE_COMPILER_GCC)
+        find_program(GCC_AR   NAMES gcc-ar   gcc-ar-${CMAKE_CXX_COMPILER_VERSION})
+        find_program(GCC_RANLIB NAMES gcc-ranlib gcc-ranlib-${CMAKE_CXX_COMPILER_VERSION})
+        if(GCC_AR AND GCC_RANLIB)
+          set(CMAKE_AR     "${GCC_AR}"     CACHE FILEPATH "LTO-aware ar"     FORCE)
+          set(CMAKE_RANLIB "${GCC_RANLIB}" CACHE FILEPATH "LTO-aware ranlib" FORCE)
+        endif()
+      elseif(HFILE_COMPILER_CLANG)
+        find_program(LLVM_AR     NAMES llvm-ar)
+        find_program(LLVM_RANLIB NAMES llvm-ranlib)
+        if(LLVM_AR AND LLVM_RANLIB)
+          set(CMAKE_AR     "${LLVM_AR}"     CACHE FILEPATH "LTO-aware ar"     FORCE)
+          set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "LTO-aware ranlib" FORCE)
+        endif()
+      endif()
     endif()
   else()
     message(FATAL_ERROR "Unsupported compiler for Release configuration")
@@ -124,7 +142,38 @@ endif()
 # Find dependencies
 find_package(Arrow REQUIRED)
 find_package(Protobuf REQUIRED)
-find_package(ZLIB REQUIRED)
+# zlib / zlib-ng — GZip compression for HFile blocks.
+# zlib-ng in compat mode provides the same zlib.h API with SIMD-optimized
+# deflate (typically 2-4x faster).  When installed in compat mode, zlib-ng
+# replaces libz and find_package(ZLIB) picks it up automatically.
+#
+# To build with zlib-ng compat mode:
+#   git clone https://github.com/zlib-ng/zlib-ng.git
+#   cd zlib-ng && mkdir build && cd build
+#   cmake .. -DZLIB_COMPAT=ON -DCMAKE_INSTALL_PREFIX=/usr/local
+#   make -j && sudo make install
+#
+option(HFILE_PREFER_ZLIB_NG
+       "Try to find zlib-ng (native API) before standard zlib" OFF)
+
+if(HFILE_PREFER_ZLIB_NG)
+  # zlib-ng native mode installs as 'zlib-ng' pkg-config package
+  find_package(PkgConfig QUIET)
+  if(PkgConfig_FOUND)
+    pkg_check_modules(ZLIBNG QUIET zlib-ng)
+  endif()
+  if(ZLIBNG_FOUND)
+    message(STATUS "Using zlib-ng native: ${ZLIBNG_LINK_LIBRARIES}")
+    add_library(ZLIB::ZLIB ALIAS PkgConfig::ZLIBNG)
+    set(HFILE_USING_ZLIB_NG TRUE)
+  else()
+    message(STATUS "zlib-ng not found via pkg-config, falling back to standard zlib")
+    find_package(ZLIB REQUIRED)
+  endif()
+else()
+  # Default: find_package(ZLIB) — works with both stock zlib and zlib-ng compat mode
+  find_package(ZLIB REQUIRED)
+endif()
 find_package(Threads REQUIRED)
 
 if(HFILE_ENABLE_JAVA_TESTS)

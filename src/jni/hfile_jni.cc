@@ -294,6 +294,7 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
 
         static const std::unordered_set<std::string> kAllowedKeys = {
             "compression",
+            "compression_level",
             "block_size",
             "column_family",
             "data_block_encoding",
@@ -317,6 +318,12 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             else if (*comp == "snappy") next_opts.compression = hfile::Compression::Snappy;
             else if (*comp == "gzip")   next_opts.compression = hfile::Compression::GZip;
             else return fail_config("Invalid compression: " + *comp);
+        }
+
+        if (auto cl = hfile::jni::config_int(cfg, "compression_level")) {
+            if (*cl < 0 || *cl > 9)
+                return fail_config("compression_level must be 0-9");
+            next_opts.compression_level = static_cast<int>(*cl);
         }
 
         if (auto bs = hfile::jni::config_int(cfg, "block_size")) {

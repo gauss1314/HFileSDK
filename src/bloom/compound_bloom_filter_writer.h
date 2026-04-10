@@ -3,6 +3,7 @@
 #include <hfile/types.h>
 #include <hfile/status.h>
 #include "checksum/crc32c.h"
+#include "codec/compressor.h"
 #include <vector>
 #include <span>
 #include <cstdint>
@@ -110,7 +111,8 @@ public:
     /// Call from the writer's non-scanned section, after all data blocks.
     /// Returns true if any bloom data was produced.
     bool finish_data_blocks(std::vector<uint8_t>& blocks_out,
-                            int64_t current_file_offset) {
+                            int64_t current_file_offset,
+                            codec::Compressor* compressor = nullptr) {
         if (type_ == BloomType::None) return false;
         if (cur_keys_ > 0) finish_chunk();
         if (chunks_.empty()) return false;
@@ -119,7 +121,7 @@ public:
         for (size_t i = 0; i < chunks_.size(); ++i) {
             chunk_offsets_.push_back(
                 current_file_offset + static_cast<int64_t>(blocks_out.size()));
-            write_bloom_chunk_block(blocks_out, chunks_[i]);
+            write_bloom_chunk_block(blocks_out, chunks_[i], compressor);
         }
         return true;
     }
@@ -128,8 +130,9 @@ public:
     /// Must be called after finish_data_blocks().
     /// `meta_block_file_offset` is the absolute file offset where this block starts
     /// (used to build the meta root index entry pointing to BLMFMET2).
-    void finish_meta_block(std::vector<uint8_t>& meta_out) {
-        write_bloom_meta_block(meta_out);
+    void finish_meta_block(std::vector<uint8_t>& meta_out,
+                           codec::Compressor* compressor = nullptr) {
+        write_bloom_meta_block(meta_out, compressor);
     }
 
     bool      is_enabled()     const noexcept { return type_ != BloomType::None; }
@@ -175,39 +178,54 @@ private:
     }
 
     void write_bloom_chunk_block(std::vector<uint8_t>& out,
-                                 const std::vector<uint8_t>& chunk_data) {
-        // HFile block header (33 bytes) + chunk_data
-        // Magic: BLMFBLK2
+                                 const std::vector<uint8_t>& chunk_data,
+                                 codec::Compressor* compressor = nullptr) {
+        // Optionally compress the chunk data
+        std::span<const uint8_t> payload{chunk_data.data(), chunk_data.size()};
+        std::vector<uint8_t> compressed;
+        if (compressor && compressor->type() != Compression::None) {
+            compressed.resize(compressor->max_compressed_size(chunk_data.size()));
+            size_t comp_len = compressor->compress(
+                {chunk_data.data(), chunk_data.size()},
+                compressed.data(), compressed.size());
+            if (comp_len > 0) {
+                compressed.resize(comp_len);
+                payload = {compressed.data(), compressed.size()};
+            }
+        }
+
         size_t off = out.size();
-        size_t on_disk_data_with_header = kBlockHeaderSize + chunk_data.size();
+        size_t on_disk_data_with_header = kBlockHeaderSize + payload.size();
         size_t n_chunks = (on_disk_data_with_header + kBytesPerChecksum - 1) / kBytesPerChecksum;
         std::vector<uint8_t> checksum_buf(n_chunks * 4);
-        out.resize(off + kBlockHeaderSize + chunk_data.size() + checksum_buf.size());
+        out.resize(off + kBlockHeaderSize + payload.size() + checksum_buf.size());
         uint8_t* p = out.data() + off;
 
         std::memcpy(p, kBloomChunkMagic.data(), 8); p += 8;
-        write_be32(p, static_cast<uint32_t>(chunk_data.size() + checksum_buf.size())); p += 4;
-        write_be32(p, static_cast<uint32_t>(chunk_data.size()));  p += 4; // uncompSz
-        write_be64(p, 0);                                          p += 8; // prevOffset
+        write_be32(p, static_cast<uint32_t>(payload.size() + checksum_buf.size())); p += 4;
+        write_be32(p, static_cast<uint32_t>(chunk_data.size()));  p += 4; // uncompressed original size
+        write_be64(p, 0);                                          p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, kBytesPerChecksum); p += 4;
         write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
 
-        std::memcpy(p, chunk_data.data(), chunk_data.size());
+        std::memcpy(p, payload.data(), payload.size());
         checksum::compute_hfile_checksums(
-            out.data() + off, kBlockHeaderSize + chunk_data.size(), kBytesPerChecksum, checksum_buf.data());
-        std::memcpy(out.data() + off + kBlockHeaderSize + chunk_data.size(),
+            out.data() + off, kBlockHeaderSize + payload.size(), kBytesPerChecksum, checksum_buf.data());
+        std::memcpy(out.data() + off + kBlockHeaderSize + payload.size(),
                     checksum_buf.data(), checksum_buf.size());
     }
 
-    void write_bloom_meta_block(std::vector<uint8_t>& out) {
+    void write_bloom_meta_block(std::vector<uint8_t>& out,
+                                codec::Compressor* compressor = nullptr) {
         // Bloom meta block format (HBase compatible):
         // version(4B BE) + totalByteSize(8B BE) + hashCount(4B BE) + hashType(4B BE)
         // + totalKeyCount(8B BE) + totalMaxKeys(8B BE) + numChunks(4B BE)
         // + comparatorClassName(bytes with writable-vint length prefix)
         // + bloom index root payload:
         //   [chunkOffset(8B BE) + chunkByteSize(4B BE) + firstKey(bytes with writable-vint length prefix)] * N
-        size_t off = out.size();
+
+        // ── Step 1: serialize bloom meta data into temp buffer ────────────────
         uint8_t comparator_len_buf[10];
         const int comparator_len_size = encode_writable_vint(comparator_len_buf, 0);
         size_t index_payload_size = 0;
@@ -220,55 +238,76 @@ private:
         size_t data_size = 4 + 8 + 4 + 4 + 8 + 8 + 4
                          + static_cast<size_t>(comparator_len_size)
                          + index_payload_size;
-        size_t on_disk_data_with_header = kBlockHeaderSize + data_size;
+
+        std::vector<uint8_t> raw_data(data_size);
+        uint8_t* dp = raw_data.data();
+
+        write_be32(dp, kBloomFormatVersion); dp += 4;
+        uint64_t total_bytes = 0;
+        for (const auto& c : chunks_) total_bytes += c.size();
+        write_be64(dp, total_bytes); dp += 8;
+        write_be32(dp, static_cast<uint32_t>(kNumHashFunctions)); dp += 4;
+        write_be32(dp, static_cast<uint32_t>(kHashTypeMurmur3)); dp += 4;
+        write_be64(dp, static_cast<uint64_t>(total_keys_)); dp += 8;
+        uint64_t total_max_keys = 0;
+        for (uint32_t c : chunk_key_counts_) total_max_keys += c;
+        write_be64(dp, total_max_keys); dp += 8;
+        write_be32(dp, static_cast<uint32_t>(chunks_.size())); dp += 4;
+        std::memcpy(dp, comparator_len_buf, static_cast<size_t>(comparator_len_size));
+        dp += comparator_len_size;
+        for (size_t i = 0; i < chunks_.size(); ++i) {
+            uint8_t key_len_buf[10];
+            const int key_len_size = encode_writable_vint(
+                key_len_buf, static_cast<int64_t>(chunk_first_keys_[i].size()));
+            write_be64(dp, static_cast<uint64_t>(chunk_offsets_[i])); dp += 8;
+            write_be32(dp, static_cast<uint32_t>(chunks_[i].size())); dp += 4;
+            std::memcpy(dp, key_len_buf, static_cast<size_t>(key_len_size));
+            dp += key_len_size;
+            std::memcpy(dp, chunk_first_keys_[i].data(), chunk_first_keys_[i].size());
+            dp += chunk_first_keys_[i].size();
+        }
+
+        // ── Step 2: optionally compress ───────────────────────────────────────
+        std::span<const uint8_t> payload{raw_data.data(), raw_data.size()};
+        std::vector<uint8_t> compressed;
+        if (compressor && compressor->type() != Compression::None) {
+            compressed.resize(compressor->max_compressed_size(data_size));
+            size_t comp_len = compressor->compress(
+                {raw_data.data(), raw_data.size()},
+                compressed.data(), compressed.size());
+            if (comp_len > 0) {
+                compressed.resize(comp_len);
+                payload = {compressed.data(), compressed.size()};
+            }
+        }
+
+        // ── Step 3: write block header + payload + checksums ──────────────────
+        size_t off = out.size();
+        size_t on_disk_data_with_header = kBlockHeaderSize + payload.size();
         size_t n_chunks = (on_disk_data_with_header + kBytesPerChecksum - 1) / kBytesPerChecksum;
         std::vector<uint8_t> checksum_buf(n_chunks * 4);
-        out.resize(off + kBlockHeaderSize + data_size + checksum_buf.size());
+        out.resize(off + kBlockHeaderSize + payload.size() + checksum_buf.size());
         uint8_t* p = out.data() + off;
 
         // Block header — BLMFMET2
         std::memcpy(p, kBloomMetaMagic.data(), 8); p += 8;
-        write_be32(p, static_cast<uint32_t>(data_size + checksum_buf.size())); p += 4;
-        write_be32(p, static_cast<uint32_t>(data_size)); p += 4;
+        write_be32(p, static_cast<uint32_t>(payload.size() + checksum_buf.size())); p += 4;
+        write_be32(p, static_cast<uint32_t>(data_size)); p += 4;  // uncompressed original size
         write_be64(p, 0);                                 p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, kBytesPerChecksum); p += 4;
         write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
 
-        // Bloom meta data
-        write_be32(p, kBloomFormatVersion); p += 4;
+        // Payload (compressed or raw)
+        std::memcpy(p, payload.data(), payload.size());
 
-        uint64_t total_bytes = 0;
-        for (const auto& c : chunks_) total_bytes += c.size();
-        write_be64(p, total_bytes); p += 8;
-
-        write_be32(p, static_cast<uint32_t>(kNumHashFunctions)); p += 4;
-        write_be32(p, static_cast<uint32_t>(kHashTypeMurmur3)); p += 4;
-        write_be64(p, static_cast<uint64_t>(total_keys_)); p += 8;
-        uint64_t total_max_keys = 0;
-        for (uint32_t c : chunk_key_counts_) total_max_keys += c;
-        write_be64(p, total_max_keys); p += 8;
-        write_be32(p, static_cast<uint32_t>(chunks_.size())); p += 4;
-        std::memcpy(p, comparator_len_buf, static_cast<size_t>(comparator_len_size));
-        p += comparator_len_size;
-
-        for (size_t i = 0; i < chunks_.size(); ++i) {
-            uint8_t key_len_buf[10];
-            const int key_len_size = encode_writable_vint(
-                key_len_buf, static_cast<int64_t>(chunk_first_keys_[i].size()));
-            write_be64(p, static_cast<uint64_t>(chunk_offsets_[i])); p += 8;
-            write_be32(p, static_cast<uint32_t>(chunks_[i].size())); p += 4;
-            std::memcpy(p, key_len_buf, static_cast<size_t>(key_len_size));
-            p += key_len_size;
-            std::memcpy(p, chunk_first_keys_[i].data(), chunk_first_keys_[i].size());
-            p += chunk_first_keys_[i].size();
-        }
+        // Checksums
         checksum::compute_hfile_checksums(
             out.data() + off,
-            kBlockHeaderSize + data_size,
+            kBlockHeaderSize + payload.size(),
             kBytesPerChecksum,
             checksum_buf.data());
-        std::memcpy(out.data() + off + kBlockHeaderSize + data_size,
+        std::memcpy(out.data() + off + kBlockHeaderSize + payload.size(),
                     checksum_buf.data(), checksum_buf.size());
     }
 

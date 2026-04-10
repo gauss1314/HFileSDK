@@ -221,12 +221,13 @@ public class ArrowToHFileConverter {
         String rowKeyRule  = cmd.getOptionValue("rule");
         String nativeLib   = cmd.getOptionValue("native-lib");
         String cf          = cmd.getOptionValue("cf",            "cf");
-        String compression = cmd.getOptionValue("compression",   "lz4");
+        String compression = cmd.getOptionValue("compression",   "gzip");
         String encoding    = cmd.getOptionValue("encoding",      "FAST_DIFF");
         String bloomType   = cmd.getOptionValue("bloom",         "row");
         String fsyncPolicy = cmd.getOptionValue("fsync-policy",  "safe");
         String errorPolicy = cmd.getOptionValue("error-policy",  "skip_row");
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
+        int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
 
         // ── Validate input file ────────────────────────────────────────────
         Path arrowFilePath = Paths.get(arrowPath);
@@ -274,6 +275,7 @@ public class ArrowToHFileConverter {
                 .rowKeyRule(rowKeyRule)
                 .columnFamily(cf)
                 .compression(compression)
+                .compressionLevel(compLevel)
                 .dataBlockEncoding(encoding)
                 .bloomType(bloomType)
                 .fsyncPolicy(fsyncPolicy)
@@ -347,11 +349,12 @@ public class ArrowToHFileConverter {
         String table   = cmd.getOptionValue("table", "");
         String nativeLib = cmd.getOptionValue("native-lib");
         String cf          = cmd.getOptionValue("cf",           "cf");
-        String compression = cmd.getOptionValue("compression",  "lz4");
+        String compression = cmd.getOptionValue("compression",  "gzip");
         String encoding    = cmd.getOptionValue("encoding",     "FAST_DIFF");
         String bloomType   = cmd.getOptionValue("bloom",        "row");
         String errorPolicy = cmd.getOptionValue("error-policy", "skip_row");
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
+        int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
         int    parallelism = parseInt(cmd.getOptionValue("parallelism",
             String.valueOf(Runtime.getRuntime().availableProcessors())),
             Runtime.getRuntime().availableProcessors());
@@ -377,6 +380,7 @@ public class ArrowToHFileConverter {
             .rowKeyRule(rule)
             .columnFamily(cf)
             .compression(compression)
+            .compressionLevel(compLevel)
             .dataBlockEncoding(encoding)
             .bloomType(bloomType)
             .errorPolicy(errorPolicy)
@@ -489,7 +493,7 @@ public class ArrowToHFileConverter {
             .desc("Temp dir for merged Arrow files.  [default: system temp]")
             .hasArg().argName("DIR").build());
 
-        o.addOption(Option.builder().longOpt("exclude-cols")
+        o.addOption(Option.builder().longOpt("rule")
             .desc("Row Key rule expression                  [required]\n" +
                   "  Format: \"name,index,isReverse,padLen[,padMode][,padContent]#...\"\n" +
                   "  Example: \"REFID,0,false,15\"")
@@ -504,8 +508,11 @@ public class ArrowToHFileConverter {
             .desc("Absolute path to libhfilesdk.so/.dll     [default: from env/library.path]")
             .hasArg().argName("PATH").build());
         o.addOption(Option.builder().longOpt("compression")
-            .desc("Compression: none|lz4|zstd|snappy|gzip  [default: lz4]")
+            .desc("Compression: none|lz4|zstd|snappy|gzip  [default: gzip]")
             .hasArg().argName("ALG").build());
+        o.addOption(Option.builder().longOpt("compression-level")
+            .desc("Compression level 1(fastest)-9(best ratio) [default: 1]")
+            .hasArg().argName("N").build());
         o.addOption(Option.builder().longOpt("encoding")
             .desc("Encoding: NONE|PREFIX|DIFF|FAST_DIFF     [default: FAST_DIFF]")
             .hasArg().argName("ENC").build());

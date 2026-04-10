@@ -190,43 +190,115 @@ public:
 
 // ─── GZip ─────────────────────────────────────────────────────────────────────
 
+// ─── GZip (RFC 1952 gzip format — required by HBase RegionServer) ─────────────
+//
+// HBase "GZ" compression has two code paths that expect DIFFERENT formats:
+//
+//   1. Native Hadoop zlib path (ZlibDecompressor with DEFAULT_HEADER):
+//      Uses windowBits=15, expects RFC 1950 zlib format (header 0x78 xx).
+//      Active when native-hadoop libraries are installed.
+//
+//   2. Pure-Java fallback (BuiltInGzipDecompressor):
+//      Strictly requires RFC 1952 gzip format (magic 0x1f 0x8b).
+//      Active when native-hadoop libraries are NOT installed on that node.
+//
+// Hadoop assumes all nodes in the cluster have consistent native-lib status.
+// In practice, RegionServer nodes may lack native libs while the local
+// machine (where `hbase hfile` runs) has them.  This causes the classic
+// "works locally, fails on RS" symptom.
+//
+// We produce RFC 1952 gzip format because BuiltInGzipDecompressor (the more
+// restrictive path) is what RS nodes without native libs use.
+//
+// If local `hbase hfile` verification fails with "unknown compression method",
+// disable native zlib for the local test:
+//   HADOOP_OPTS="-Dhadoop.native.lib=false" hbase hfile -m -v -f <path>
+//
+// For performance, use zlib-ng (https://github.com/zlib-ng/zlib-ng) compiled
+// in compat mode.  Same zlib.h API, SIMD-optimized, typically 2-4x faster.
+
 class GZipCompressor final : public Compressor {
 public:
-    GZipCompressor() : Compressor(Compression::GZip) {}
+    /// @param level 1 (fastest) to 9 (best ratio).  0 = Z_DEFAULT_COMPRESSION (6).
+    explicit GZipCompressor(int level = Z_DEFAULT_COMPRESSION)
+        : Compressor(Compression::GZip)
+        , level_(level <= 0 ? Z_DEFAULT_COMPRESSION : level) {}
 
     size_t max_compressed_size(size_t n) const noexcept override {
-        return n + n / 1000 + 32;
+        // gzip adds 10-byte header + 8-byte trailer on top of deflate bound
+        return compressBound(static_cast<uLong>(n)) + 32;
     }
 
     size_t compress(std::span<const uint8_t> input,
                     uint8_t* output, size_t capacity) const noexcept override {
-        uLongf dest_len = static_cast<uLongf>(capacity);
-        int r = compress2(reinterpret_cast<Bytef*>(output), &dest_len,
-                          reinterpret_cast<const Bytef*>(input.data()),
-                          static_cast<uLong>(input.size()), Z_DEFAULT_COMPRESSION);
-        return r == Z_OK ? static_cast<size_t>(dest_len) : 0;
+        z_stream strm{};
+        strm.next_in   = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.data()));
+        strm.avail_in  = static_cast<uInt>(input.size());
+        strm.next_out  = reinterpret_cast<Bytef*>(output);
+        strm.avail_out = static_cast<uInt>(capacity);
+
+        // windowBits = MAX_WBITS + 16 (31) → RFC 1952 gzip format.
+        //
+        // HBase clusters may or may not have native Hadoop zlib:
+        //   - WITH native zlib:  ZlibDecompressor(DEFAULT_HEADER, windowBits=15)
+        //                        → only handles RFC 1950 zlib format
+        //   - WITHOUT native:    BuiltInGzipDecompressor (pure Java)
+        //                        → strictly requires RFC 1952 gzip (checks 0x1f 0x8b)
+        //
+        // We produce gzip format because BuiltInGzipDecompressor is the more
+        // restrictive consumer.  If the local `hbase hfile` tool fails because
+        // the local machine HAS native zlib, disable it for testing:
+        //   HADOOP_OPTS="-Dhadoop.native.lib=false" hbase hfile -m -v -f <path>
+        int ret = deflateInit2(&strm, level_, Z_DEFLATED,
+                               MAX_WBITS + 16, /*memLevel=*/8,
+                               Z_DEFAULT_STRATEGY);
+        if (ret != Z_OK) return 0;
+
+        ret = deflate(&strm, Z_FINISH);
+        size_t compressed_size = strm.total_out;
+        deflateEnd(&strm);
+
+        if (ret != Z_STREAM_END) return 0;
+        return compressed_size;
     }
 
     Status decompress(std::span<const uint8_t> compressed,
                       uint8_t* output, size_t output_size) const noexcept override {
-        uLongf dest_len = static_cast<uLongf>(output_size);
-        int r = uncompress(reinterpret_cast<Bytef*>(output), &dest_len,
-                           reinterpret_cast<const Bytef*>(compressed.data()),
-                           static_cast<uLong>(compressed.size()));
-        if (r != Z_OK) return Status::Corruption("GZip decompress failed");
+        z_stream strm{};
+        strm.next_in   = const_cast<Bytef*>(
+            reinterpret_cast<const Bytef*>(compressed.data()));
+        strm.avail_in  = static_cast<uInt>(compressed.size());
+        strm.next_out  = reinterpret_cast<Bytef*>(output);
+        strm.avail_out = static_cast<uInt>(output_size);
+
+        // windowBits = MAX_WBITS + 32 (47) → auto-detect zlib or gzip format.
+        // This lets our decompress() handle files written by either format,
+        // useful for unit tests and hfile-verify.
+        int ret = inflateInit2(&strm, MAX_WBITS + 32);
+        if (ret != Z_OK) return Status::Corruption("inflateInit2 failed");
+
+        ret = inflate(&strm, Z_FINISH);
+        inflateEnd(&strm);
+
+        if (ret != Z_STREAM_END)
+            return Status::Corruption("GZip decompress failed (inflate returned "
+                                      + std::to_string(ret) + ")");
         return Status::OK();
     }
+
+private:
+    int level_;
 };
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
 
-std::unique_ptr<Compressor> Compressor::create(Compression c) {
+std::unique_ptr<Compressor> Compressor::create(Compression c, int level) {
     switch (c) {
     case Compression::None:   return std::make_unique<NoneCompressor>();
     case Compression::LZ4:    return std::make_unique<LZ4Compressor>();
     case Compression::Zstd:   return std::make_unique<ZstdCompressor>();
     case Compression::Snappy: return std::make_unique<SnappyCompressor>();
-    case Compression::GZip:   return std::make_unique<GZipCompressor>();
+    case Compression::GZip:   return std::make_unique<GZipCompressor>(level);
     }
     return std::make_unique<NoneCompressor>();
 }

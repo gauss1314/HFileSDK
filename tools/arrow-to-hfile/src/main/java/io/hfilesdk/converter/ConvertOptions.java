@@ -21,13 +21,14 @@ import java.util.List;
  * ConvertOptions.builder()
  *     .arrowPath("/data/events.arrow")
  *     .hfilePath("/staging/cf/events.hfile")
- *     .rowKeyRule("STARTTIME,5,false,10#IMSI,6,true,15")  // 索引从原始 schema 算，不受过滤影响
+ *     .rowKeyRule("STARTTIME,0,false,10#IMSI,1,true,15")  // 索引基于过滤后的 schema
  *     .excludedColumnPrefix("_hoodie")                    // 丢弃全部5个 _hoodie_* 列
  *     .build();
  * }</pre>
  *
- * <p><strong>重要</strong>：列过滤只影响 HBase KV 输出，
- * {@code rowKeyRule} 中的 {@code index} 始终指向原始 Arrow Schema 中的列位置。
+ * <p><strong>重要</strong>：列过滤在 rowKeyRule 索引解析之前生效。
+ * {@code rowKeyRule} 中的 {@code index} 指向的是<strong>排除列之后</strong>的 Arrow Schema 位置。
+ * 例如原始 schema 有 5 个 _hoodie 列 + STARTTIME + IMSI，排除后 STARTTIME 变为 index 0。
  *
  * <h3>rowKeyRule 格式</h3>
  * 用 {@code #} 分隔的若干段，每段：
@@ -44,6 +45,7 @@ public final class ConvertOptions {
     // ── HFile writer settings ─────────────────────────────────────────────────
     private final String columnFamily;
     private final String compression;
+    private final int    compressionLevel;
     private final String dataBlockEncoding;
     private final String bloomType;
     private final String fsyncPolicy;
@@ -64,6 +66,7 @@ public final class ConvertOptions {
         this.rowKeyRule             = requireNonBlank(b.rowKeyRule, "rowKeyRule");
         this.columnFamily           = b.columnFamily;
         this.compression            = b.compression;
+        this.compressionLevel       = b.compressionLevel;
         this.dataBlockEncoding      = b.dataBlockEncoding;
         this.bloomType              = b.bloomType;
         this.fsyncPolicy            = b.fsyncPolicy;
@@ -88,6 +91,7 @@ public final class ConvertOptions {
     public String       rowKeyRule()               { return rowKeyRule; }
     public String       columnFamily()             { return columnFamily; }
     public String       compression()              { return compression; }
+    public int          compressionLevel()         { return compressionLevel; }
     public String       dataBlockEncoding()        { return dataBlockEncoding; }
     public String       bloomType()                { return bloomType; }
     public String       fsyncPolicy()              { return fsyncPolicy; }
@@ -103,6 +107,10 @@ public final class ConvertOptions {
     String toConfigJson() {
         StringBuilder sb = new StringBuilder("{");
         appendStr(sb, "compression",         compression);
+        if (compressionLevel > 0) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"compression_level\":").append(compressionLevel);
+        }
         appendStr(sb, "column_family",       columnFamily);
         appendStr(sb, "data_block_encoding", dataBlockEncoding);
         appendStr(sb, "bloom_type",          bloomType);
@@ -148,7 +156,8 @@ public final class ConvertOptions {
         private String tableName;
         private String rowKeyRule;
         private String columnFamily      = "cf";
-        private String compression       = "lz4";
+        private String compression       = "gzip";
+        private int    compressionLevel  = 1;
         private String dataBlockEncoding = "FAST_DIFF";
         private String bloomType         = "row";
         private String fsyncPolicy       = "safe";
@@ -185,6 +194,7 @@ public final class ConvertOptions {
 
         public Builder columnFamily(String v)      { columnFamily = v;      return this; }
         public Builder compression(String v)       { compression = v;       return this; }
+        public Builder compressionLevel(int v)     { compressionLevel = v;  return this; }
         public Builder dataBlockEncoding(String v) { dataBlockEncoding = v; return this; }
         public Builder bloomType(String v)         { bloomType = v;         return this; }
         public Builder fsyncPolicy(String v)       { fsyncPolicy = v;       return this; }

@@ -253,6 +253,7 @@ public class AdaptiveBatchConverter {
                         .rowKeyRule(opts.rowKeyRule)
                         .columnFamily(opts.columnFamily)
                         .compression(opts.compression)
+                        .compressionLevel(opts.compressionLevel)
                         .dataBlockEncoding(opts.dataBlockEncoding)
                         .bloomType(opts.bloomType)
                         .errorPolicy(opts.errorPolicy)

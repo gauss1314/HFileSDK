@@ -187,12 +187,14 @@ public class HFileSDK {
      * Fluent configuration builder around {@link HFileSDK}.
      */
     public static final class Builder {
-        private String compression        = "lz4";
+        private String compression        = "gzip";
+        private int    compressionLevel   = 1;
         private int    blockSize          = 65536;
         private String columnFamily       = "cf";
         private String dataBlockEncoding  = "FAST_DIFF";
 
         public Builder compression(String c)       { compression = c;       return this; }
+        public Builder compressionLevel(int l)     { compressionLevel = l;  return this; }
         public Builder blockSize(int s)            { blockSize = s;         return this; }
         public Builder columnFamily(String cf)     { columnFamily = cf;     return this; }
         public Builder dataBlockEncoding(String e) { dataBlockEncoding = e; return this; }
@@ -203,9 +205,9 @@ public class HFileSDK {
         public HFileSDK build() {
             HFileSDK sdk = new HFileSDK();
             String cfg = String.format(
-                "{\"compression\":\"%s\",\"block_size\":%d," +
+                "{\"compression\":\"%s\",\"compression_level\":%d,\"block_size\":%d," +
                 "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\"}",
-                compression, blockSize, columnFamily, dataBlockEncoding);
+                compression, compressionLevel, blockSize, columnFamily, dataBlockEncoding);
             sdk.configure(cfg);
             return sdk;
         }

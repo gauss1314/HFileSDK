@@ -34,7 +34,11 @@ public:
 
     Compression type() const noexcept { return type_; }
 
-    static std::unique_ptr<Compressor> create(Compression c);
+    /// Create a compressor for the given algorithm.
+    /// @param level Compression level (1=fastest, 9=best ratio).
+    ///              Only meaningful for GZip and Zstd; ignored for LZ4/Snappy/None.
+    ///              Default (0) uses the algorithm's default level.
+    static std::unique_ptr<Compressor> create(Compression c, int level = 0);
 
 protected:
     explicit Compressor(Compression t) : type_{t} {}

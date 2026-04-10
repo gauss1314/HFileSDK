@@ -170,14 +170,10 @@ public:
                       "falling back to NONE for on-disk blocks");
             opts_.data_block_encoding = Encoding::None;
         }
-        if (opts_.compression != Compression::None) {
-            log::warn("Requested compression is temporarily disabled for HBase "
-                      "compatibility; falling back to NONE");
-            opts_.compression = Compression::None;
-        }
         encoder_    = block::DataBlockEncoder::create(opts_.data_block_encoding,
                                                       opts_.block_size);
-        compressor_ = codec::Compressor::create(opts_.compression);
+        compressor_ = codec::Compressor::create(opts_.compression,
+                                                 opts_.compression_level);
         bloom_      = std::make_unique<bloom::CompoundBloomFilterWriter>(
                           opts_.bloom_type, opts_.bloom_error_rate);
 
@@ -281,7 +277,8 @@ public:
         if (bloom_result.enabled) {
             bloom_result.bloom_data_offset = writer_->position();
             std::vector<uint8_t> bloom_chunk_buf;
-            bloom_->finish_data_blocks(bloom_chunk_buf, writer_->position());
+            bloom_->finish_data_blocks(bloom_chunk_buf, writer_->position(),
+                                        compressor_.get());
             if (!bloom_chunk_buf.empty()) {
                 HFILE_RETURN_IF_ERROR(
                     writer_->write({bloom_chunk_buf.data(), bloom_chunk_buf.size()}));
@@ -311,7 +308,7 @@ public:
         std::vector<uint8_t> bloom_meta_block;
         std::vector<uint8_t> file_info_block;
         if (bloom_result.enabled) {
-            bloom_->finish_meta_block(bloom_meta_block);
+            bloom_->finish_meta_block(bloom_meta_block, compressor_.get());
         }
 
         static const uint8_t kBloomMetaKey[] = "GENERAL_BLOOM_META";

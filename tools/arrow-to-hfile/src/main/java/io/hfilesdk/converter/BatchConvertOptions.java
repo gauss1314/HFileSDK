@@ -36,6 +36,7 @@ public final class BatchConvertOptions {
     // ── Writer settings (forwarded to per-file ConvertOptions) ───────────────
     public final String columnFamily;
     public final String compression;
+    public final int    compressionLevel;
     public final String dataBlockEncoding;
     public final String bloomType;
     public final String errorPolicy;
@@ -75,6 +76,7 @@ public final class BatchConvertOptions {
         this.rowKeyRule            = requireNonNull(b.rowKeyRule, "rowKeyRule");
         this.columnFamily          = b.columnFamily;
         this.compression           = b.compression;
+        this.compressionLevel      = b.compressionLevel;
         this.dataBlockEncoding     = b.dataBlockEncoding;
         this.bloomType             = b.bloomType;
         this.errorPolicy           = b.errorPolicy;
@@ -108,7 +110,8 @@ public final class BatchConvertOptions {
         private String     tableName;
         private String     rowKeyRule;
         private String     columnFamily      = "cf";
-        private String     compression       = "lz4";
+        private String     compression       = "gzip";
+        private int        compressionLevel  = 1;
         private String     dataBlockEncoding = "FAST_DIFF";
         private String     bloomType         = "row";
         private String     errorPolicy       = "skip_row";
@@ -130,6 +133,7 @@ public final class BatchConvertOptions {
         public Builder rowKeyRule(String v)          { rowKeyRule = v;            return this; }
         public Builder columnFamily(String v)        { columnFamily = v;          return this; }
         public Builder compression(String v)         { compression = v;           return this; }
+        public Builder compressionLevel(int v)       { compressionLevel = v;      return this; }
         public Builder dataBlockEncoding(String v)   { dataBlockEncoding = v;     return this; }
         public Builder bloomType(String v)           { bloomType = v;             return this; }
         public Builder errorPolicy(String v)         { errorPolicy = v;           return this; }

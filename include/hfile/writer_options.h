@@ -64,7 +64,12 @@ struct WriterOptions {
 
     // ── Block settings ─────────────────────────────────────────────────────
     size_t       block_size           = kDefaultBlockSize;
-    Compression  compression          = Compression::LZ4;
+    Compression  compression          = Compression::GZip;
+    /// Compression level: 1 (fastest) to 9 (best ratio).
+    /// 0 = algorithm default.  Only affects GZip (via zlib deflate level)
+    /// and Zstd (via ZSTD_compress level).  Ignored for LZ4/Snappy/None.
+    /// Recommended: 1 or 2 for write-throughput-sensitive HFile generation.
+    int          compression_level    = 1;
     Encoding     data_block_encoding  = Encoding::FastDiff;
 
     // ── Bloom filter ───────────────────────────────────────────────────────
