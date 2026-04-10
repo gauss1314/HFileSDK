@@ -41,6 +41,29 @@
       <artifactId>arrow-memory-unsafe</artifactId>
       <version>${arrow.version}</version>
     </dependency>
+
+    <!--
+      Arrow IPC body 压缩支持（新增）。
+      CommonsCompressionFactory 提供 ZSTD / LZ4 编解码器，写出时在每个
+      RecordBatch 的 FlatBuffer 消息中附加 BodyCompression{codec=ZSTD}，
+      C++ RecordBatchStreamReader 读取时自动透明解压，无需修改 C++ 侧。
+    -->
+    <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-compression</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+    <!--
+      ZSTD JNI 绑定（新增）。
+      arrow-compression 通过 commons-compress 调用，
+      commons-compress 的 ZSTD 后端需要 zstd-jni 在 classpath 中。
+    -->
+    <dependency>
+      <groupId>com.github.luben</groupId>
+      <artifactId>zstd-jni</artifactId>
+      <version>1.5.5-11</version>
+    </dependency>
+
     <!-- CLI argument parsing -->
     <dependency>
       <groupId>commons-cli</groupId>
@@ -72,6 +95,7 @@
               "org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
               <mainClass>${main.class}</mainClass>
             </transformer>
+            <!-- 合并 META-INF/services（Arrow SPI 注册，压缩工厂必须） -->
             <transformer implementation=
               "org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
           </transformers>
