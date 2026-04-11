@@ -67,6 +67,8 @@ struct ConvertResult {
     /// Non-zero here means your rowKeyRule is not injective for this dataset;
     /// review the rule or add a uniqueness-guaranteeing segment (e.g. $RND$).
     int64_t     duplicate_key_count = 0;
+    int64_t     memory_budget_bytes = 0;
+    int64_t     tracked_memory_peak_bytes = 0;
 
     std::chrono::milliseconds elapsed_ms{0};
     std::chrono::milliseconds sort_ms{0};

@@ -123,6 +123,8 @@ public class HFileSDK {
      *   <li>{@code arrow_rows_read}    — total Arrow rows read
      *   <li>{@code kv_written_count}   — KVs successfully written to HFile
      *   <li>{@code kv_skipped_count}   — rows skipped (empty key / oversized value)
+     *   <li>{@code memory_budget_bytes} — configured SDK-tracked memory budget, 0 = unlimited
+     *   <li>{@code tracked_memory_peak_bytes} — peak SDK-tracked memory observed during convert()
      *   <li>{@code hfile_size_bytes}   — final HFile size on disk
      *   <li>{@code elapsed_ms}         — total elapsed milliseconds
      *   <li>{@code sort_ms}            — time spent sorting
@@ -137,13 +139,15 @@ public class HFileSDK {
      *
      * <p>Supported JSON keys:
      * <ul>
-     *   <li>{@code compression}                — {@code "none" | "lz4" | "zstd" | "snappy" | "gzip"}
+     *   <li>{@code compression}                — {@code "none" | "lz4" | "zstd" | "snappy" | "GZ"}
+     *                                            (also accepts {@code "gzip"} for compatibility)
      *   <li>{@code block_size}                 — data block size in bytes (default 65536)
      *   <li>{@code column_family}              — HBase column family name (default "cf")
      *   <li>{@code data_block_encoding}        — {@code "NONE" | "PREFIX" | "DIFF" | "FAST_DIFF"}
      *   <li>{@code fsync_policy}               — {@code "safe" | "fast" | "paranoid"}
      *   <li>{@code error_policy}               — {@code "strict" | "skip_row" | "skip_batch"}
      *   <li>{@code bloom_type}                 — {@code "none" | "row" | "rowcol"}
+     *   <li>{@code max_memory_bytes}           — soft SDK memory budget in bytes, 0 = unlimited
      *   <li>{@code excluded_columns}           — JSON string array of column names to exclude
      *                                            from HBase KV output (exact match, case-sensitive).
      *                                            Does NOT affect row key construction.
@@ -189,17 +193,19 @@ public class HFileSDK {
      * Fluent configuration builder around {@link HFileSDK}.
      */
     public static final class Builder {
-        private String compression        = "gzip";
+        private String compression        = "GZ";
         private int    compressionLevel   = 1;
         private int    blockSize          = 65536;
         private String columnFamily       = "cf";
         private String dataBlockEncoding  = "FAST_DIFF";
+        private long   maxMemoryBytes     = 0;
 
         public Builder compression(String c)       { compression = c;       return this; }
         public Builder compressionLevel(int l)     { compressionLevel = l;  return this; }
         public Builder blockSize(int s)            { blockSize = s;         return this; }
         public Builder columnFamily(String cf)     { columnFamily = cf;     return this; }
         public Builder dataBlockEncoding(String e) { dataBlockEncoding = e; return this; }
+        public Builder maxMemoryBytes(long v)      { maxMemoryBytes = v;    return this; }
 
         /**
          * Build and configure an {@link HFileSDK} instance.
@@ -208,8 +214,9 @@ public class HFileSDK {
             HFileSDK sdk = new HFileSDK();
             String cfg = String.format(
                 "{\"compression\":\"%s\",\"compression_level\":%d,\"block_size\":%d," +
-                "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\"}",
-                compression, compressionLevel, blockSize, columnFamily, dataBlockEncoding);
+                "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\",\"max_memory_bytes\":%d}",
+                compression, compressionLevel, blockSize, columnFamily, dataBlockEncoding,
+                maxMemoryBytes);
             int rc = sdk.configure(cfg);
             if (rc != OK) {
                 throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());

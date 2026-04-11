@@ -41,6 +41,8 @@ public final class ConvertResult {
      * Each collision emits exactly ONE WARN log line (not one per column).
      */
     public final long duplicateKeyCount;
+    public final long memoryBudgetBytes;
+    public final long trackedMemoryPeakBytes;
 
     // ── Timing (milliseconds) ──────────────────────────────────────────────────
     public final long elapsedMs;
@@ -63,6 +65,8 @@ public final class ConvertResult {
                           long arrowBatchesRead, long arrowRowsRead,
                           long kvWrittenCount, long kvSkippedCount,
                           long duplicateKeyCount,
+                          long memoryBudgetBytes,
+                          long trackedMemoryPeakBytes,
                           long hfileSizeBytes,
                           long elapsedMs, long sortMs, long writeMs) {
         this.errorCode        = errorCode;
@@ -72,6 +76,8 @@ public final class ConvertResult {
         this.kvWrittenCount   = kvWrittenCount;
         this.kvSkippedCount   = kvSkippedCount;
         this.duplicateKeyCount = duplicateKeyCount;
+        this.memoryBudgetBytes = memoryBudgetBytes;
+        this.trackedMemoryPeakBytes = trackedMemoryPeakBytes;
         this.hfileSizeBytes   = hfileSizeBytes;
         this.elapsedMs        = elapsedMs;
         this.sortMs           = sortMs;
@@ -134,7 +140,7 @@ public final class ConvertResult {
      */
     static ConvertResult fromJson(String json, int sdkRc) {
         if (json == null || json.isBlank() || json.equals("{}")) {
-            return new ConvertResult(sdkRc, "", 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            return new ConvertResult(sdkRc, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
         return new ConvertResult(
             (int) parseLong(json, "error_code",          sdkRc),
@@ -144,6 +150,8 @@ public final class ConvertResult {
             parseLong(json, "kv_written_count",           0),
             parseLong(json, "kv_skipped_count",           0),
             parseLong(json, "duplicate_key_count",        0),
+            parseLong(json, "memory_budget_bytes",        0),
+            parseLong(json, "tracked_memory_peak_bytes",  0),
             parseLong(json, "hfile_size_bytes",           0),
             parseLong(json, "elapsed_ms",                 0),
             parseLong(json, "sort_ms",                    0),
@@ -153,7 +161,7 @@ public final class ConvertResult {
 
     /** Construct a result representing a pre-convert failure (bad args, etc.). */
     static ConvertResult ofError(int code, String message) {
-        return new ConvertResult(code, message, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        return new ConvertResult(code, message, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     // ── Internal JSON helpers ──────────────────────────────────────────────────

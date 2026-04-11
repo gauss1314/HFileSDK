@@ -73,14 +73,23 @@ Throughput: 612.4 MB/s
 | `--table NAME` | | `""` | HBase 表名（仅用于日志） |
 | `--native-lib PATH` | | 从环境变量 | `libhfilesdk.so` 的绝对路径 |
 | `--cf CF` | | `cf` | Column Family 名称 |
-| `--compression ALG` | | `lz4` | 压缩算法：`none`/`lz4`/`zstd`/`snappy`/`gzip` |
+| `--compression ALG` | | `GZ` | 压缩算法：`none`/`lz4`/`zstd`/`snappy`/`GZ`（兼容 `gzip`） |
 | `--encoding ENC` | | `FAST_DIFF` | 块编码：`NONE`/`PREFIX`/`DIFF`/`FAST_DIFF` |
 | `--bloom TYPE` | | `row` | Bloom Filter：`none`/`row`/`rowcol` |
 | `--block-size BYTES` | | `65536` | 数据块大小（字节） |
+| `--max-memory-mb MB` | | `0` | C++ SDK 内部软内存预算，单位 MiB；`0` 表示不限制 |
 | `--fsync-policy` | | `safe` | Fsync 策略：`safe`/`fast`/`paranoid` |
 | `--error-policy` | | `skip_row` | 行错误策略：`strict`/`skip_row`/`skip_batch` |
 
 说明：CLI 仍接受 `FAST_DIFF` 等编码参数，但当前 C++ writer 为保证 HBase 可读性，实际落盘会统一回退为 `NONE`。
+
+### 内存控制与观测
+
+- `--max-memory-mb` 会通过 JNI `configure()` 下发为 `max_memory_bytes`，控制 SDK 内部 `MemoryBudget`
+- 这是 SDK 内部的 soft budget，只统计 SDK 显式追踪的可归因内存，不等于整个 JNI 进程 RSS
+- `getLastResult()` / `ConvertResult` 现在额外返回：
+  - `memory_budget_bytes`
+  - `tracked_memory_peak_bytes`
 
 ---
 

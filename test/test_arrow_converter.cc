@@ -989,5 +989,7 @@ TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall) {
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::MEMORY_EXHAUSTED);
     EXPECT_FALSE(result.error_message.empty());
+    EXPECT_EQ(result.memory_budget_bytes, 1);
+    EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
     fs::remove_all(dir);
 }

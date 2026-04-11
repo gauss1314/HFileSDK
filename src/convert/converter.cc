@@ -579,6 +579,7 @@ static Status append_grouped_row_cells(
 ConvertResult convert(const ConvertOptions& opts) {
     ConvertResult result;
     auto t_start = std::chrono::steady_clock::now();
+    result.memory_budget_bytes = static_cast<int64_t>(opts.writer_opts.max_memory_bytes);
 
     clog::info("Convert started: arrow=" + opts.arrow_path +
                " hfile=" + opts.hfile_path +
@@ -648,6 +649,10 @@ ConvertResult convert(const ConvertOptions& opts) {
     std::unique_ptr<memory::MemoryBudget> budget;
     if (opts.writer_opts.max_memory_bytes > 0)
         budget = std::make_unique<memory::MemoryBudget>(opts.writer_opts.max_memory_bytes);
+    auto update_memory_metrics = [&]() {
+        if (budget)
+            result.tracked_memory_peak_bytes = static_cast<int64_t>(budget->peak());
+    };
 
     auto t_sort_start = std::chrono::steady_clock::now();
     {
@@ -655,6 +660,7 @@ ConvertResult convert(const ConvertOptions& opts) {
                                     removal_indices,
                                     sort_index, batches, budget.get(), result);
         if (!s.ok()) {
+            update_memory_metrics();
             result.error_code = map_pass1_status_to_error_code(s);
             result.error_message = s.message();
             clog::err("Pass 1 failed: " + s.message());
@@ -713,6 +719,7 @@ ConvertResult convert(const ConvertOptions& opts) {
         .build();
 
     if (!ws.ok()) {
+        update_memory_metrics();
         result.error_code = ErrorCode::IO_ERROR;
         result.error_message = ws.message();
         clog::err("HFile open failed: " + ws.message());
@@ -787,6 +794,7 @@ ConvertResult convert(const ConvertOptions& opts) {
             // value-too-large from the HFileWriter's ErrorPolicy) are treated
             // as per the configured error_policy.
             if (s.message().find("SORT_ORDER_VIOLATION") != std::string::npos) {
+                update_memory_metrics();
                 result.error_code = ErrorCode::SORT_VIOLATION;
                 result.error_message = s.message();
                 clog::err("Pass 2 aborted: " + s.message());
@@ -811,6 +819,7 @@ ConvertResult convert(const ConvertOptions& opts) {
     // ── 6. Finish HFile ───────────────────────────────────────────────────
     auto fs = writer->finish();
     if (!fs.ok()) {
+        update_memory_metrics();
         result.error_code = map_status_to_error_code(fs);
         result.error_message = fs.message();
         clog::err("HFile finish failed: " + fs.message());
@@ -827,6 +836,7 @@ ConvertResult convert(const ConvertOptions& opts) {
 
     result.elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t_start);
+    update_memory_metrics();
 
     clog::info("Convert done: kvs=" + std::to_string(result.kv_written_count) +
                " skipped=" + std::to_string(result.kv_skipped_count) +

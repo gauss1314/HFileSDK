@@ -51,6 +51,7 @@ public final class ConvertOptions {
     private final String fsyncPolicy;
     private final String errorPolicy;
     private final int    blockSize;
+    private final long   maxMemoryBytes;
 
     // ── Column exclusion ──────────────────────────────────────────────────────
     private final List<String> excludedColumns;
@@ -72,6 +73,7 @@ public final class ConvertOptions {
         this.fsyncPolicy            = b.fsyncPolicy;
         this.errorPolicy            = b.errorPolicy;
         this.blockSize              = b.blockSize;
+        this.maxMemoryBytes         = requireNonNegative(b.maxMemoryBytes, "maxMemoryBytes");
         this.excludedColumns        = Collections.unmodifiableList(new ArrayList<>(b.excludedColumns));
         this.excludedColumnPrefixes = Collections.unmodifiableList(new ArrayList<>(b.excludedColumnPrefixes));
         this.nativeLibPath          = b.nativeLibPath;
@@ -80,6 +82,11 @@ public final class ConvertOptions {
     private static String requireNonBlank(String v, String name) {
         if (v == null || v.isBlank())
             throw new IllegalArgumentException(name + " must not be null or blank");
+        return v;
+    }
+
+    private static long requireNonNegative(long v, String name) {
+        if (v < 0) throw new IllegalArgumentException(name + " must be >= 0");
         return v;
     }
 
@@ -97,6 +104,7 @@ public final class ConvertOptions {
     public String       fsyncPolicy()              { return fsyncPolicy; }
     public String       errorPolicy()              { return errorPolicy; }
     public int          blockSize()                { return blockSize; }
+    public long         maxMemoryBytes()           { return maxMemoryBytes; }
     public List<String> excludedColumns()          { return excludedColumns; }
     public List<String> excludedColumnPrefixes()   { return excludedColumnPrefixes; }
     public String       nativeLibPath()            { return nativeLibPath; }
@@ -119,6 +127,10 @@ public final class ConvertOptions {
         if (blockSize > 0) {
             if (sb.length() > 1) sb.append(',');
             sb.append("\"block_size\":").append(blockSize);
+        }
+        if (maxMemoryBytes > 0) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"max_memory_bytes\":").append(maxMemoryBytes);
         }
         appendStrArray(sb, "excluded_columns",         excludedColumns);
         appendStrArray(sb, "excluded_column_prefixes", excludedColumnPrefixes);
@@ -156,13 +168,14 @@ public final class ConvertOptions {
         private String tableName;
         private String rowKeyRule;
         private String columnFamily      = "cf";
-        private String compression       = "gzip";
+        private String compression       = "GZ";
         private int    compressionLevel  = 1;
         private String dataBlockEncoding = "FAST_DIFF";
         private String bloomType         = "row";
         private String fsyncPolicy       = "safe";
         private String errorPolicy       = "skip_row";
         private int    blockSize         = 65536;
+        private long   maxMemoryBytes;
         private final ArrayList<String> excludedColumns        = new ArrayList<>();
         private final ArrayList<String> excludedColumnPrefixes = new ArrayList<>();
         private String nativeLibPath;
@@ -200,6 +213,7 @@ public final class ConvertOptions {
         public Builder fsyncPolicy(String v)       { fsyncPolicy = v;       return this; }
         public Builder errorPolicy(String v)       { errorPolicy = v;       return this; }
         public Builder blockSize(int v)            { blockSize = v;         return this; }
+        public Builder maxMemoryBytes(long v)      { maxMemoryBytes = v;    return this; }
 
         /**
          * Exclude one column by exact name from HBase KV output.

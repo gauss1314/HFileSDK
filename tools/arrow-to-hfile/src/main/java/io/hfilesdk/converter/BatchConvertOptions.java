@@ -41,6 +41,7 @@ public final class BatchConvertOptions {
     public final String bloomType;
     public final String errorPolicy;
     public final int    blockSize;
+    public final long   maxMemoryBytes;
     public final List<String> excludedColumnPrefixes;
     public final List<String> excludedColumns;
 
@@ -81,6 +82,7 @@ public final class BatchConvertOptions {
         this.bloomType             = b.bloomType;
         this.errorPolicy           = b.errorPolicy;
         this.blockSize             = b.blockSize;
+        this.maxMemoryBytes        = requireNonNegative(b.maxMemoryBytes, "maxMemoryBytes");
         this.excludedColumnPrefixes = b.excludedColumnPrefixes != null
                                       ? List.copyOf(b.excludedColumnPrefixes) : List.of();
         this.excludedColumns       = b.excludedColumns != null
@@ -101,6 +103,11 @@ public final class BatchConvertOptions {
         return v;
     }
 
+    private static long requireNonNegative(long v, String name) {
+        if (v < 0) throw new IllegalArgumentException(name + " must be >= 0");
+        return v;
+    }
+
     public static Builder builder() { return new Builder(); }
 
     public static final class Builder {
@@ -110,12 +117,13 @@ public final class BatchConvertOptions {
         private String     tableName;
         private String     rowKeyRule;
         private String     columnFamily      = "cf";
-        private String     compression       = "gzip";
+        private String     compression       = "GZ";
         private int        compressionLevel  = 1;
         private String     dataBlockEncoding = "FAST_DIFF";
         private String     bloomType         = "row";
         private String     errorPolicy       = "skip_row";
         private int        blockSize         = 65536;
+        private long       maxMemoryBytes;
         private List<String> excludedColumnPrefixes;
         private List<String> excludedColumns;
         private int        parallelism;
@@ -138,6 +146,7 @@ public final class BatchConvertOptions {
         public Builder bloomType(String v)           { bloomType = v;             return this; }
         public Builder errorPolicy(String v)         { errorPolicy = v;           return this; }
         public Builder blockSize(int v)              { blockSize = v;             return this; }
+        public Builder maxMemoryBytes(long v)        { maxMemoryBytes = v;        return this; }
         public Builder excludedColumnPrefixes(List<String> v) { excludedColumnPrefixes = v; return this; }
         public Builder excludedColumns(List<String> v)        { excludedColumns = v;        return this; }
         /** Number of concurrent conversions. Default: CPU count. */

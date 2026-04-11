@@ -6,6 +6,7 @@
 #include <hfile/writer_options.h>
 
 #include <jni.h>
+#include <cctype>
 #include <string>
 #include <stdexcept>
 #include <cstdio>
@@ -20,6 +21,13 @@
 
 namespace hfile {
 namespace jni {
+
+static std::string ascii_lower(std::string value) {
+    for (char& ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return value;
+}
 
 struct InstanceState {
     jobject       weak_ref{nullptr};
@@ -41,6 +49,8 @@ static std::string result_to_json(const ConvertResult& r) {
         << "\"kv_written_count\":"    << static_cast<long long>(r.kv_written_count) << ','
         << "\"kv_skipped_count\":"    << static_cast<long long>(r.kv_skipped_count) << ','
         << "\"duplicate_key_count\":" << static_cast<long long>(r.duplicate_key_count) << ','
+        << "\"memory_budget_bytes\":" << static_cast<long long>(r.memory_budget_bytes) << ','
+        << "\"tracked_memory_peak_bytes\":" << static_cast<long long>(r.tracked_memory_peak_bytes) << ','
         << "\"hfile_size_bytes\":"    << static_cast<long long>(r.hfile_size_bytes) << ','
         << "\"elapsed_ms\":"          << static_cast<long long>(r.elapsed_ms.count()) << ','
         << "\"sort_ms\":"             << static_cast<long long>(r.sort_ms.count()) << ','
@@ -302,6 +312,7 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             "error_policy",
             "bloom_type",
             "include_mvcc",
+            "max_memory_bytes",
             // Column exclusion — used for Hudi / CDC metadata columns
             "excluded_columns",          // ["col1","col2",...]  exact names
             "excluded_column_prefixes"   // ["_hoodie","_cdc_"]  prefix match
@@ -312,11 +323,13 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         }
 
         if (auto comp = hfile::jni::config_string(cfg, "compression")) {
-            if      (*comp == "none")   next_opts.compression = hfile::Compression::None;
-            else if (*comp == "lz4")    next_opts.compression = hfile::Compression::LZ4;
-            else if (*comp == "zstd")   next_opts.compression = hfile::Compression::Zstd;
-            else if (*comp == "snappy") next_opts.compression = hfile::Compression::Snappy;
-            else if (*comp == "gzip")   next_opts.compression = hfile::Compression::GZip;
+            std::string normalized = hfile::jni::ascii_lower(*comp);
+            if      (normalized == "none")             next_opts.compression = hfile::Compression::None;
+            else if (normalized == "lz4")              next_opts.compression = hfile::Compression::LZ4;
+            else if (normalized == "zstd")             next_opts.compression = hfile::Compression::Zstd;
+            else if (normalized == "snappy")           next_opts.compression = hfile::Compression::Snappy;
+            else if (normalized == "gzip" || normalized == "gz")
+                                                     next_opts.compression = hfile::Compression::GZip;
             else return fail_config("Invalid compression: " + *comp);
         }
 
@@ -368,6 +381,11 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         if (auto mvcc = hfile::jni::config_int(cfg, "include_mvcc")) {
             if (*mvcc != 0 && *mvcc != 1) return fail_config("include_mvcc must be 0 or 1");
             next_opts.include_mvcc = (*mvcc != 0);
+        }
+
+        if (auto mm = hfile::jni::config_int(cfg, "max_memory_bytes")) {
+            if (*mm < 0) return fail_config("max_memory_bytes must be >= 0");
+            next_opts.max_memory_bytes = static_cast<size_t>(*mm);
         }
 
         // ── Column exclusion ──────────────────────────────────────────────────

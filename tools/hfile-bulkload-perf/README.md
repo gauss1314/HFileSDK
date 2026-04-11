@@ -7,6 +7,13 @@
 
 每个用例固定执行 3 次，输出每轮耗时与平均耗时，便于横向对比两种实现。
 
+从当前版本开始，perf runner 会将每个 `implementation + iteration` 放到独立 worker 进程中执行，再由父进程汇总报告。这样才能对 JNI 实现和纯 Java 实现做进程级 CPU / 内存对比，而不是把两者混在同一个 JVM 内部。
+
+需要区分两层串行/并行语义：
+
+- 父进程层面：不同 implementation 与不同 iteration 仍然串行调度，避免 JNI 与纯 Java 在同一轮里互相抢占资源
+- worker 层面：保留各实现自己的目录转换能力；例如 JNI 目录场景仍可使用 `--parallelism` 对多个 Arrow 文件并行生成多个 HFile
+
 ## 固定场景
 
 - 单文件：`1MB`、`10MB`、`100MB`、`500MB`
@@ -29,6 +36,13 @@ mvn -q -f tools/hfile-bulkload-perf/pom.xml package
 ```bash
 java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
   --native-lib /Users/gauss/workspace/github_project/HFileSDK/build/libhfilesdk.dylib \
+  --cpu-set 0-3 \
+  --process-memory-mb 4096 \
+  --jni-xmx-mb 512 \
+  --jni-direct-memory-mb 512 \
+  --jni-sdk-max-memory-mb 1024 \
+  --java-xmx-mb 512 \
+  --java-direct-memory-mb 512 \
   --table perf_table \
   --work-dir /tmp/hfilesdk-bulkload-perf
 ```
@@ -60,18 +74,29 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 
 - `--native-lib`：JNI 实现所需 `libhfilesdk` 动态库路径
 - `--table`：结果中使用的表名标签，默认 `hfilesdk_perf`
-- `--work-dir`：场景输入、输出与中间报告目录
-- `--report-json`：最终结构化报告路径
+- `--work-dir`：场景输入、输出与临时中间目录，默认 `/tmp/hfilesdk-bulkload-perf`
+- `--report-json`：最终结构化报告路径；未显式指定时默认写到启动命令的当前目录 `./perf-matrix-report.json`
 - `--implementations`：实现列表，默认同时执行两种实现
 - `--scenario-filter`：只运行匹配场景 ID 的子集
 - `--iterations`：固定为 `3`
-- `--parallelism`：JNI 大文件并行转换线程数
+- `--parallelism`：JNI 目录场景的 worker 内并行度；JNI 与纯 Java 两个 implementation 本身仍由父进程串行执行
 - `--merge-threshold`：JNI 小文件合并阈值
 - `--trigger-size` / `--trigger-count` / `--trigger-interval`：JNI 小文件合并策略参数
 - `--payload-bytes`：每行 `PAYLOAD` 的字节数
 - `--batch-rows`：每个 Arrow RecordBatch 行数
 - `--rule`：rowKeyRule，默认 `USER_ID,0,false,0`
-- `--keep-generated-files`：保留输入 Arrow 与每轮 HFile 输出
+- `--cpu-set`：Linux 上通过 `taskset` 绑定 worker CPU，确保两种实现使用同一组核
+- `--process-memory-mb`：worker 进程总内存硬限制；优先 cgroup v2，失败时退化为 `prlimit`
+- `--jni-xmx-mb` / `--jni-direct-memory-mb`：JNI worker JVM 的 heap / direct memory
+- `--jni-sdk-max-memory-mb`：JNI 内部 C++ SDK soft budget
+- `--java-xmx-mb` / `--java-direct-memory-mb`：纯 Java worker JVM 的 heap / direct memory
+- `--keep-generated-files`：保留输入 Arrow、每轮 HFile 输出和 worker 日志；默认在场景完成后自动清理这些中间文件
+
+公平性说明：
+
+- 官方对比口径以 Linux 为准，优先使用相同 `--cpu-set` 和 `--process-memory-mb`
+- 纯 Java 实现不能只设置 `-Xmx`，还应同时设置 `--java-direct-memory-mb`
+- JNI 报告中的 `sdk_memory_budget_bytes` / `sdk_tracked_memory_peak_bytes` 是 SDK 内部可归因内存，不是整个 worker RSS
 
 ## 输出结构
 
@@ -91,4 +116,14 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 - `elapsed_ms`
 - `hfile_size_bytes`
 - `kv_written_count`
+- `process_peak_rss_bytes`
+- `process_user_cpu_ms`
+- `process_sys_cpu_ms`
+- `process_exit_code`
+- `process_exit_signal`
+- `worker_parallelism`
+- `sdk_memory_budget_bytes`
+- `sdk_tracked_memory_peak_bytes`
+- `process_control_mode`
+- `process_control_note`
 - `detail`

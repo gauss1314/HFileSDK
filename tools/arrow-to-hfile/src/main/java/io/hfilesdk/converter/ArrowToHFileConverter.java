@@ -221,13 +221,14 @@ public class ArrowToHFileConverter {
         String rowKeyRule  = cmd.getOptionValue("rule");
         String nativeLib   = cmd.getOptionValue("native-lib");
         String cf          = cmd.getOptionValue("cf",            "cf");
-        String compression = cmd.getOptionValue("compression",   "gzip");
+        String compression = cmd.getOptionValue("compression",   "GZ");
         String encoding    = cmd.getOptionValue("encoding",      "FAST_DIFF");
         String bloomType   = cmd.getOptionValue("bloom",         "row");
         String fsyncPolicy = cmd.getOptionValue("fsync-policy",  "safe");
         String errorPolicy = cmd.getOptionValue("error-policy",  "skip_row");
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
         int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
+        long   maxMemoryBytes = parseLong(cmd.getOptionValue("max-memory-mb", "0"), 0) * 1024L * 1024L;
 
         // ── Validate input file ────────────────────────────────────────────
         Path arrowFilePath = Paths.get(arrowPath);
@@ -280,7 +281,8 @@ public class ArrowToHFileConverter {
                 .bloomType(bloomType)
                 .fsyncPolicy(fsyncPolicy)
                 .errorPolicy(errorPolicy)
-                .blockSize(blockSize);
+                .blockSize(blockSize)
+                .maxMemoryBytes(maxMemoryBytes);
 
             // Column exclusion — exact names
             if (cmd.hasOption("exclude-cols")) {
@@ -349,12 +351,13 @@ public class ArrowToHFileConverter {
         String table   = cmd.getOptionValue("table", "");
         String nativeLib = cmd.getOptionValue("native-lib");
         String cf          = cmd.getOptionValue("cf",           "cf");
-        String compression = cmd.getOptionValue("compression",  "gzip");
+        String compression = cmd.getOptionValue("compression",  "GZ");
         String encoding    = cmd.getOptionValue("encoding",     "FAST_DIFF");
         String bloomType   = cmd.getOptionValue("bloom",        "row");
         String errorPolicy = cmd.getOptionValue("error-policy", "skip_row");
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
         int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
+        long   maxMemoryBytes = parseLong(cmd.getOptionValue("max-memory-mb", "0"), 0) * 1024L * 1024L;
         int    parallelism = parseInt(cmd.getOptionValue("parallelism",
             String.valueOf(Runtime.getRuntime().availableProcessors())),
             Runtime.getRuntime().availableProcessors());
@@ -385,6 +388,7 @@ public class ArrowToHFileConverter {
             .bloomType(bloomType)
             .errorPolicy(errorPolicy)
             .blockSize(blockSize)
+            .maxMemoryBytes(maxMemoryBytes)
             .parallelism(parallelism)
             .skipExisting(skipExisting)
             .nativeLibPath(nativeLib);
@@ -508,7 +512,7 @@ public class ArrowToHFileConverter {
             .desc("Absolute path to libhfilesdk.so/.dll     [default: from env/library.path]")
             .hasArg().argName("PATH").build());
         o.addOption(Option.builder().longOpt("compression")
-            .desc("Compression: none|lz4|zstd|snappy|gzip  [default: gzip]")
+            .desc("Compression: none|lz4|zstd|snappy|GZ    [default: GZ, also accepts gzip]")
             .hasArg().argName("ALG").build());
         o.addOption(Option.builder().longOpt("compression-level")
             .desc("Compression level 1(fastest)-9(best ratio) [default: 1]")
@@ -522,6 +526,9 @@ public class ArrowToHFileConverter {
         o.addOption(Option.builder().longOpt("block-size")
             .desc("Data block size in bytes                 [default: 65536]")
             .hasArg().argName("BYTES").build());
+        o.addOption(Option.builder().longOpt("max-memory-mb")
+            .desc("Soft SDK memory budget in MiB            [default: unlimited]")
+            .hasArg().argName("MiB").build());
         o.addOption(Option.builder().longOpt("fsync-policy")
             .desc("Fsync: safe|fast|paranoid                [default: safe]")
             .hasArg().argName("POLICY").build());

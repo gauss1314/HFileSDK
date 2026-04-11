@@ -64,6 +64,22 @@ public class HFileSDKIntegrationTest {
     }
 
     @Test
+    void configureAcceptsCanonicalGzAndLegacyGzipAlias() {
+        HFileSDK sdk = new HFileSDK();
+        assertEquals(HFileSDK.OK, sdk.configure("{\"compression\":\"GZ\"}"));
+        assertEquals(HFileSDK.OK, sdk.configure("{\"compression\":\"gzip\"}"));
+    }
+
+    @Test
+    void configureRejectsNegativeMaxMemoryBytes() {
+        HFileSDK sdk = new HFileSDK();
+        int rc = sdk.configure("{\"max_memory_bytes\":-1}");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, rc);
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("max_memory_bytes"));
+    }
+
+    @Test
     void instanceStateIsIsolatedAcrossSdkObjects() {
         HFileSDK sdk1 = new HFileSDK();
         HFileSDK sdk2 = new HFileSDK();
@@ -103,6 +119,37 @@ public class HFileSDKIntegrationTest {
         String lastResult = sdk.getLastResult();
         assertTrue(lastResult.contains("\"error_code\":1"));
         assertTrue(lastResult.contains("must not be null/empty"));
+    }
+
+    @Test
+    void convertReportsTrackedMemoryMetrics(@TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");
+        writeArrowStream(arrowPath, List.of("row1", "row2"), List.of("value1", "value2"));
+
+        HFileSDK sdk = new HFileSDK();
+        int configureRc = sdk.configure("""
+            {
+              "compression":"none",
+              "column_family":"cf",
+              "data_block_encoding":"NONE",
+              "bloom_type":"row",
+              "include_mvcc":0,
+              "max_memory_bytes":33554432
+            }
+            """);
+        assertEquals(HFileSDK.OK, configureRc);
+
+        int rc = sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "ID,0,false,0");
+        assertEquals(HFileSDK.OK, rc);
+
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"memory_budget_bytes\":33554432"));
+        assertTrue(lastResult.contains("\"tracked_memory_peak_bytes\":"));
     }
 
     @Test
