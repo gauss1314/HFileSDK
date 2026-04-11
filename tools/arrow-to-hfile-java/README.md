@@ -5,10 +5,10 @@
 ## 能力
 
 - 输入单个 Arrow IPC Stream 文件
-- 依据 `rowKeyRule` 直接构造 Row Key
+- 依据 `rowKeyRule` 构造 Row Key，并在内存中完成内部排序
 - 按过滤后的 Arrow Schema 顺序引用列索引
 - 输出单个本地 HFile 文件
-- 对未排序输入直接失败，不在内存中额外排序
+- 支持未排序输入，输出始终按 Row Key 有序
 - 提供 CLI 与可复用 Java API
 
 ## 构建
@@ -50,12 +50,11 @@ JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
 - Arrow 文件不存在：返回 `ARROW_FILE_ERROR`
 - `rowKeyRule` 非法：返回 `INVALID_ROW_KEY_RULE`
 - 过滤后列为空或索引越界：返回 `INVALID_ARGUMENT`
-- 输入未按 `rowKeyRule` 结果升序排列：返回 `SORT_VIOLATION`
 - 文件写出异常：返回 `IO_ERROR`
 
 ## 当前约束
 
-- 当前实现面向性能对比场景，不执行额外排序
+- 当前实现会像 JNI 版本一样在内存中构建 sort index 后再写出 HFile
 - 默认输出采用与 C++ 写入链路一致的 `GZ + NONE`
 - 即使调用方传入 `PREFIX`、`DIFF`、`FAST_DIFF`，当前落盘仍统一按 `NONE` 处理
 - 推荐与 `tools/hfile-bulkload-perf` 配合使用同一批 mock Arrow 数据

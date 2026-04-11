@@ -27,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 final class ArrowToHFileJavaConverterTest {
 
     @Test
-    void convertsArrowFileToReadableHFile() throws Exception {
+    void convertsUnsortedArrowFileToReadableSortedHFile() throws Exception {
         java.nio.file.Path tempDir = Files.createTempDirectory("arrow-to-hfile-java-test");
         java.nio.file.Path arrowFile = tempDir.resolve("input.arrow");
         java.nio.file.Path hfile = tempDir.resolve("output.hfile");
@@ -43,13 +43,13 @@ final class ArrowToHFileJavaConverterTest {
             eventTime.allocateNew();
             payload.allocateNew();
 
-            userId.setSafe(0, "user-0001".getBytes(StandardCharsets.UTF_8));
-            eventTime.setSafe(0, 1001L);
-            payload.setSafe(0, "payload-a".getBytes(StandardCharsets.UTF_8));
+            userId.setSafe(0, "user-0002".getBytes(StandardCharsets.UTF_8));
+            eventTime.setSafe(0, 1002L);
+            payload.setSafe(0, "payload-b".getBytes(StandardCharsets.UTF_8));
 
-            userId.setSafe(1, "user-0002".getBytes(StandardCharsets.UTF_8));
-            eventTime.setSafe(1, 1002L);
-            payload.setSafe(1, "payload-b".getBytes(StandardCharsets.UTF_8));
+            userId.setSafe(1, "user-0001".getBytes(StandardCharsets.UTF_8));
+            eventTime.setSafe(1, 1001L);
+            payload.setSafe(1, "payload-a".getBytes(StandardCharsets.UTF_8));
 
             userId.setValueCount(2);
             eventTime.setValueCount(2);
@@ -85,6 +85,7 @@ final class ArrowToHFileJavaConverterTest {
             HFileScanner scanner = reader.getScanner(conf, false, false);
             assertTrue(scanner.seekTo());
             Cell firstCell = scanner.getCell();
+            assertEquals("user-0001", new String(firstCell.getRowArray(), firstCell.getRowOffset(), firstCell.getRowLength(), StandardCharsets.UTF_8));
             assertEquals("EVENT_TIME", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
         }
     }

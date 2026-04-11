@@ -15,6 +15,7 @@ import java.nio.channels.WritableByteChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -45,8 +46,12 @@ import java.util.List;
  *
  * <h2>跨文件唯一键保证</h2>
  * <p>批量模式使用同一个 {@link RowGenerator} 实例跨所有文件持续生成数据。
- * {@code RowGenerator} 内部维护单调递增的 {@code refid}（每行 +10~490）和
- * {@code starttime}（每行 +1~10ms），因此跨文件不会产生重复主键。
+ * {@code RowGenerator} 内部维护单调递增的逻辑主键来源（如 {@code refid} /
+ * {@code starttime}），再在写入每个 RecordBatch 前做批内洗牌，因此：
+ * <ul>
+ *   <li>跨文件不会产生重复主键</li>
+ *   <li>最终 Arrow 文件默认是乱序的，更贴近生产环境</li>
+ * </ul>
  *
  * <h2>ZSTD 压缩说明</h2>
  * <p>Arrow IPC body 级别压缩：每个 RecordBatch 的 body buffers 经 ZSTD 压缩，
@@ -66,6 +71,7 @@ public class MockArrowGenerator {
     // ── Defaults ──────────────────────────────────────────────────────────────
     private static final int    DEFAULT_SIZE_MB    = 10;
     private static final int    DEFAULT_BATCH_ROWS = 1000;
+    private static final int    DEFAULT_PAYLOAD_BYTES = 0;
     private static final long   DEFAULT_SEED       = 42L;
     private static final String DEFAULT_TABLE      = TableSchema.TDR_SIGNAL_STOR_20550.tableName;
     private static final String DEFAULT_COMPRESSION = "ZSTD";
@@ -92,6 +98,7 @@ public class MockArrowGenerator {
         String tableName  = cmd.getOptionValue("table",       DEFAULT_TABLE);
         int    sizeMb     = parseInt(cmd.getOptionValue("size",  String.valueOf(DEFAULT_SIZE_MB)),  DEFAULT_SIZE_MB);
         int    batchRows  = parseInt(cmd.getOptionValue("batch", String.valueOf(DEFAULT_BATCH_ROWS)), DEFAULT_BATCH_ROWS);
+        int    payloadBytes = parseInt(cmd.getOptionValue("payload-bytes", String.valueOf(DEFAULT_PAYLOAD_BYTES)), DEFAULT_PAYLOAD_BYTES);
         long   seed       = parseLong(cmd.getOptionValue("seed", String.valueOf(DEFAULT_SEED)), DEFAULT_SEED);
         String compStr    = cmd.getOptionValue("compression", DEFAULT_COMPRESSION);
 
@@ -133,11 +140,12 @@ public class MockArrowGenerator {
             System.out.printf("  output      : %s%n", outputPath);
             System.out.printf("  target      : %d MiB%n", sizeMb);
             System.out.printf("  batch       : %d rows%n", batchRows);
+            System.out.printf("  payload     : %s%n", payloadBytes > 0 ? payloadBytes + " bytes" : "schema default");
             System.out.printf("  seed        : %d%n", seed);
             System.out.printf("  compression : %s%n", compStr.toUpperCase());
             System.out.printf("  rowKey      : %s%n%n", schema.rowKeyRule);
 
-            RowGenerator gen = new RowGenerator(schema, seed);
+            RowGenerator gen = new RowGenerator(schema, seed, payloadBytes);
             GenerateResult result = generate(schema, out, sizeMb, batchRows, gen, codec);
 
             System.out.printf("%nDone:%n");
@@ -169,6 +177,7 @@ public class MockArrowGenerator {
             System.out.printf("  count       : %d files%n", count);
             System.out.printf("  size/file   : %d MiB%n", sizeMb);
             System.out.printf("  batch       : %d rows%n", batchRows);
+            System.out.printf("  payload     : %s%n", payloadBytes > 0 ? payloadBytes + " bytes" : "schema default");
             System.out.printf("  seed        : %d%n", seed);
             System.out.printf("  compression : %s%n", compStr.toUpperCase());
             System.out.printf("  rowKey      : %s%n", schema.rowKeyRule);
@@ -176,27 +185,19 @@ public class MockArrowGenerator {
             System.out.printf("  REFID/STARTTIME 单调递增，跨文件绝无重复%n%n");
 
             // 关键：单一 RowGenerator 实例跨所有文件，保证主键全局唯一
-            RowGenerator sharedGen = new RowGenerator(schema, seed);
-            long totalRows = 0;
             long startAll  = System.currentTimeMillis();
-
-            for (int i = 0; i < count; i++) {
-                String fileName = String.format("%s_%04d.arrow", schema.tableName, i);
-                Path   filePath = dir.resolve(fileName);
-
-                long t0 = System.currentTimeMillis();
-                GenerateResult r = generate(schema, filePath, sizeMb, batchRows, sharedGen, codec);
-                long elapsedMs = System.currentTimeMillis() - t0;
-                totalRows += r.totalRows;
-
-                System.out.printf("  [%d/%d] %-50s  rows=%,d  size=%.1fMiB  %dms%n",
-                    i + 1, count, fileName, r.totalRows,
-                    r.fileSizeBytes / 1024.0 / 1024.0, elapsedMs);
+            DirectoryGenerateResult batchResult = generateDirectory(
+                schema, dir, count, sizeMb, batchRows, seed, payloadBytes, codec);
+            for (int i = 0; i < batchResult.files().size(); i++) {
+                Path filePath = batchResult.files().get(i);
+                GenerateResult fileResult = batchResult.fileResults().get(i);
+                System.out.printf("  [%d/%d] %-50s  rows=%,d  size=%.1fMiB%n",
+                    i + 1, count, filePath.getFileName(), fileResult.totalRows,
+                    fileResult.fileSizeBytes / 1024.0 / 1024.0);
             }
-
             long totalMs = System.currentTimeMillis() - startAll;
             System.out.printf("%nDone: %d files  total rows=%,d  elapsed=%.1fs%n",
-                count, totalRows, totalMs / 1000.0);
+                count, batchResult.totalRows(), totalMs / 1000.0);
             System.out.printf("rowKeyRule: %s%n", schema.rowKeyRule);
         }
     }
@@ -211,6 +212,13 @@ public class MockArrowGenerator {
             throws IOException {
         return generate(schema, output, sizeMb, batchRows,
                         new RowGenerator(schema, seed), null);
+    }
+
+    public static GenerateResult generate(
+            TableSchema schema, Path output, int sizeMb, int batchRows, long seed, int payloadBytes)
+            throws IOException {
+        return generate(schema, output, sizeMb, batchRows,
+                        new RowGenerator(schema, seed, payloadBytes), null);
     }
 
     /**
@@ -270,6 +278,43 @@ public class MockArrowGenerator {
         return new GenerateResult(totalRows, batches, fileSize);
     }
 
+    public static DirectoryGenerateResult generateDirectory(
+            TableSchema schema,
+            Path dir,
+            int count,
+            int sizeMb,
+            int batchRows,
+            long seed,
+            int payloadBytes,
+            CompressionUtil.CodecType codec) throws IOException {
+        if (count < 1) {
+            throw new IllegalArgumentException("count must be >= 1");
+        }
+        Files.createDirectories(dir);
+        RowGenerator sharedGen = new RowGenerator(schema, seed, payloadBytes);
+        List<Path> files = new ArrayList<>(count);
+        List<GenerateResult> fileResults = new ArrayList<>(count);
+        long totalRows = 0L;
+        int totalBatches = 0;
+        long totalFileSizeBytes = 0L;
+        for (int index = 0; index < count; index++) {
+            Path filePath = dir.resolve(String.format("%s_%04d.arrow", schema.tableName, index));
+            GenerateResult result = generate(schema, filePath, sizeMb, batchRows, sharedGen, codec);
+            files.add(filePath);
+            fileResults.add(result);
+            totalRows += result.totalRows;
+            totalBatches += result.batches;
+            totalFileSizeBytes += result.fileSizeBytes;
+        }
+        return new DirectoryGenerateResult(
+            totalRows,
+            totalBatches,
+            totalFileSizeBytes,
+            List.copyOf(files),
+            List.copyOf(fileResults)
+        );
+    }
+
     // ── Writer factory ────────────────────────────────────────────────────────
 
     /**
@@ -294,7 +339,7 @@ public class MockArrowGenerator {
         }
     }
 
-    // ── Batch filling（原有逻辑，完全不变）────────────────────────────────────
+    // ── Batch filling（默认生成乱序数据）─────────────────────────────────────
 
     private static void fillBatch(
             TableSchema schema, VectorSchemaRoot root,
@@ -318,8 +363,14 @@ public class MockArrowGenerator {
         BigIntVector  bitmapVec  = (BigIntVector)  vectors.get(3);
         VarCharVector noVec      = (VarCharVector) vectors.get(4);
 
+        Object[][] rows = new Object[n][];
         for (int i = 0; i < n; i++) {
-            Object[] row = gen.nextRow();
+            rows[i] = gen.nextRow();
+        }
+        gen.shuffleRows(rows);
+
+        for (int i = 0; i < n; i++) {
+            Object[] row = rows[i];
             refidVec .setSafe(i, (Long)   row[0]);
             timeVec  .setSafe(i, (Long)   row[1]);
             byte[] sigBytes = ((String) row[2]).getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -340,8 +391,14 @@ public class MockArrowGenerator {
         VarCharVector cellVec   = (VarCharVector) vectors.get(6);
         VarCharVector ratVec    = (VarCharVector) vectors.get(7);
 
+        Object[][] rows = new Object[n][];
         for (int i = 0; i < n; i++) {
-            Object[] row = gen.nextRow();
+            rows[i] = gen.nextRow();
+        }
+        gen.shuffleRows(rows);
+
+        for (int i = 0; i < n; i++) {
+            Object[] row = rows[i];
             startVec.setSafe(i, (Long) row[0]);
             setUtf8(imsiVec,   i, (String) row[1]);
             setUtf8(msisdnVec, i, (String) row[2]);
@@ -361,6 +418,14 @@ public class MockArrowGenerator {
     // ── Result record（原有，不变）────────────────────────────────────────────
 
     public record GenerateResult(long totalRows, int batches, long fileSizeBytes) {}
+
+    public record DirectoryGenerateResult(
+        long totalRows,
+        int totalBatches,
+        long totalFileSizeBytes,
+        List<Path> files,
+        List<GenerateResult> fileResults
+    ) {}
 
     // ── CLI helpers ───────────────────────────────────────────────────────────
 
@@ -404,6 +469,9 @@ public class MockArrowGenerator {
         o.addOption(Option.builder().longOpt("batch")
             .desc("Rows per Arrow RecordBatch  [default: " + DEFAULT_BATCH_ROWS + "]")
             .hasArg().argName("ROWS").build());
+        o.addOption(Option.builder().longOpt("payload-bytes")
+            .desc("Approximate payload bytes for large text columns; for tdr_signal_stor_20550 this tunes SIGSTORE width")
+            .hasArg().argName("BYTES").build());
         o.addOption(Option.builder().longOpt("seed")
             .desc("Random seed for reproducibility  [default: " + DEFAULT_SEED + "]")
             .hasArg().argName("SEED").build());
@@ -428,7 +496,7 @@ public class MockArrowGenerator {
             "\nExamples:\n" +
             "  # 单文件，ZSTD 压缩（默认，与生产一致）:\n" +
             "  java -jar mock-arrow-1.0.0.jar \\\n" +
-            "    --output /data/tdr_20550.arrow --size 50\n\n" +
+            "    --output /data/tdr_20550.arrow --size 50 --payload-bytes 512\n\n" +
             "  # 单文件，不压缩:\n" +
             "  java -jar mock-arrow-1.0.0.jar \\\n" +
             "    --output /data/tdr_20550.arrow --size 50 --compression NONE\n\n" +

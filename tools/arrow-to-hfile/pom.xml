@@ -76,6 +76,16 @@
       <version>${arrow.version}</version>
     </dependency>
     <dependency>
+      <groupId>org.apache.arrow</groupId>
+      <artifactId>arrow-compression</artifactId>
+      <version>${arrow.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.github.luben</groupId>
+      <artifactId>zstd-jni</artifactId>
+      <version>1.5.5-11</version>
+    </dependency>
+    <dependency>
       <groupId>org.junit.jupiter</groupId>
       <artifactId>junit-jupiter</artifactId>
       <version>${junit.version}</version>
@@ -138,6 +148,8 @@
                 <Add-Opens>java.base/java.lang=ALL-UNNAMED</Add-Opens>
               </manifestEntries>
             </transformer>
+            <transformer implementation=
+              "org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
           </transformers>
           <!-- 排除签名文件，防止 fat jar 签名冲突 -->
           <filters>

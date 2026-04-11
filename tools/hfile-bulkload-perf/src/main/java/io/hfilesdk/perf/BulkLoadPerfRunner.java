@@ -9,13 +9,8 @@ import io.hfilesdk.converter.ConvertResult;
 import io.hfilesdk.converter.javaimpl.ArrowToHFileJavaConverter;
 import io.hfilesdk.converter.javaimpl.JavaConvertOptions;
 import io.hfilesdk.converter.javaimpl.JavaConvertResult;
-import org.apache.arrow.memory.BufferAllocator;
-import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.BigIntVector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.VarCharVector;
-import org.apache.arrow.vector.VectorSchemaRoot;
-import org.apache.arrow.vector.ipc.ArrowStreamWriter;
+import io.hfilesdk.mock.MockArrowGenerator;
+import io.hfilesdk.mock.TableSchema;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
@@ -24,7 +19,6 @@ import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 
 import java.nio.Buffer;
-import java.nio.channels.Channels;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -42,12 +36,13 @@ public final class BulkLoadPerfRunner {
 
     private static final int FIXED_ITERATIONS = 3;
     private static final int DEFAULT_BATCH_ROWS = 8192;
-    private static final int DEFAULT_PAYLOAD_BYTES = 768;
+    private static final int DEFAULT_PAYLOAD_BYTES = 0;
     private static final int DEFAULT_MERGE_THRESHOLD_MB = 100;
     private static final int DEFAULT_TRIGGER_SIZE_MB = 512;
     private static final int DEFAULT_TRIGGER_COUNT = 500;
     private static final int DEFAULT_TRIGGER_INTERVAL_SECONDS = 180;
-    private static final String DEFAULT_RULE = "USER_ID,0,false,0";
+    private static final String DEFAULT_TABLE = TableSchema.TDR_SIGNAL_STOR_20550.tableName;
+    private static final long DEFAULT_MOCK_ARROW_SEED = 42L;
     private static final String DEFAULT_CF = "cf";
     private static final String DEFAULT_COMPRESSION = "GZ";
     private static final String DEFAULT_ENCODING = "NONE";
@@ -55,11 +50,6 @@ public final class BulkLoadPerfRunner {
     private static final String DEFAULT_ERROR_POLICY = "skip_row";
     private static final int DEFAULT_BLOCK_SIZE = 65536;
     private static final String DEFAULT_WORK_DIR = "/tmp/hfilesdk-bulkload-perf";
-    private static final int FIXED_ARROW_OVERHEAD_BYTES = 256;
-    private static final int FIXED_ROW_OVERHEAD_BYTES = 80;
-    private static final String USER_ID_PREFIX = "user-";
-    private static final String DEVICE_PREFIX = "device-";
-    private static final String[] REGIONS = {"cn-north", "cn-east", "cn-south", "sg", "us-west"};
     private static final String IMPL_JNI = "arrow-to-hfile";
     private static final String IMPL_JAVA = "arrow-to-hfile-java";
     private static final String STRATEGY_DIRECT = "DIRECT-CONVERT";
@@ -132,7 +122,7 @@ public final class BulkLoadPerfRunner {
     private static Options buildOptions() {
         Options options = new Options();
         options.addOption(Option.builder().longOpt("native-lib").hasArg().argName("PATH").desc("JNI 实现所需 libhfilesdk 动态库路径").build());
-        options.addOption(Option.builder().longOpt("table").hasArg().argName("NAME").desc("表名，默认 hfilesdk_perf").build());
+        options.addOption(Option.builder().longOpt("table").hasArg().argName("NAME").desc("mock-arrow 表名，默认 tdr_signal_stor_20550").build());
         options.addOption(Option.builder().longOpt("work-dir").hasArg().argName("PATH").desc("工作目录").build());
         options.addOption(Option.builder().longOpt("report-json").hasArg().argName("PATH").desc("结构化结果输出路径").build());
         options.addOption(Option.builder().longOpt("implementations").hasArg().argName("LIST").desc("实现列表：arrow-to-hfile,arrow-to-hfile-java").build());
@@ -144,9 +134,9 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("trigger-count").hasArg().argName("N").desc("JNI 合并攒批文件数阈值").build());
         options.addOption(Option.builder().longOpt("trigger-interval").hasArg().argName("SEC").desc("JNI 合并时间阈值").build());
         options.addOption(Option.builder().longOpt("batch-rows").hasArg().argName("N").desc("每个 Arrow batch 行数").build());
-        options.addOption(Option.builder().longOpt("payload-bytes").hasArg().argName("BYTES").desc("每行 PAYLOAD 字节数").build());
+        options.addOption(Option.builder().longOpt("payload-bytes").hasArg().argName("BYTES").desc("mock-arrow 大文本列近似字节数；tdr_signal_stor_20550 下对应 SIGSTORE 宽度").build());
         options.addOption(Option.builder().longOpt("cf").hasArg().argName("CF").desc("列族名").build());
-        options.addOption(Option.builder().longOpt("rule").hasArg().argName("RULE").desc("rowKeyRule").build());
+        options.addOption(Option.builder().longOpt("rule").hasArg().argName("RULE").desc("rowKeyRule；未传时默认使用 mock-arrow schema 自带规则").build());
         options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法").build());
         options.addOption(Option.builder().longOpt("encoding").hasArg().argName("ENC").desc("Data Block Encoding").build());
         options.addOption(Option.builder().longOpt("bloom").hasArg().argName("TYPE").desc("Bloom 类型").build());
@@ -189,10 +179,12 @@ public final class BulkLoadPerfRunner {
         Path reportJson = Path.of(commandLine.getOptionValue("report-json", "perf-matrix-report.json"))
             .toAbsolutePath()
             .normalize();
+        String tableName = commandLine.getOptionValue("table", DEFAULT_TABLE);
+        String rowKeyRule = resolveDefaultRowKeyRule(tableName, workerMode, commandLine.getOptionValue("rule", ""));
 
         return new RunConfig(
             nativeLib,
-            commandLine.getOptionValue("table", "hfilesdk_perf"),
+            tableName,
             workDir,
             reportJson,
             implementations,
@@ -203,9 +195,9 @@ public final class BulkLoadPerfRunner {
             parsePositiveInt(commandLine.getOptionValue("trigger-count", Integer.toString(DEFAULT_TRIGGER_COUNT)), "trigger-count"),
             parsePositiveInt(commandLine.getOptionValue("trigger-interval", Integer.toString(DEFAULT_TRIGGER_INTERVAL_SECONDS)), "trigger-interval"),
             parsePositiveInt(commandLine.getOptionValue("batch-rows", Integer.toString(DEFAULT_BATCH_ROWS)), "batch-rows"),
-            parsePositiveInt(commandLine.getOptionValue("payload-bytes", Integer.toString(DEFAULT_PAYLOAD_BYTES)), "payload-bytes"),
+            Math.toIntExact(parseNonNegativeLong(commandLine.getOptionValue("payload-bytes", Integer.toString(DEFAULT_PAYLOAD_BYTES)), "payload-bytes")),
             commandLine.getOptionValue("cf", DEFAULT_CF),
-            commandLine.getOptionValue("rule", DEFAULT_RULE),
+            rowKeyRule,
             commandLine.getOptionValue("compression", DEFAULT_COMPRESSION),
             commandLine.getOptionValue("encoding", DEFAULT_ENCODING),
             commandLine.getOptionValue("bloom", DEFAULT_BLOOM),
@@ -220,6 +212,16 @@ public final class BulkLoadPerfRunner {
             parseNonNegativeLong(commandLine.getOptionValue("java-xmx-mb", "0"), "java-xmx-mb"),
             parseNonNegativeLong(commandLine.getOptionValue("java-direct-memory-mb", "0"), "java-direct-memory-mb")
         );
+    }
+
+    private static String resolveDefaultRowKeyRule(String tableName, boolean workerMode, String rawRule) {
+        if (rawRule != null && !rawRule.isBlank()) {
+            return rawRule;
+        }
+        if (workerMode) {
+            return TableSchema.TDR_SIGNAL_STOR_20550.rowKeyRule;
+        }
+        return TableSchema.forTable(tableName).rowKeyRule;
     }
 
     private static List<String> parseImplementations(String raw) {
@@ -289,76 +291,25 @@ public final class BulkLoadPerfRunner {
 
     private static GenerationStats generateArrowFiles(RunConfig config, ScenarioConfig scenario, Path inputDir) throws Exception {
         long start = System.nanoTime();
-        byte[] payloadSuffix = buildPayloadSuffix(config.payloadBytes());
-        List<Path> arrowFiles = new ArrayList<>();
-        long totalRows = 0L;
-        int totalBatches = 0;
-        long totalArrowSizeBytes = 0L;
-        long nextRowOffset = 0L;
-
-        for (int index = 0; index < scenario.arrowFileCount(); index++) {
-            Path arrowFile = inputDir.resolve(String.format(Locale.ROOT, "%s-part-%03d.arrow", scenario.scenarioId(), index + 1));
-            SingleFileGenerationStats fileStats = writeArrowFile(config, scenario.targetSizeMb(), arrowFile, nextRowOffset, payloadSuffix);
-            arrowFiles.add(arrowFile);
-            totalRows += fileStats.rows();
-            totalBatches += fileStats.batches();
-            totalArrowSizeBytes += fileStats.sizeBytes();
-            nextRowOffset += fileStats.rows();
-        }
+        TableSchema schema = TableSchema.forTable(config.tableName());
+        MockArrowGenerator.DirectoryGenerateResult generationResult = MockArrowGenerator.generateDirectory(
+            schema,
+            inputDir,
+            scenario.arrowFileCount(),
+            scenario.targetSizeMb(),
+            config.batchRows(),
+            DEFAULT_MOCK_ARROW_SEED,
+            config.payloadBytes(),
+            null
+        );
 
         return new GenerationStats(
-            totalRows,
-            totalBatches,
-            totalArrowSizeBytes,
-            List.copyOf(arrowFiles),
+            generationResult.totalRows(),
+            generationResult.totalBatches(),
+            generationResult.totalFileSizeBytes(),
+            generationResult.files(),
             System.nanoTime() - start
         );
-    }
-
-    private static SingleFileGenerationStats writeArrowFile(RunConfig config,
-                                                            int targetSizeMb,
-                                                            Path arrowFile,
-                                                            long rowOffset,
-                                                            byte[] payloadSuffix) throws Exception {
-        long targetBytes = targetSizeMb * 1024L * 1024L;
-        long rows = 0L;
-        int batches = 0;
-        long eventBase = 1_775_000_000L;
-        int estimatedRowBytes = Math.max(1, config.payloadBytes() + FIXED_ROW_OVERHEAD_BYTES);
-
-        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
-             VarCharVector userIdVector = new VarCharVector("USER_ID", allocator);
-             BigIntVector eventTimeVector = new BigIntVector("EVENT_TIME", allocator);
-             VarCharVector deviceIdVector = new VarCharVector("DEVICE_ID", allocator);
-             VarCharVector regionVector = new VarCharVector("REGION", allocator);
-             IntVector scoreVector = new IntVector("SCORE", allocator);
-             VarCharVector payloadVector = new VarCharVector("PAYLOAD", allocator);
-             VectorSchemaRoot root = new VectorSchemaRoot(List.of(
-                 userIdVector,
-                 eventTimeVector,
-                 deviceIdVector,
-                 regionVector,
-                 scoreVector,
-                 payloadVector
-             ));
-             ArrowStreamWriter writer = new ArrowStreamWriter(root, null, Channels.newChannel(Files.newOutputStream(arrowFile)))) {
-
-            allocateVectors(config, userIdVector, eventTimeVector, deviceIdVector, regionVector, scoreVector, payloadVector);
-            writer.start();
-            while (!Files.exists(arrowFile) || Files.size(arrowFile) < targetBytes) {
-                long currentSize = Files.exists(arrowFile) ? Files.size(arrowFile) : 0L;
-                long remainingBytes = Math.max(estimatedRowBytes, targetBytes - currentSize - FIXED_ARROW_OVERHEAD_BYTES);
-                int rowsThisBatch = (int) Math.min(config.batchRows(), Math.max(1L, remainingBytes / estimatedRowBytes));
-                fillBatch(config, rowsThisBatch, rowOffset + rows, payloadSuffix, eventBase, userIdVector, eventTimeVector, deviceIdVector, regionVector, scoreVector, payloadVector);
-                root.setRowCount(rowsThisBatch);
-                writer.writeBatch();
-                rows += rowsThisBatch;
-                batches++;
-            }
-            writer.end();
-        }
-
-        return new SingleFileGenerationStats(rows, batches, Files.size(arrowFile));
     }
 
     private static ImplementationSummary runImplementation(RunConfig config,
@@ -859,9 +810,12 @@ public final class BulkLoadPerfRunner {
                 userTicks = sample.utimeTicks();
                 sysTicks = sample.stimeTicks();
             } else {
-                procfsCpuFallbackMs = process.toHandle().info().totalCpuDuration()
-                    .map(Duration::toMillis)
-                    .orElse(procfsCpuFallbackMs);
+                try {
+                    procfsCpuFallbackMs = process.toHandle().info().totalCpuDuration()
+                        .map(Duration::toMillis)
+                        .orElse(procfsCpuFallbackMs);
+                } catch (RuntimeException ignored) {
+                }
             }
             Thread.sleep(PROCESS_SAMPLE_INTERVAL_MS);
         }
@@ -1036,72 +990,6 @@ public final class BulkLoadPerfRunner {
         System.out.println("  total_ms            : " + nanosToMillis(report.totalNanos()));
     }
 
-    private static void allocateVectors(RunConfig config,
-                                        VarCharVector userIdVector,
-                                        BigIntVector eventTimeVector,
-                                        VarCharVector deviceIdVector,
-                                        VarCharVector regionVector,
-                                        IntVector scoreVector,
-                                        VarCharVector payloadVector) {
-        int batchRows = config.batchRows();
-        userIdVector.allocateNew(Math.max(256, batchRows * 24), batchRows);
-        eventTimeVector.allocateNew(batchRows);
-        deviceIdVector.allocateNew(Math.max(256, batchRows * 24), batchRows);
-        regionVector.allocateNew(Math.max(256, batchRows * 12), batchRows);
-        scoreVector.allocateNew(batchRows);
-        payloadVector.allocateNew((long) batchRows * config.payloadBytes(), batchRows);
-    }
-
-    private static void fillBatch(RunConfig config,
-                                  int rowCount,
-                                  long rowOffset,
-                                  byte[] payloadSuffix,
-                                  long eventBase,
-                                  VarCharVector userIdVector,
-                                  BigIntVector eventTimeVector,
-                                  VarCharVector deviceIdVector,
-                                  VarCharVector regionVector,
-                                  IntVector scoreVector,
-                                  VarCharVector payloadVector) {
-        for (int index = 0; index < rowCount; index++) {
-            long rowId = rowOffset + index;
-            userIdVector.setSafe(index, utf8(USER_ID_PREFIX + zeroPad(rowId, 12)));
-            eventTimeVector.setSafe(index, eventBase + rowId);
-            deviceIdVector.setSafe(index, utf8(DEVICE_PREFIX + zeroPad(rowId % 1_000_000L, 10)));
-            regionVector.setSafe(index, utf8(REGIONS[(int) (rowId % REGIONS.length)]));
-            scoreVector.setSafe(index, (int) (rowId % 10_000));
-            payloadVector.setSafe(index, buildPayload(rowId, config.payloadBytes(), payloadSuffix));
-        }
-        userIdVector.setValueCount(rowCount);
-        eventTimeVector.setValueCount(rowCount);
-        deviceIdVector.setValueCount(rowCount);
-        regionVector.setValueCount(rowCount);
-        scoreVector.setValueCount(rowCount);
-        payloadVector.setValueCount(rowCount);
-    }
-
-    private static byte[] buildPayload(long rowId, int payloadBytes, byte[] suffix) {
-        byte[] prefix = utf8("payload-" + Long.toUnsignedString(rowId, 36) + "-");
-        if (payloadBytes <= prefix.length) {
-            byte[] out = new byte[payloadBytes];
-            System.arraycopy(prefix, 0, out, 0, payloadBytes);
-            return out;
-        }
-        byte[] out = new byte[payloadBytes];
-        System.arraycopy(prefix, 0, out, 0, prefix.length);
-        System.arraycopy(suffix, 0, out, prefix.length, payloadBytes - prefix.length);
-        return out;
-    }
-
-    private static byte[] buildPayloadSuffix(int payloadBytes) {
-        byte[] out = new byte[payloadBytes];
-        byte[] seed = utf8("abcdefghijklmnopqrstuvwxyz0123456789");
-        for (int index = 0; index < out.length; index++) {
-            out[index] = seed[index % seed.length];
-        }
-        return out;
-    }
-
     private static String decideStrategy(List<Path> arrowFiles, int mergeThresholdMb) {
         if (arrowFiles.isEmpty()) {
             return STRATEGY_DIRECT;
@@ -1233,14 +1121,6 @@ public final class BulkLoadPerfRunner {
             throw new IllegalArgumentException("--" + option + " is required");
         }
         return value;
-    }
-
-    private static String zeroPad(long value, int width) {
-        return String.format(Locale.ROOT, "%0" + width + "d", value);
-    }
-
-    private static byte[] utf8(String value) {
-        return value.getBytes(StandardCharsets.UTF_8);
     }
 
     private static long nanosToMillis(long nanos) {
@@ -1395,8 +1275,6 @@ public final class BulkLoadPerfRunner {
     ) {}
 
     private record ScenarioConfig(String scenarioId, String inputMode, int arrowFileCount, int targetSizeMb) {}
-
-    private record SingleFileGenerationStats(long rows, int batches, long sizeBytes) {}
 
     private record GenerationStats(long rows, int batches, long arrowSizeBytes, List<Path> arrowFiles, long elapsedNanos) {}
 

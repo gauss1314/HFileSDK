@@ -64,7 +64,8 @@ final class BulkLoadPerfRunnerTest {
             "--scenario-filter", "single-001mb",
             "--work-dir", tempDir.toString(),
             "--report-json", reportJson.toString(),
-            "--rule", "USER_ID,0,false,0",
+            "--table", "tdr_signal_stor_20550",
+            "--rule", "REFID,0,false,15",
             "--java-xmx-mb", "256",
             "--java-direct-memory-mb", "256"
         });
@@ -95,8 +96,10 @@ final class BulkLoadPerfRunnerTest {
         command.add("single-001mb");
         command.add("--work-dir");
         command.add(workDir.toString());
+        command.add("--table");
+        command.add("tdr_signal_stor_20550");
         command.add("--rule");
-        command.add("USER_ID,0,false,0");
+        command.add("REFID,0,false,15");
         command.add("--java-xmx-mb");
         command.add("256");
         command.add("--java-direct-memory-mb");

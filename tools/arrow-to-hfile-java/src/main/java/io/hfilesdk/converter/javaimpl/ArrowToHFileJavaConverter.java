@@ -15,8 +15,11 @@ import org.apache.arrow.vector.UInt4Vector;
 import org.apache.arrow.vector.UInt8Vector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
+import org.apache.arrow.vector.VectorLoader;
 import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.VectorUnloader;
 import org.apache.arrow.vector.ipc.ArrowStreamReader;
+import org.apache.arrow.vector.ipc.message.ArrowRecordBatch;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.HelpFormatter;
@@ -61,6 +64,7 @@ public final class ArrowToHFileJavaConverter {
         java.nio.file.Path hfilePath = Paths.get(options.hfilePath()).toAbsolutePath().normalize();
         long rowsRead = 0L;
         long kvWritten = 0L;
+        List<VectorSchemaRoot> storedBatches = new ArrayList<>();
 
         try {
             if (!Files.exists(arrowPath) || !Files.isRegularFile(arrowPath)) {
@@ -95,42 +99,40 @@ public final class ArrowToHFileJavaConverter {
                 .withIncludesTags(true)
                 .build();
 
-            try (InputStream inputStream = Files.newInputStream(arrowPath);
-                 ArrowStreamReader reader = new ArrowStreamReader(inputStream, new RootAllocator(Long.MAX_VALUE));
-                 HFile.Writer writer = HFile.getWriterFactory(configuration, new CacheConfig(configuration))
-                     .withPath(fileSystem, outputPath)
-                     .withFileContext(context)
-                     .create()) {
+            try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+                 InputStream inputStream = Files.newInputStream(arrowPath);
+                 ArrowStreamReader reader = new ArrowStreamReader(inputStream, allocator)) {
+                try {
+                    VectorSchemaRoot root = reader.getVectorSchemaRoot();
+                    ProjectedSchema projectedSchema = ProjectedSchema.from(root, options);
+                    JavaRowKeyBuilder rowKeyBuilder = JavaRowKeyBuilder.compile(options.rowKeyRule(), projectedSchema.fieldCount());
+                    List<SortEntry> sortIndex = new ArrayList<>();
 
-                VectorSchemaRoot root = reader.getVectorSchemaRoot();
-                ProjectedSchema projectedSchema = ProjectedSchema.from(root, options);
-                JavaRowKeyBuilder rowKeyBuilder = JavaRowKeyBuilder.compile(options.rowKeyRule(), projectedSchema.fieldCount());
-                byte[] previousRowKey = null;
-
-                while (reader.loadNextBatch()) {
-                    int rowCount = root.getRowCount();
-                    for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
-                        byte[] rowKey = rowKeyBuilder.buildRowKey(projectedSchema.visibleFields(), rowIndex);
-                        if (previousRowKey != null && Bytes.compareTo(previousRowKey, rowKey) > 0) {
-                            return JavaConvertResult.error(
-                                JavaConvertResult.SORT_VIOLATION,
-                                "输入 Arrow 未按 rowKeyRule 结果升序排列，纯 Java 实现不会执行额外排序",
-                                arrowPath.toString(),
-                                hfilePath.toString(),
-                                rowsRead,
-                                kvWritten,
-                                elapsedMillis(start)
-                            );
+                    while (reader.loadNextBatch()) {
+                        storedBatches.add(cloneBatch(root, allocator));
+                        int batchIndex = storedBatches.size() - 1;
+                        int rowCount = root.getRowCount();
+                        for (int rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+                            byte[] rowKey = rowKeyBuilder.buildRowKey(projectedSchema, root, rowIndex);
+                            if (rowKey.length == 0) {
+                                rowsRead++;
+                                continue;
+                            }
+                            sortIndex.add(new SortEntry(rowKey, batchIndex, rowIndex));
+                            rowsRead++;
                         }
-                        previousRowKey = rowKey;
-                        long timestamp = Long.MAX_VALUE - rowsRead;
-                        for (VisibleField visibleField : projectedSchema.qualifierFields()) {
-                            byte[] value = extractValueBytes(visibleField.vector(), rowIndex);
-                            writer.append(new KeyValue(rowKey, columnFamily, visibleField.qualifier(), timestamp, value));
-                            kvWritten++;
-                        }
-                        rowsRead++;
                     }
+
+                    sortIndex.sort((left, right) -> Bytes.compareTo(left.rowKey(), right.rowKey()));
+
+                    try (HFile.Writer writer = HFile.getWriterFactory(configuration, new CacheConfig(configuration))
+                        .withPath(fileSystem, outputPath)
+                        .withFileContext(context)
+                        .create()) {
+                        kvWritten = writeSortedRows(writer, columnFamily, storedBatches, projectedSchema, sortIndex);
+                    }
+                } finally {
+                    closeBatches(storedBatches);
                 }
             }
 
@@ -403,22 +405,92 @@ public final class ArrowToHFileJavaConverter {
         return value == null ? "" : String.valueOf(value);
     }
 
-    private record VisibleField(String name, byte[] qualifier, FieldVector vector) {}
+    private static VectorSchemaRoot cloneBatch(VectorSchemaRoot sourceRoot, RootAllocator allocator) throws IOException {
+        VectorSchemaRoot clonedRoot = VectorSchemaRoot.create(sourceRoot.getSchema(), allocator);
+        try (ArrowRecordBatch unloaded = new VectorUnloader(sourceRoot).getRecordBatch();
+             ArrowRecordBatch transferred = unloaded.cloneWithTransfer(allocator)) {
+            new VectorLoader(clonedRoot).load(transferred);
+            return clonedRoot;
+        } catch (Exception e) {
+            clonedRoot.close();
+            throw new IOException("Arrow batch clone failed: " + e.getMessage(), e);
+        }
+    }
 
-    private record ProjectedSchema(List<VisibleField> visibleFields, List<VisibleField> qualifierFields) {
+    private static long writeSortedRows(HFile.Writer writer,
+                                        byte[] columnFamily,
+                                        List<VectorSchemaRoot> storedBatches,
+                                        ProjectedSchema projectedSchema,
+                                        List<SortEntry> sortIndex) throws IOException {
+        long kvWritten = 0L;
+        List<GroupedCell> cells = new ArrayList<>();
+
+        for (int index = 0; index < sortIndex.size();) {
+            SortEntry current = sortIndex.get(index);
+            byte[] rowKey = current.rowKey();
+            cells.clear();
+
+            int next = index;
+            while (next < sortIndex.size() && Bytes.equals(sortIndex.get(next).rowKey(), rowKey)) {
+                SortEntry entry = sortIndex.get(next);
+                VectorSchemaRoot batchRoot = storedBatches.get(entry.batchIndex());
+                for (ProjectedField field : projectedSchema.qualifierFields()) {
+                    byte[] value = extractValueBytes(batchRoot.getVector(field.sourceIndex()), entry.rowIndex());
+                    if (value.length == 0) {
+                        continue;
+                    }
+                    cells.add(new GroupedCell(field.name(), field.qualifier(), value));
+                }
+                next++;
+            }
+
+            cells.sort(Comparator.comparing(GroupedCell::name));
+            String previousQualifier = null;
+            long timestamp = System.currentTimeMillis();
+            for (GroupedCell cell : cells) {
+                if (cell.name().equals(previousQualifier)) {
+                    continue;
+                }
+                writer.append(new KeyValue(rowKey, columnFamily, cell.qualifier(), timestamp, cell.value()));
+                kvWritten++;
+                previousQualifier = cell.name();
+            }
+            index = next;
+        }
+        return kvWritten;
+    }
+
+    private static void closeBatches(List<VectorSchemaRoot> storedBatches) {
+        for (int index = storedBatches.size() - 1; index >= 0; index--) {
+            try {
+                storedBatches.get(index).close();
+            } catch (Exception ignored) {
+            }
+        }
+    }
+
+    private record ProjectedField(String name, byte[] qualifier, int sourceIndex) {}
+
+    private record GroupedCell(String name, byte[] qualifier, byte[] value) {}
+
+    private record SortEntry(byte[] rowKey, int batchIndex, int rowIndex) {}
+
+    private record ProjectedSchema(List<ProjectedField> visibleFields, List<ProjectedField> qualifierFields) {
         private static ProjectedSchema from(VectorSchemaRoot root, JavaConvertOptions options) {
-            List<VisibleField> visibleFields = new ArrayList<>();
-            for (FieldVector vector : root.getFieldVectors()) {
+            List<ProjectedField> visibleFields = new ArrayList<>();
+            List<FieldVector> vectors = root.getFieldVectors();
+            for (int sourceIndex = 0; sourceIndex < vectors.size(); sourceIndex++) {
+                FieldVector vector = vectors.get(sourceIndex);
                 if (isExcluded(vector.getName(), options)) {
                     continue;
                 }
-                visibleFields.add(new VisibleField(vector.getName(), Bytes.toBytes(vector.getName()), vector));
+                visibleFields.add(new ProjectedField(vector.getName(), Bytes.toBytes(vector.getName()), sourceIndex));
             }
             if (visibleFields.isEmpty()) {
                 throw new IllegalArgumentException("过滤后没有可写入的列");
             }
-            List<VisibleField> qualifierFields = visibleFields.stream()
-                .sorted(Comparator.comparing(VisibleField::name))
+            List<ProjectedField> qualifierFields = visibleFields.stream()
+                .sorted(Comparator.comparing(ProjectedField::name))
                 .toList();
             return new ProjectedSchema(List.copyOf(visibleFields), qualifierFields);
         }
@@ -543,14 +615,18 @@ public final class ArrowToHFileJavaConverter {
             return new JavaRowKeyBuilder(List.copyOf(segments));
         }
 
-        private byte[] buildRowKey(List<VisibleField> visibleFields, int rowIndex) {
+        private byte[] buildRowKey(ProjectedSchema projectedSchema, VectorSchemaRoot root, int rowIndex) {
             StringBuilder builder = new StringBuilder(64);
             for (Segment segment : segments) {
                 String value = switch (segment.type()) {
                     case RANDOM -> randomDigits(segment.padLength());
                     case FILL -> "";
-                    case COLUMN_REF -> extractStringValue(visibleFields.get(segment.columnIndex()).vector(), rowIndex);
-                    case ENCODED -> encodeValue(segment, extractStringValue(visibleFields.get(segment.columnIndex()).vector(), rowIndex));
+                    case COLUMN_REF -> extractStringValue(
+                        root.getVector(projectedSchema.visibleFields().get(segment.columnIndex()).sourceIndex()),
+                        rowIndex);
+                    case ENCODED -> encodeValue(segment, extractStringValue(
+                        root.getVector(projectedSchema.visibleFields().get(segment.columnIndex()).sourceIndex()),
+                        rowIndex));
                 };
                 builder.append(applyPaddingAndReverse(segment, value));
             }

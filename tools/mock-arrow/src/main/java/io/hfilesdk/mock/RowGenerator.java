@@ -10,7 +10,7 @@ import java.util.Random;
  *
  * <h3>Design goals</h3>
  * <ul>
- *   <li>REFID / STARTTIME are unique and monotonically increasing per row</li>
+ *   <li>REFID / STARTTIME are unique and monotonically increasing in logical row generation</li>
  *   <li>String fields have realistic, variable-length values so that the
  *       generated file size is predictable and configurable</li>
  *   <li>All numeric ranges match the sample data provided in the spec</li>
@@ -33,6 +33,7 @@ public class RowGenerator {
 
     private final TableSchema schema;
     private final Random      rng;
+    private final int         payloadBytes;
 
     // ── Per-row state ─────────────────────────────────────────────────────────
     private long refid;
@@ -41,8 +42,13 @@ public class RowGenerator {
     private int  rowIndex;  // global counter used to derive cycling fields
 
     public RowGenerator(TableSchema schema, long seed) {
+        this(schema, seed, 0);
+    }
+
+    public RowGenerator(TableSchema schema, long seed, int payloadBytes) {
         this.schema    = schema;
         this.rng       = new Random(seed);
+        this.payloadBytes = Math.max(0, payloadBytes);
         this.refid     = REFID_START;
         this.starttime = STARTTIME_BASE;
         this.imsiBase  = IMSI_BASE;
@@ -63,6 +69,19 @@ public class RowGenerator {
         };
         rowIndex++;
         return row;
+    }
+
+    /**
+     * Shuffle a batch of generated rows in place so the emitted Arrow file is
+     * not pre-sorted by the eventual row key.
+     */
+    public void shuffleRows(Object[][] rows) {
+        for (int index = rows.length - 1; index > 0; index--) {
+            int swapIndex = rng.nextInt(index + 1);
+            Object[] tmp = rows[index];
+            rows[index] = rows[swapIndex];
+            rows[swapIndex] = tmp;
+        }
     }
 
     // ─── tdr_signal_stor_20550 ────────────────────────────────────────────────
@@ -96,7 +115,10 @@ public class RowGenerator {
      * The number of records is varied (1-3) to produce variable-length values.
      */
     private String buildSigstore(long time) {
-        int numRecords = 1 + (rowIndex % 3);  // 1, 2, or 3 signal records
+        int targetSigstoreBytes = payloadBytes > 0 ? payloadBytes : 0;
+        int numRecords = targetSigstoreBytes > 0
+            ? Math.max(1, (targetSigstoreBytes + 79) / 80)
+            : 1 + (rowIndex % 3);  // 1, 2, or 3 signal records
         StringBuilder sb = new StringBuilder();
         for (int r = 0; r < numRecords; r++) {
             long imsi = IMSI_BASE + rng.nextInt(1_000_000);
@@ -112,6 +134,15 @@ public class RowGenerator {
             sb.append(String.format(
                 "cs,%d,%d,%d,%d,0,%d,,,%d,%d,,%d,%d,,,%d,%d,%d,",
                 svc, mcc, mnc, imsi, rat, time, time, cell, rsrp, ber, snr, bytes));
+        }
+        if (targetSigstoreBytes > 0) {
+            while (sb.length() < targetSigstoreBytes) {
+                sb.append("cs,12111,100,100,460001234560000,0,1,,,")
+                    .append(time)
+                    .append(',')
+                    .append(time)
+                    .append(",,34,10,,,10,10,10,");
+            }
         }
         sb.append("; ");
         return sb.toString();
@@ -152,8 +183,8 @@ public class RowGenerator {
     /** Estimate the approximate serialised byte size of one row (for size budgeting). */
     public int estimateRowBytes() {
         return switch (schema) {
-            // REFID(8) + TIME(8) + SIGSTORE(avg 120B) + BITMAP(8) + NO(1) + overhead(20)
-            case TDR_SIGNAL_STOR_20550 -> 165;
+            // REFID(8) + TIME(8) + SIGSTORE(avg 120B or caller hint) + BITMAP(8) + NO(1) + overhead(20)
+            case TDR_SIGNAL_STOR_20550 -> 45 + Math.max(120, payloadBytes);
             // STARTTIME(8) + IMSI(15) + MSISDN(11) + DURATION(8)*3 + CELL(6) + RAT(3) + overhead(30)
             case TDR_MOCK -> 105;
         };
