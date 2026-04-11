@@ -530,7 +530,7 @@ if(HFILE_ENABLE_JAVA_TESTS)
       ${HFILE_MAVEN_EXECUTABLE} -q test
   )
   set_tests_properties(test_java_jni_integration PROPERTIES
-    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/java)
+    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/tools/arrow-to-hfile)
   add_test(
     NAME test_java_hbase_reader_verify
     COMMAND ${CMAKE_COMMAND}

@@ -2,6 +2,14 @@
 
 Arrow IPC Stream → HBase HFile v3 转换工具，基于 HFileSDK C++ 共享库实现。
 
+## 模块分层
+
+- `com.hfile.HFileSDK`：最底层 JNI 桥接，直接映射 `configure / convert / getLastResult` 三个 native 接口
+- `io.hfilesdk.converter.*`：面向实际使用的工具层与 API 层，封装 native 库加载、参数建模、异常处理、单文件转换、批量转换与自适应批处理
+- `src/test/java/com/hfile/HFileSDKIntegrationTest.java`：JNI 集成测试入口，同时负责生成 HBase Reader 黑盒校验所需 fixture
+
+如果你的目标是完成单个或多个 Arrow 文件转 HFile，优先使用 `ArrowToHFileConverter`、`BatchArrowToHFileConverter` 与 `AdaptiveBatchConverter`，而不是直接操作 `HFileSDK`。
+
 ## 快速开始
 
 ### 1. 编译
@@ -72,6 +80,8 @@ Throughput: 612.4 MB/s
 | `--fsync-policy` | | `safe` | Fsync 策略：`safe`/`fast`/`paranoid` |
 | `--error-policy` | | `skip_row` | 行错误策略：`strict`/`skip_row`/`skip_batch` |
 
+说明：CLI 仍接受 `FAST_DIFF` 等编码参数，但当前 C++ writer 为保证 HBase 可读性，实际落盘会统一回退为 `NONE`。
+
 ---
 
 ### Native Library 加载顺序
@@ -84,6 +94,14 @@ Throughput: 612.4 MB/s
 ---
 
 ## 生产系统集成（目标2）
+
+### 推荐使用层级
+
+- 直接使用 `com.hfile.HFileSDK`：适合你要完全按 JNI 原始契约控制 `configure()` 与错误码
+- 使用 `ArrowToHFileConverter`：适合单文件转换，也是大多数业务接入的推荐入口
+- 使用 `BatchArrowToHFileConverter` / `AdaptiveBatchConverter`：适合目录批量转换和大小文件混合场景
+
+仓库内已经不再保留单独的根目录 `java/` 模块；JNI Java 封装、测试和工具入口现已统一收敛到 `tools/arrow-to-hfile`。
 
 ### 安装到本地 Maven 仓库
 
@@ -285,14 +303,21 @@ ID,0,false,0
 tools/arrow-to-hfile/
 ├── pom.xml
 ├── README.md
-└── src/main/java/
-    ├── com/hfile/
-    │   └── HFileSDK.java              # JNI 桥接（自包含副本）
-    └── io/hfilesdk/converter/
-        ├── ArrowToHFileConverter.java  # 主类：CLI + 生产 API
-        ├── ConvertOptions.java         # 转换参数（Builder 模式）
-        ├── ConvertResult.java          # 转换结果（含 JSON 解析）
-        ├── ConvertException.java       # 失败时的异常
-        ├── NativeLibLoader.java        # native 库加载工具
-        └── NativeLibLoadException.java # 加载失败异常
+└── src/
+    ├── main/java/
+    │   ├── com/hfile/
+    │   │   └── HFileSDK.java              # JNI 桥接唯一实现（低层 API）
+    │   └── io/hfilesdk/converter/
+    │       ├── ArrowToHFileConverter.java  # 单文件 CLI + 推荐生产 API
+    │       ├── BatchArrowToHFileConverter.java
+    │       ├── AdaptiveBatchConverter.java
+    │       ├── ConvertOptions.java         # 单文件转换参数
+    │       ├── ConvertResult.java          # 单文件转换结果
+    │       ├── BatchConvertOptions.java    # 批量转换参数
+    │       ├── BatchConvertResult.java     # 批量转换结果
+    │       ├── ConvertException.java       # 单文件转换异常
+    │       ├── NativeLibLoader.java        # native 库加载工具
+    │       └── NativeLibLoadException.java # 加载失败异常
+    └── test/java/com/hfile/
+        └── HFileSDKIntegrationTest.java    # JNI 集成测试与 HBase Reader fixture 生成
 ```

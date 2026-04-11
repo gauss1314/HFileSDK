@@ -155,7 +155,7 @@ bash scripts/coverage.sh
 
 | 模块 | 已覆盖场景 | 对应用例 |
 |---|---|---|
-| HFileSDK Java JNI | `configure()` 非法 JSON、空路径错误、非法 row key rule、Java 生成 Arrow 文件并经 JNI 完成真实转换 | `test_java_jni_integration` |
+| HFileSDK Java JNI | `configure()` 非法 JSON、空路径错误、非法 row key rule、Java 生成 Arrow 文件并经 JNI 完成真实转换；测试源码位于 `tools/arrow-to-hfile/src/test/java/com/hfile/HFileSDKIntegrationTest.java` | `test_java_jni_integration` |
 | HBase Reader 黑盒校验 | Java/JNI 生成固定 fixture，再用 HBase 原生 Reader 校验 major version、entry count、compression、encoding，以及 row/family/qualifier/value/type 顺序 | `test_java_hbase_reader_verify` |
 
 ## 当前边界

@@ -25,7 +25,7 @@ execute_process(
           "-Dhfilesdk.e2e.arrowPath=${HFILE_ARROW_PATH}"
           "-Dhfilesdk.e2e.hfilePath=${HFILE_HFILE_PATH}"
           test
-  WORKING_DIRECTORY "${HFILE_SOURCE_DIR}/java"
+  WORKING_DIRECTORY "${HFILE_SOURCE_DIR}/tools/arrow-to-hfile"
   RESULT_VARIABLE HFILE_JAVA_TEST_STATUS
 )
 

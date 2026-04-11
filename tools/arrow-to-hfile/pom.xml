@@ -94,7 +94,8 @@
         <configuration>
           <release>21</release>
           <compilerArgs>
-            <!-- Enable preview features if needed in the future -->
+            <arg>-h</arg>
+            <arg>${project.build.directory}/jni-headers</arg>
           </compilerArgs>
         </configuration>
       </plugin>
@@ -104,7 +105,12 @@
         <version>3.2.5</version>
         <configuration>
           <useModulePath>false</useModulePath>
-          <argLine>--add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+          <argLine>-Djava.library.path=${env.HFILESDK_NATIVE_DIR} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+          <systemPropertyVariables>
+            <hfilesdk.native.dir>${env.HFILESDK_NATIVE_DIR}</hfilesdk.native.dir>
+            <hfilesdk.native.lib>${env.HFILESDK_NATIVE_LIB}</hfilesdk.native.lib>
+            <hfilesdk.build.dir>${env.HFILESDK_BUILD_DIR}</hfilesdk.build.dir>
+          </systemPropertyVariables>
         </configuration>
       </plugin>
 

@@ -514,7 +514,7 @@ flowchart LR
 
 ### 5.3 JNI 接口层（v4.0 新增）
 
-#### Java 侧接口（`java/src/main/java/com/hfile/HFileSDK.java`）
+#### Java 侧接口（`tools/arrow-to-hfile/src/main/java/com/hfile/HFileSDK.java`）
 
 ```java
 package com.hfile;

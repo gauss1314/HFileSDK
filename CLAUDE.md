@@ -116,10 +116,9 @@ src/
   bulk_load_writer.cc   BulkLoadWriterImpl（ThreadPool 并行 finish，ProgressCallback）
 
 proto/                  hfile_trailer.proto（HFile v3 Trailer）
-java/                   Java JNI 桥接（HFileSDK.java，Java 21）
 test/                   测试（21 个文件，已全部纳入 ctest）
 tools/
-  arrow-to-hfile/       JNI 版 Arrow → HFile 转换器
+  arrow-to-hfile/       JNI 版 Arrow → HFile 转换器，内含唯一 HFileSDK.java、单/批量转换入口与 JNI 集成测试
   arrow-to-hfile-java/  纯 Java 版 Arrow → HFile 转换器
   hfile-bulkload-perf/  双实现性能矩阵与三轮统计工具
   hfile-verify/         Java HBase 原生 Reader 验证工具（Java 21）
@@ -127,6 +126,15 @@ tools/
   hfile-chaos/          故障注入测试（掉电/磁盘满模拟）
   hfile-report/         Python HTML 对比报告生成器
 ```
+
+---
+
+## Java 层入口约定
+
+- JNI Java 封装唯一位置：`tools/arrow-to-hfile/src/main/java/com/hfile/HFileSDK.java`
+- 实际业务入口优先使用：`tools/arrow-to-hfile/src/main/java/io/hfilesdk/converter/`
+- JNI 集成测试与 HBase Reader fixture 生成：`tools/arrow-to-hfile/src/test/java/com/hfile/HFileSDKIntegrationTest.java`
+- 根目录 `java/` 模块已移除，不再作为构建、测试或发布入口
 
 ---
 
