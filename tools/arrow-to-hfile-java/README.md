@@ -1,6 +1,6 @@
 # arrow-to-hfile-java
 
-纯 Java 版 Arrow → HFile 转换器，使用 HBase 原生 `HFile.Writer` 写出 HFile，用于与 JNI 版 `tools/arrow-to-hfile` 做对照性能测试。
+纯 Java 版 Arrow → HFile 转换器，使用 HBase 原生 `StoreFileWriter` 写出 HFile，用于与 JNI 版 `tools/arrow-to-hfile` 做对照性能测试。
 
 ## 能力
 
@@ -9,6 +9,7 @@
 - 按过滤后的 Arrow Schema 顺序引用列索引
 - 输出单个本地 HFile 文件
 - 支持未排序输入，输出始终按 Row Key 有序
+- 支持 `ROW` Bloom Filter，并补齐 HBase 原生 writer 会写出的核心 FileInfo
 - 提供 CLI 与可复用 Java API
 
 ## 构建
@@ -57,4 +58,5 @@ JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
 - 当前实现会像 JNI 版本一样在内存中构建 sort index 后再写出 HFile
 - 默认输出采用与 C++ 写入链路一致的 `GZ + NONE`
 - 即使调用方传入 `PREFIX`、`DIFF`、`FAST_DIFF`，当前落盘仍统一按 `NONE` 处理
+- 比较 Comparator 时应以 Trailer 为准；HBase 原生 Java writer 不要求在 FileInfo 中额外重复写 `hfile.COMPARATOR`
 - 推荐与 `tools/hfile-bulkload-perf` 配合使用同一批 mock Arrow 数据

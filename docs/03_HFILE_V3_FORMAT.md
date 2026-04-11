@@ -218,8 +218,8 @@ FileInfo 是一个 key-value map，序列化为 ProtoBuf（`hfile_file_info.prot
 | `hfile.AVG_KEY_LEN` | 4B BE uint32 | `set_avg_key_len()` — total_key_bytes / entry_count |
 | `hfile.AVG_VALUE_LEN` | 4B BE uint32 | `set_avg_value_len()` — total_value_bytes / entry_count |
 | `hfile.MAX_TAGS_LEN` | 4B BE uint32 | `set_max_tags_len()` — 通常为 0 |
-| `hfile.KEY_VALUE_VERSION` | 4B BE uint32 = 1 | `set_key_value_version(1)` — 表示含 MemstoreTS |
-| `hfile.MAX_MEMSTORE_TS_KEY` | 8B BE uint64 = 0 | `set_max_memstore_ts(0)` — Bulk Load 场景 |
+| `KEY_VALUE_VERSION` | 4B BE uint32 = 1 | `set_key_value_version(1)` — 表示含 MemstoreTS |
+| `MAX_MEMSTORE_TS_KEY` | 8B BE uint64 = 0 | `set_max_memstore_ts(0)` — Bulk Load 场景 |
 | `hfile.COMPARATOR` | UTF-8 字符串 | `set_comparator(kCellComparator)` |
 | `DATA_BLOCK_ENCODING` | UTF-8: "NONE" | `set_data_block_encoding(Encoding::None)` |
 | `hfile.CREATE_TIME_TS` | 8B BE int64 | `set_create_time()` — 当前毫秒时间戳 |

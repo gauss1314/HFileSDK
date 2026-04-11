@@ -34,10 +34,10 @@ import org.apache.hadoop.hbase.CellComparatorImpl;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.regionserver.BloomType;
+import org.apache.hadoop.hbase.regionserver.StoreFileWriter;
 import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
-import org.apache.hadoop.hbase.io.hfile.HFile;
 import org.apache.hadoop.hbase.io.hfile.HFileContext;
 import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;
 import org.apache.hadoop.hbase.util.Bytes;
@@ -57,7 +57,6 @@ public final class ArrowToHFileJavaConverter {
 
     private static final String RANDOM_DIGITS = "$RND$";
     private static final int RANDOM_SEED_RANGE = 9;
-
     public JavaConvertResult convert(JavaConvertOptions options) {
         long start = System.nanoTime();
         java.nio.file.Path arrowPath = Paths.get(options.arrowPath()).toAbsolutePath().normalize();
@@ -90,14 +89,19 @@ public final class ArrowToHFileJavaConverter {
             DataBlockEncoding encoding = normalizeEncoding(options.dataBlockEncoding());
             BloomType bloomType = BloomType.valueOf(options.bloomType().toUpperCase(Locale.ROOT));
 
-            HFileContext context = new HFileContextBuilder()
+            HFileContextBuilder contextBuilder = new HFileContextBuilder()
                 .withCompression(compression)
                 .withDataBlockEncoding(encoding)
                 .withCellComparator(CellComparatorImpl.COMPARATOR)
                 .withBlockSize(options.blockSize())
                 .withColumnFamily(columnFamily)
                 .withIncludesTags(true)
-                .build();
+                .withIncludesMvcc(true)
+                .withCompressTags(false);
+            if (!options.tableName().isBlank()) {
+                contextBuilder.withTableName(Bytes.toBytes(options.tableName()));
+            }
+            HFileContext context = contextBuilder.build();
 
             try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
                  InputStream inputStream = Files.newInputStream(arrowPath);
@@ -125,11 +129,18 @@ public final class ArrowToHFileJavaConverter {
 
                     sortIndex.sort((left, right) -> Bytes.compareTo(left.rowKey(), right.rowKey()));
 
-                    try (HFile.Writer writer = HFile.getWriterFactory(configuration, new CacheConfig(configuration))
-                        .withPath(fileSystem, outputPath)
-                        .withFileContext(context)
-                        .create()) {
+                    StoreFileWriter writer = createStoreFileWriter(
+                        configuration,
+                        fileSystem,
+                        outputPath,
+                        context,
+                        bloomType,
+                        sortIndex.size()
+                    );
+                    try {
                         kvWritten = writeSortedRows(writer, columnFamily, storedBatches, projectedSchema, sortIndex);
+                    } finally {
+                        writer.close();
                     }
                 } finally {
                     closeBatches(storedBatches);
@@ -338,6 +349,22 @@ public final class ArrowToHFileJavaConverter {
         return fileSystem;
     }
 
+    private static StoreFileWriter createStoreFileWriter(Configuration configuration,
+                                                         FileSystem fileSystem,
+                                                         Path outputPath,
+                                                         HFileContext context,
+                                                         BloomType bloomType,
+                                                         int maxKeyCount) throws IOException {
+        return new StoreFileWriter.Builder(configuration, new CacheConfig(configuration), fileSystem)
+            .withFilePath(outputPath)
+            .withBloomType(bloomType)
+            .withMaxKeyCount(Math.max(1L, maxKeyCount))
+            .withFileContext(context)
+            .withCellComparator(context.getCellComparator())
+            .withMaxVersions(1)
+            .build();
+    }
+
     private static byte[] extractValueBytes(FieldVector vector, int rowIndex) {
         if (vector.isNull(rowIndex)) {
             return new byte[0];
@@ -417,7 +444,7 @@ public final class ArrowToHFileJavaConverter {
         }
     }
 
-    private static long writeSortedRows(HFile.Writer writer,
+    private static long writeSortedRows(StoreFileWriter writer,
                                         byte[] columnFamily,
                                         List<VectorSchemaRoot> storedBatches,
                                         ProjectedSchema projectedSchema,

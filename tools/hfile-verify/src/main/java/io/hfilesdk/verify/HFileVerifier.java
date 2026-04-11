@@ -15,6 +15,7 @@ import org.apache.hadoop.hbase.util.BloomFilterFactory;
 
 import java.io.File;
 import java.io.DataInput;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -40,6 +41,61 @@ public class HFileVerifier {
         List<String> values = List.of();
         List<String> types = List.of();
         List<Long> timestamps = List.of();
+    }
+
+    static final class LayoutSummary {
+        long dataBytes;
+        int dataBlocks;
+        long indexBytes;
+        int indexBlocks;
+        long bloomBytes;
+        int bloomBlocks;
+        long metaBytes;
+        int metaBlocks;
+        long fileInfoBytes;
+        int fileInfoBlocks;
+        long otherBytes;
+        int otherBlocks;
+        long trailerBytes;
+        long fileSizeBytes;
+        long accountedBytes;
+
+        void addBlock(BlockType blockType, int onDiskSizeWithHeader) {
+            if (blockType == BlockType.FILE_INFO) {
+                fileInfoBytes += onDiskSizeWithHeader;
+                ++fileInfoBlocks;
+                return;
+            }
+            switch (blockType.getCategory()) {
+                case DATA -> {
+                    dataBytes += onDiskSizeWithHeader;
+                    ++dataBlocks;
+                }
+                case INDEX -> {
+                    indexBytes += onDiskSizeWithHeader;
+                    ++indexBlocks;
+                }
+                case BLOOM -> {
+                    bloomBytes += onDiskSizeWithHeader;
+                    ++bloomBlocks;
+                }
+                case META -> {
+                    metaBytes += onDiskSizeWithHeader;
+                    ++metaBlocks;
+                }
+                default -> {
+                    otherBytes += onDiskSizeWithHeader;
+                    ++otherBlocks;
+                }
+            }
+        }
+
+        void finalizeTotals(long fileSizeBytes, long trailerBytes) {
+            this.fileSizeBytes = fileSizeBytes;
+            this.trailerBytes = trailerBytes;
+            this.accountedBytes = dataBytes + indexBytes + bloomBytes + metaBytes
+                + fileInfoBytes + otherBytes + trailerBytes;
+        }
     }
 
     private int totalFiles   = 0;
@@ -186,6 +242,18 @@ public class HFileVerifier {
         return trimmed.isEmpty() ? List.of() : Arrays.asList(trimmed.split(",", -1));
     }
 
+    static LayoutSummary inspectLayout(File file) throws Exception {
+        Configuration conf = HBaseConfiguration.create();
+        Path path = new Path(file.getAbsolutePath());
+        FileSystem fs = FileSystem.getLocal(conf);
+        try (Reader reader = HFile.createReader(fs, path, new CacheConfig(conf), true, conf)) {
+            if (!(reader instanceof HFileReaderImpl hfileReader)) {
+                throw new IllegalStateException("Unsupported HFile reader: " + reader.getClass().getName());
+            }
+            return inspectLayout(hfileReader, file.length());
+        }
+    }
+
     private void verifyFile(File file, boolean verbose, long maxKVs, Expectations expectations) {
         ++totalFiles;
         System.out.printf("Verifying: %s%n", file.getAbsolutePath());
@@ -200,6 +268,7 @@ public class HFileVerifier {
 
             // ── Validate trailer / metadata ────────────────────────────────
             HFileContext ctx = reader.getFileContext();
+            LayoutSummary layout = inspectLayout((HFileReaderImpl) reader, file.length());
             System.out.printf("  Major version   : %d%n",
                 reader.getTrailer().getMajorVersion());
             System.out.printf("  Minor version   : %d%n",
@@ -207,11 +276,14 @@ public class HFileVerifier {
             System.out.printf("  Entry count     : %,d%n",
                 reader.getEntries());
             System.out.printf("  Data blocks     : %d%n",
-                reader.getTrailer().getDataIndexCount());
+                layout.dataBlocks);
+            System.out.printf("  Index blocks    : %d%n",
+                layout.indexBlocks);
             System.out.printf("  Compression     : %s%n",
                 ctx.getCompression());
             System.out.printf("  Encoding        : %s%n",
                 ctx.getDataBlockEncoding());
+            printLayoutSummary(layout);
 
             // Validate version
             if (reader.getTrailer().getMajorVersion() != 3) {
@@ -245,6 +317,7 @@ public class HFileVerifier {
             }
 
             // ── Validate FileInfo mandatory fields ─────────────────────────
+            validateLayoutSummary(layout);
             validateFileInfo(reader);
             validateBloomMeta(reader);
 
@@ -355,11 +428,6 @@ public class HFileVerifier {
             "hfile.LASTKEY",
             "hfile.AVG_KEY_LEN",
             "hfile.AVG_VALUE_LEN",
-            "hfile.MAX_TAGS_LEN",
-            "hfile.COMPARATOR",
-            "DATA_BLOCK_ENCODING",
-            "hfile.KEY_VALUE_VERSION",
-            "hfile.MAX_MEMSTORE_TS_KEY",
             "hfile.CREATE_TIME_TS",
             "hfile.LEN_OF_BIGGEST_CELL",
         };
@@ -369,6 +437,19 @@ public class HFileVerifier {
             byte[] value = fileInfo.get(Bytes.toBytes(key));
             if (value == null) {
                 throw new RuntimeException("Missing FileInfo key: " + key);
+            }
+        }
+
+        HFileContext context = reader.getFileContext();
+        if (context.isIncludesTags() && fileInfo.get(Bytes.toBytes("hfile.MAX_TAGS_LEN")) == null) {
+            throw new RuntimeException("Missing FileInfo key: hfile.MAX_TAGS_LEN");
+        }
+        if (context.isIncludesMvcc()) {
+            if (fileInfo.get(Bytes.toBytes("KEY_VALUE_VERSION")) == null) {
+                throw new RuntimeException("Missing FileInfo key: KEY_VALUE_VERSION");
+            }
+            if (fileInfo.get(Bytes.toBytes("MAX_MEMSTORE_TS_KEY")) == null) {
+                throw new RuntimeException("Missing FileInfo key: MAX_MEMSTORE_TS_KEY");
             }
         }
 
@@ -382,6 +463,22 @@ public class HFileVerifier {
                 "Unexpected comparator: " + comparator);
         }
         System.out.printf("  Comparator      : %s%n", comparator);
+
+        byte[] comparatorFileInfo =
+            ((HFileReaderImpl) reader).getHFileInfo().get(Bytes.toBytes("hfile.COMPARATOR"));
+        if (comparatorFileInfo != null) {
+            System.out.printf("  FileInfo cmp    : %s%n", Bytes.toString(comparatorFileInfo));
+        } else {
+            System.out.printf("  FileInfo cmp    : TRAILER_ONLY%n");
+        }
+
+        byte[] encodingFileInfo =
+            ((HFileReaderImpl) reader).getHFileInfo().get(Bytes.toBytes("DATA_BLOCK_ENCODING"));
+        if (encodingFileInfo != null) {
+            System.out.printf("  FileInfo enc    : %s%n", Bytes.toString(encodingFileInfo));
+        } else {
+            System.out.printf("  FileInfo enc    : CONTEXT_ONLY%n");
+        }
     }
 
     private void validateBloomMeta(Reader reader) throws Exception {
@@ -404,6 +501,88 @@ public class HFileVerifier {
             System.out.printf("  Bloom meta      : %s%n", bloom.getClass().getSimpleName());
         } else {
             System.out.printf("  Bloom meta      : NONE%n");
+        }
+    }
+
+    private static LayoutSummary inspectLayout(HFileReaderImpl reader, long fileSizeBytes) throws Exception {
+        LayoutSummary summary = new LayoutSummary();
+        FixedFileTrailer trailer = reader.getTrailer();
+        long scanEndOffset = fileSizeBytes - trailer.getTrailerSize();
+        Object fsReader = reader.getUncachedBlockReader();
+        Object iterator = invoke(fsReader, "blockRange", new Class<?>[]{long.class, long.class}, 0L, scanEndOffset);
+        try {
+            while (true) {
+                Object next = invoke(iterator, "nextBlock", new Class<?>[0]);
+                if (next == null) {
+                    break;
+                }
+                HFileBlock block = (HFileBlock) next;
+                summary.addBlock(block.getBlockType(), block.getOnDiskSizeWithHeader());
+            }
+        } finally {
+            invoke(iterator, "freeBlocks", new Class<?>[0]);
+        }
+        summary.finalizeTotals(fileSizeBytes, trailer.getTrailerSize());
+        return summary;
+    }
+
+    private static Object invoke(Object target, String methodName, Class<?>[] parameterTypes, Object... args) throws Exception {
+        Method method = findMethod(target.getClass(), methodName, parameterTypes);
+        method.setAccessible(true);
+        return method.invoke(target, args);
+    }
+
+    private static Method findMethod(Class<?> type, String name, Class<?>[] parameterTypes) throws NoSuchMethodException {
+        for (Class<?> current = type; current != null; current = current.getSuperclass()) {
+            try {
+                return current.getDeclaredMethod(name, parameterTypes);
+            } catch (NoSuchMethodException ignored) {
+            }
+            for (Class<?> iface : current.getInterfaces()) {
+                try {
+                    return iface.getDeclaredMethod(name, parameterTypes);
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+        }
+        throw new NoSuchMethodException(type.getName() + "#" + name);
+    }
+
+    private static void printLayoutSummary(LayoutSummary layout) {
+        System.out.printf(
+            "  Layout bytes    : data=%,d index=%,d bloom=%,d meta=%,d fileinfo=%,d trailer=%,d%n",
+            layout.dataBytes,
+            layout.indexBytes,
+            layout.bloomBytes,
+            layout.metaBytes,
+            layout.fileInfoBytes,
+            layout.trailerBytes
+        );
+        System.out.printf(
+            "  Layout blocks   : data=%d index=%d bloom=%d meta=%d fileinfo=%d%n",
+            layout.dataBlocks,
+            layout.indexBlocks,
+            layout.bloomBlocks,
+            layout.metaBlocks,
+            layout.fileInfoBlocks
+        );
+    }
+
+    private static void validateLayoutSummary(LayoutSummary layout) {
+        if (layout.fileInfoBlocks != 1 || layout.fileInfoBytes <= 0) {
+            throw new RuntimeException(
+                "Expected exactly one FILE_INFO block, got blocks=" + layout.fileInfoBlocks +
+                    " bytes=" + layout.fileInfoBytes);
+        }
+        if (layout.otherBytes != 0 || layout.otherBlocks != 0) {
+            throw new RuntimeException(
+                "Found unexpected block categories: blocks=" + layout.otherBlocks +
+                    " bytes=" + layout.otherBytes);
+        }
+        if (layout.accountedBytes != layout.fileSizeBytes) {
+            throw new RuntimeException(
+                "Section size mismatch: accounted=" + layout.accountedBytes +
+                    " file=" + layout.fileSizeBytes);
         }
     }
 }

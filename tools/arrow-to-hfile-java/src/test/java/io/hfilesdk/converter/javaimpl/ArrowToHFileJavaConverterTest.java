@@ -14,6 +14,8 @@ import org.apache.hadoop.hbase.io.compress.Compression;
 import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.HFile;
+import org.apache.hadoop.hbase.io.hfile.HFileInfo;
+import org.apache.hadoop.hbase.io.hfile.HFileReaderImpl;
 import org.apache.hadoop.hbase.io.hfile.HFileScanner;
 import org.junit.jupiter.api.Test;
 
@@ -22,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 final class ArrowToHFileJavaConverterTest {
@@ -82,11 +85,17 @@ final class ArrowToHFileJavaConverterTest {
             assertEquals(6L, reader.getEntries());
             assertEquals(Compression.Algorithm.GZ, reader.getFileContext().getCompression());
             assertEquals(DataBlockEncoding.NONE, reader.getFileContext().getDataBlockEncoding());
+            assertNotNull(reader.getGeneralBloomFilterMetadata());
             HFileScanner scanner = reader.getScanner(conf, false, false);
             assertTrue(scanner.seekTo());
             Cell firstCell = scanner.getCell();
             assertEquals("user-0001", new String(firstCell.getRowArray(), firstCell.getRowOffset(), firstCell.getRowLength(), StandardCharsets.UTF_8));
             assertEquals("EVENT_TIME", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
+
+            HFileInfo fileInfo = ((HFileReaderImpl) reader).getHFileInfo();
+            assertNotNull(fileInfo.get(org.apache.hadoop.hbase.util.Bytes.toBytes("BLOOM_FILTER_TYPE")));
+            assertNotNull(fileInfo.get(org.apache.hadoop.hbase.util.Bytes.toBytes("LAST_BLOOM_KEY")));
+            assertNotNull(((HFileReaderImpl) reader).getTrailer().getComparatorClassName());
         }
     }
 
