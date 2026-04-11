@@ -82,9 +82,9 @@ public final class ArrowToHFileJavaConverter {
             FileSystem fileSystem = createLocalFileSystem(configuration);
             Path outputPath = new Path(hfilePath.toString());
             byte[] columnFamily = Bytes.toBytes(options.columnFamily());
-            Compression.Algorithm compression = Compression.getCompressionAlgorithmByName(options.compression().toLowerCase(Locale.ROOT));
-            DataBlockEncoding encoding = DataBlockEncoding.valueOf(options.dataBlockEncoding().replace('-', '_').toUpperCase(Locale.ROOT));
-            BloomType.valueOf(options.bloomType().toUpperCase(Locale.ROOT));
+            Compression.Algorithm compression = normalizeCompression(options.compression());
+            DataBlockEncoding encoding = normalizeEncoding(options.dataBlockEncoding());
+            BloomType bloomType = BloomType.valueOf(options.bloomType().toUpperCase(Locale.ROOT));
 
             HFileContext context = new HFileContextBuilder()
                 .withCompression(compression)
@@ -222,8 +222,8 @@ public final class ArrowToHFileJavaConverter {
                 .tableName(commandLine.getOptionValue("table", ""))
                 .rowKeyRule(required(commandLine, "rule"))
                 .columnFamily(commandLine.getOptionValue("cf", "cf"))
-                .compression(commandLine.getOptionValue("compression", "lz4"))
-                .dataBlockEncoding(commandLine.getOptionValue("encoding", "FAST_DIFF"))
+                .compression(commandLine.getOptionValue("compression", "GZ"))
+                .dataBlockEncoding(commandLine.getOptionValue("encoding", "NONE"))
                 .bloomType(commandLine.getOptionValue("bloom", "ROW"))
                 .blockSize(parsePositiveInt(commandLine.getOptionValue("block-size", "65536"), "block-size"))
                 .excludedColumns(parseCsv(commandLine.getOptionValue("exclude-cols", "")))
@@ -251,8 +251,8 @@ public final class ArrowToHFileJavaConverter {
         options.addOption(Option.builder().longOpt("table").hasArg().argName("NAME").desc("表名，仅用于日志与元数据").build());
         options.addOption(Option.builder().longOpt("rule").hasArg().argName("RULE").desc("rowKeyRule").build());
         options.addOption(Option.builder().longOpt("cf").hasArg().argName("CF").desc("列族名，默认 cf").build());
-        options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法，默认 lz4").build());
-        options.addOption(Option.builder().longOpt("encoding").hasArg().argName("ENC").desc("Data Block Encoding，默认 FAST_DIFF").build());
+        options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法，默认 GZ").build());
+        options.addOption(Option.builder().longOpt("encoding").hasArg().argName("ENC").desc("Data Block Encoding，默认 NONE").build());
         options.addOption(Option.builder().longOpt("bloom").hasArg().argName("TYPE").desc("Bloom 类型，默认 ROW").build());
         options.addOption(Option.builder().longOpt("block-size").hasArg().argName("BYTES").desc("block size，默认 65536").build());
         options.addOption(Option.builder().longOpt("exclude-cols").hasArg().argName("COL1,COL2").desc("排除列名").build());
@@ -284,6 +284,32 @@ public final class ArrowToHFileJavaConverter {
             throw new IllegalArgumentException("--" + optionName + " 必须为正整数");
         }
         return value;
+    }
+
+    private static Compression.Algorithm normalizeCompression(String rawCompression) {
+        String compression = rawCompression == null ? "" : rawCompression.trim().toUpperCase(Locale.ROOT);
+        if (compression.isEmpty()) {
+            return Compression.Algorithm.GZ;
+        }
+        return switch (compression) {
+            case "GZ", "GZIP" -> Compression.Algorithm.GZ;
+            case "NONE" -> Compression.Algorithm.NONE;
+            case "LZ4" -> Compression.Algorithm.LZ4;
+            case "SNAPPY" -> Compression.Algorithm.SNAPPY;
+            case "ZSTD" -> Compression.Algorithm.ZSTD;
+            default -> throw new IllegalArgumentException("不支持的压缩算法: " + rawCompression);
+        };
+    }
+
+    private static DataBlockEncoding normalizeEncoding(String rawEncoding) {
+        String encoding = rawEncoding == null ? "" : rawEncoding.trim().replace('-', '_').toUpperCase(Locale.ROOT);
+        if (encoding.isEmpty() || encoding.equals("NONE")) {
+            return DataBlockEncoding.NONE;
+        }
+        return switch (encoding) {
+            case "PREFIX", "DIFF", "FAST_DIFF" -> DataBlockEncoding.NONE;
+            default -> throw new IllegalArgumentException("不支持的 Data Block Encoding: " + rawEncoding);
+        };
     }
 
     private static List<String> parseCsv(String raw) {

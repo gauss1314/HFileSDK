@@ -27,8 +27,8 @@ java -jar tools/arrow-to-hfile-java/target/arrow-to-hfile-java-1.0.0.jar \
   --table perf_table \
   --rule USER_ID,0,false,0 \
   --cf cf \
-  --compression lz4 \
-  --encoding FAST_DIFF
+  --compression GZ \
+  --encoding NONE
 ```
 
 ## Java API
@@ -41,8 +41,6 @@ JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
         .tableName("perf_table")
         .rowKeyRule("USER_ID,0,false,0")
         .columnFamily("cf")
-        .compression("lz4")
-        .dataBlockEncoding("FAST_DIFF")
         .build()
 );
 ```
@@ -58,4 +56,6 @@ JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
 ## 当前约束
 
 - 当前实现面向性能对比场景，不执行额外排序
+- 默认输出采用与 C++ 写入链路一致的 `GZ + NONE`
+- 即使调用方传入 `PREFIX`、`DIFF`、`FAST_DIFF`，当前落盘仍统一按 `NONE` 处理
 - 推荐与 `tools/hfile-bulkload-perf` 配合使用同一批 mock Arrow 数据

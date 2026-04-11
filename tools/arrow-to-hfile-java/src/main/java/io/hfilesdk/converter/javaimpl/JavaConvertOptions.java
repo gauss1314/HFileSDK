@@ -23,9 +23,9 @@ public final class JavaConvertOptions {
         this.tableName = builder.tableName == null ? "" : builder.tableName;
         this.rowKeyRule = requireText(builder.rowKeyRule, "rowKeyRule");
         this.columnFamily = builder.columnFamily == null || builder.columnFamily.isBlank() ? "cf" : builder.columnFamily;
-        this.compression = builder.compression == null || builder.compression.isBlank() ? "lz4" : builder.compression;
+        this.compression = builder.compression == null || builder.compression.isBlank() ? "GZ" : builder.compression;
         this.dataBlockEncoding = builder.dataBlockEncoding == null || builder.dataBlockEncoding.isBlank()
-            ? "FAST_DIFF"
+            ? "NONE"
             : builder.dataBlockEncoding;
         this.bloomType = builder.bloomType == null || builder.bloomType.isBlank() ? "ROW" : builder.bloomType;
         this.blockSize = builder.blockSize <= 0 ? 65536 : builder.blockSize;
@@ -94,8 +94,8 @@ public final class JavaConvertOptions {
         private String tableName = "";
         private String rowKeyRule;
         private String columnFamily = "cf";
-        private String compression = "lz4";
-        private String dataBlockEncoding = "FAST_DIFF";
+        private String compression = "GZ";
+        private String dataBlockEncoding = "NONE";
         private String bloomType = "ROW";
         private int blockSize = 65536;
         private final List<String> excludedColumns = new ArrayList<>();

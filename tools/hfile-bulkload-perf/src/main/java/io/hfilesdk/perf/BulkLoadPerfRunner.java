@@ -46,8 +46,8 @@ public final class BulkLoadPerfRunner {
     private static final int DEFAULT_TRIGGER_INTERVAL_SECONDS = 180;
     private static final String DEFAULT_RULE = "USER_ID,0,false,0";
     private static final String DEFAULT_CF = "cf";
-    private static final String DEFAULT_COMPRESSION = "lz4";
-    private static final String DEFAULT_ENCODING = "FAST_DIFF";
+    private static final String DEFAULT_COMPRESSION = "GZ";
+    private static final String DEFAULT_ENCODING = "NONE";
     private static final String DEFAULT_BLOOM = "row";
     private static final String DEFAULT_ERROR_POLICY = "skip_row";
     private static final int DEFAULT_BLOCK_SIZE = 65536;

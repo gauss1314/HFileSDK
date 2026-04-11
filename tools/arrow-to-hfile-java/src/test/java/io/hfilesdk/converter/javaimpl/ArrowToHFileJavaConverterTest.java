@@ -10,6 +10,8 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.RawLocalFileSystem;
 import org.apache.hadoop.hbase.Cell;
+import org.apache.hadoop.hbase.io.compress.Compression;
+import org.apache.hadoop.hbase.io.encoding.DataBlockEncoding;
 import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.HFile;
 import org.apache.hadoop.hbase.io.hfile.HFileScanner;
@@ -78,10 +80,54 @@ final class ArrowToHFileJavaConverterTest {
         fs.initialize(java.net.URI.create("file:///"), conf);
         try (HFile.Reader reader = HFile.createReader(fs, new Path(hfile.toString()), new CacheConfig(conf), true, conf)) {
             assertEquals(6L, reader.getEntries());
+            assertEquals(Compression.Algorithm.GZ, reader.getFileContext().getCompression());
+            assertEquals(DataBlockEncoding.NONE, reader.getFileContext().getDataBlockEncoding());
             HFileScanner scanner = reader.getScanner(conf, false, false);
             assertTrue(scanner.seekTo());
             Cell firstCell = scanner.getCell();
             assertEquals("EVENT_TIME", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
+    void fallsBackToNoneEncodingWhenCallerRequestsFastDiff() throws Exception {
+        java.nio.file.Path tempDir = Files.createTempDirectory("arrow-to-hfile-java-encoding-test");
+        java.nio.file.Path arrowFile = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfile = tempDir.resolve("output.hfile");
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VarCharVector userId = new VarCharVector("USER_ID", allocator);
+             VectorSchemaRoot root = new VectorSchemaRoot(java.util.List.of(userId));
+             ArrowStreamWriter writer = new ArrowStreamWriter(root, null, Channels.newChannel(Files.newOutputStream(arrowFile)))) {
+            userId.allocateNew();
+            userId.setSafe(0, "user-0001".getBytes(StandardCharsets.UTF_8));
+            userId.setValueCount(1);
+            root.setRowCount(1);
+            writer.start();
+            writer.writeBatch();
+            writer.end();
+        }
+
+        JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
+            JavaConvertOptions.builder()
+                .arrowPath(arrowFile.toString())
+                .hfilePath(hfile.toString())
+                .tableName("perf_table")
+                .rowKeyRule("USER_ID,0,false,0")
+                .columnFamily("cf")
+                .compression("gzip")
+                .dataBlockEncoding("FAST_DIFF")
+                .build()
+        );
+
+        assertTrue(result.isSuccess(), result.summary());
+
+        Configuration conf = new Configuration();
+        FileSystem fs = new RawLocalFileSystem();
+        fs.initialize(java.net.URI.create("file:///"), conf);
+        try (HFile.Reader reader = HFile.createReader(fs, new Path(hfile.toString()), new CacheConfig(conf), true, conf)) {
+            assertEquals(Compression.Algorithm.GZ, reader.getFileContext().getCompression());
+            assertEquals(DataBlockEncoding.NONE, reader.getFileContext().getDataBlockEncoding());
         }
     }
 }
