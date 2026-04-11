@@ -62,10 +62,10 @@ Windows 下当前只维护 **MSYS2 内的 Clang/LLVM 工具链** 这一路径。
 bash scripts/build.sh
 bash scripts/test.sh
 bash scripts/coverage.sh
-bash scripts/bench-runner.sh --skip-hbase --skip-java --iterations 1
+bash scripts/hfile-bulkload-perf-runner.sh --skip-login -- --help
 ```
 
-命令顺序与 Linux / macOS 侧保持一致：**build → test → coverage → bench-runner**。推荐前提：
+命令顺序与 Linux / macOS 侧保持一致：**build → test → coverage → perf**。推荐前提：
 
 - `MSYSTEM=CLANG64`
 - `cmake`、`clang/clang++`、`llvm-cov`、`llvm-profdata` 在该 MSYS2 环境中可见
@@ -146,8 +146,7 @@ src/
   arrow/                Arrow → KV 转换（WideTable / TallTable / RawKV）
 proto/                  FileTrailerProto（HFile v3）
 test/                   21 个测试文件（已全部纳入 ctest）
-bench/                  微基准 + 端到端基准
-tools/                  Java 验证工具 + hfile-chaos + Python HTML 报告生成器
+tools/                  Java 转换器 / 性能对比工具 / 验证工具 / hfile-chaos / Python HTML 报告生成器
 ```
 
 ***

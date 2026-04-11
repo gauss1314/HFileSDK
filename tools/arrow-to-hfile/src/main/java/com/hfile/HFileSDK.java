@@ -72,7 +72,9 @@ package com.hfile;
 public class HFileSDK {
 
     static {
-        System.loadLibrary("hfilesdk");
+        if (!Boolean.getBoolean("hfilesdk.native.loaded")) {
+            System.loadLibrary("hfilesdk");
+        }
     }
 
     // ── Error codes (mirror hfile::ErrorCode in convert_options.h) ──────────

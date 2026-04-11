@@ -187,10 +187,6 @@ if [[ $# -gt 0 ]]; then
   CMAKE_ARGS+=("$@")
 fi
 
-if ! has_cmake_arg_prefix "-DHFILE_ENABLE_BENCHMARKS=" "${CMAKE_ARGS[@]}"; then
-  CMAKE_ARGS+=("-DHFILE_ENABLE_BENCHMARKS=OFF")
-fi
-
 preflight_coverage_env
 
 # On Windows / MSYS2 force Ninja generator and Clang compiler.

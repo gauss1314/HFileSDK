@@ -184,10 +184,6 @@ if [[ $# -gt 0 ]]; then
   fi
 fi
 
-if ! has_cmake_arg_prefix "-DHFILE_ENABLE_BENCHMARKS=" "${CMAKE_ARGS[@]}"; then
-  CMAKE_ARGS+=("-DHFILE_ENABLE_BENCHMARKS=OFF")
-fi
-
 preflight_test_env
 
 # On Windows / MSYS2 the default cmake generator is usually "MSYS Makefiles"

@@ -35,7 +35,6 @@ if(HFILE_PLATFORM_WINDOWS AND NOT HFILE_COMPILER_CLANG)
 endif()
 
 # ─── Options ──────────────────────────────────────────────────────────────────
-option(HFILE_ENABLE_BENCHMARKS "Build benchmark targets" OFF)
 option(HFILE_ENABLE_TESTS      "Build test targets (requires GTest)" ON)
 # io_uring is Linux-only; disable silently on other platforms
 option(HFILE_ENABLE_IO_URING   "Enable io_uring async I/O (Linux only)" ON)
@@ -589,36 +588,11 @@ if(HFILE_ENABLE_COVERAGE)
     COMMAND "${CMAKE_COMMAND}" -E rm -rf "${CMAKE_BINARY_DIR}/artifacts")
 endif()
 
-# Benchmarks
-if(HFILE_ENABLE_BENCHMARKS)
-  find_package(benchmark REQUIRED)
-
-  set(BENCH_SOURCES
-    bench/micro/bm_kv_encode.cc
-    bench/micro/bm_crc32c.cc
-    bench/micro/bm_compress.cc
-    bench/micro/bm_bloom.cc
-    bench/micro/bm_arrow_to_kv.cc
-    bench/macro/bm_e2e_write.cc
-  )
-
-  foreach(BENCH_SRC ${BENCH_SOURCES})
-    get_filename_component(BENCH_NAME ${BENCH_SRC} NAME_WE)
-    add_executable(${BENCH_NAME} ${BENCH_SRC})
-    target_link_libraries(${BENCH_NAME}
-      PRIVATE hfile benchmark::benchmark benchmark::benchmark_main)
-    target_include_directories(${BENCH_NAME} PRIVATE
-      ${CMAKE_SOURCE_DIR}/src
-      ${CMAKE_BINARY_DIR})
-  endforeach()
-endif()
-
 message(STATUS "HFileSDK configuration:")
 message(STATUS "  Build type:  ${CMAKE_BUILD_TYPE}")
 message(STATUS "  Tests:       ${HFILE_ENABLE_TESTS}")
 message(STATUS "  io_uring:    ${HFILE_ENABLE_IO_URING}")
 message(STATUS "  HDFS:        ${HFILE_ENABLE_HDFS}")
-message(STATUS "  Benchmarks:  ${HFILE_ENABLE_BENCHMARKS}")
 message(STATUS "  jemalloc:    ${HFILE_ENABLE_JEMALLOC}")
 message(STATUS "  ASan:        ${HFILE_ENABLE_ASAN}")
 message(STATUS "  UBSan:       ${HFILE_ENABLE_UBSAN}")

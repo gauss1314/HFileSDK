@@ -800,15 +800,15 @@ HFileSDK/
 │   ├── partition/           RegionPartitioner 实现 + CFGrouper
 │   └── arrow/               ArrowToKVConverter（3 种映射模式）
 ├── test/                    21 个测试文件（已全部纳入 ctest）
-├── bench/
-│   ├── micro/               5 个 Google Benchmark 微基准
-│   └── macro/               1 个端到端基准
 ├── tools/
+│   ├── arrow-to-hfile/      JNI 版 Arrow → HFile 转换器
+│   ├── arrow-to-hfile-java/ 纯 Java 版 Arrow → HFile 转换器
+│   ├── hfile-bulkload-perf/ 双实现性能矩阵与三轮统计工具
 │   ├── hfile-verify/        Java HBase 原生 Reader 验证工具（pom.xml 已完整）
 │   ├── hfile-bulkload-verify/ Java Bulk Load 后数据完整性验证（pom.xml 待补充）
 │   └── hfile-report/        Python HTML 对比报告生成器
 └── scripts/
-    └── bench-runner.sh      全流程自动化基准测试脚本
+    └── hfile-bulkload-perf-runner.sh 集群环境性能矩阵包装脚本
 ```
 
 ### 依赖版本要求
@@ -879,8 +879,7 @@ cd build-debug && ctest --output-on-failure
 
 # Release 构建
 cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_FLAGS="-O3 -march=native" \
-    -DHFILE_ENABLE_BENCHMARKS=ON
+    -DCMAKE_CXX_FLAGS="-O3 -march=native"
 cmake --build build -j$(nproc)
 
 # HFile 格式验证（需要 Java + HBase jar）
@@ -888,8 +887,12 @@ cd tools/hfile-verify && mvn package -q
 java -jar target/hfile-verify-1.0.0-jar-with-dependencies.jar \
     --hfile-dir /path/to/staging/cf/ --verbose
 
-# 完整基准测试流水线
-bash scripts/bench-runner.sh
+# 双实现性能对比矩阵
+mvn -q -f tools/arrow-to-hfile/pom.xml -DskipTests install
+mvn -q -f tools/arrow-to-hfile-java/pom.xml install
+mvn -q -f tools/hfile-bulkload-perf/pom.xml package
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+    --native-lib ./build/libhfilesdk.dylib
 ```
 
 ---
@@ -928,7 +931,7 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 
 **双缓冲 Encode/Compress/IO Pipeline**：
 - 当前三阶段串行执行。理论上流水线可提升 30–50% 吞吐量，但实际收益高度依赖瓶颈位置。
-- **决策准则**：先运行 `bm_e2e_write --benchmark_format=json` + `perf stat`。若 I/O 等待时间占比 < 50%（说明编码/压缩是瓶颈），或与 Java 基线差距 < 3×，再实现 Pipeline。若 I/O 已是瓶颈（NVMe 打满），Pipeline 帮助有限。
+- **决策准则**：先运行 `tools/hfile-bulkload-perf` 取得 JNI / 纯 Java 的固定场景矩阵数据。若 I/O 等待时间占比 < 50%（说明编码/压缩是瓶颈），或与 Java 基线差距 < 3×，再实现 Pipeline。若 I/O 已是瓶颈（NVMe 打满），Pipeline 帮助有限。
 - 实现方案参见 §5.6。
 
 **PGO（Profile-Guided Optimization）**：**有意不实现**。
@@ -938,7 +941,7 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 ### 剩余工作（按优先级）
 
 **P2 — 数据驱动后决定**
-- [ ] **双缓冲 Pipeline**：先运行 `bench/java/` 拿到对比数据，若差距 < 3× 再实现
+- [ ] **双缓冲 Pipeline**：先运行 `tools/hfile-bulkload-perf` 拿到对比数据，若差距 < 3× 再实现
 - [ ] **AutoSort 外排序**：当前 AutoSort 将全量 batch 保留在内存；超大文件（> RAM）需外排序实现
 
 ---

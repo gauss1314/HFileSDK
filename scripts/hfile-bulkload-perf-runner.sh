@@ -11,10 +11,6 @@ PERF_JAR="${PERF_JAR:-${PERF_JAR_DEFAULT}}"
 NATIVE_LIB="${NATIVE_LIB:-}"
 TABLE_NAME="${TABLE_NAME:-}"
 WORK_DIR="${WORK_DIR:-/tmp/hfilesdk-bulkload-perf}"
-BULKLOAD_DIR="${BULKLOAD_DIR:-/tmp/hbase_bulkload}"
-HDFS_STAGING_DIR="${HDFS_STAGING_DIR:-}"
-HBASE_BIN="${HBASE_BIN:-hbase}"
-HDFS_BIN="${HDFS_BIN:-hdfs}"
 SKIP_LOGIN=0
 declare -a PERF_ARGS=()
 
@@ -30,12 +26,8 @@ usage() {
   --skip-login              跳过 source env 与 kinit
   --perf-jar PATH           hfile-bulkload-perf fat jar 路径
   --native-lib PATH         libhfilesdk 动态库路径
-  --table NAME              HBase 表名
+  --table NAME              报告中的表名标签
   --work-dir PATH           本地工作目录
-  --bulkload-dir PATH       本地 HFile staging 目录
-  --hdfs-staging-dir PATH   HDFS staging 根目录
-  --hbase-bin BIN           hbase 命令路径
-  --hdfs-bin BIN            hdfs 命令路径
   --help                    显示帮助
 
 示例:
@@ -44,13 +36,9 @@ usage() {
     --principal ossuser \
     --keytab /opt/client/keytab/ossuser.keytab \
     --native-lib ./release/libhfilesdk.so \
-    --table tdr_signal_stor_20550 \
-    --hdfs-staging-dir /hbase/staging/job_20550 \
     -- \
-    --cf cf \
-    --arrow-file-count 8 \
-    --target-size-mb 256 \
-    --parallelism 4
+    --table perf_table \
+    --scenario-filter single-001mb
 EOF
 }
 
@@ -83,10 +71,6 @@ while [[ $# -gt 0 ]]; do
     --native-lib) NATIVE_LIB="$2"; shift 2 ;;
     --table) TABLE_NAME="$2"; shift 2 ;;
     --work-dir) WORK_DIR="$2"; shift 2 ;;
-    --bulkload-dir) BULKLOAD_DIR="$2"; shift 2 ;;
-    --hdfs-staging-dir) HDFS_STAGING_DIR="$2"; shift 2 ;;
-    --hbase-bin) HBASE_BIN="$2"; shift 2 ;;
-    --hdfs-bin) HDFS_BIN="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     --) shift; PERF_ARGS+=("$@"); break ;;
     *) PERF_ARGS+=("$1"); shift ;;
@@ -104,35 +88,24 @@ if [[ "${SKIP_LOGIN}" -eq 0 ]]; then
   fi
 fi
 
-if [[ -z "${NATIVE_LIB}" ]]; then
-  echo "--native-lib is required" >&2
-  exit 1
-fi
-if [[ -z "${TABLE_NAME}" ]]; then
-  echo "--table is required" >&2
-  exit 1
-fi
-if [[ -z "${HDFS_STAGING_DIR}" ]]; then
-  echo "--hdfs-staging-dir is required" >&2
-  exit 1
-fi
-
 require_command "${JAVA_BIN}"
 require_file "${PERF_JAR}" "perf jar"
-require_file "${NATIVE_LIB}" "native library"
 
 declare -a CMD=(
   "${JAVA_BIN}"
   "-jar"
   "${PERF_JAR}"
-  "--native-lib" "${NATIVE_LIB}"
-  "--table" "${TABLE_NAME}"
   "--work-dir" "${WORK_DIR}"
-  "--bulkload-dir" "${BULKLOAD_DIR}"
-  "--hdfs-staging-dir" "${HDFS_STAGING_DIR}"
-  "--hbase-bin" "${HBASE_BIN}"
-  "--hdfs-bin" "${HDFS_BIN}"
 )
+
+if [[ -n "${NATIVE_LIB}" ]]; then
+  require_file "${NATIVE_LIB}" "native library"
+  CMD+=("--native-lib" "${NATIVE_LIB}")
+fi
+
+if [[ -n "${TABLE_NAME}" ]]; then
+  CMD+=("--table" "${TABLE_NAME}")
+fi
 
 if [[ "${#PERF_ARGS[@]}" -gt 0 ]]; then
   CMD+=("${PERF_ARGS[@]}")

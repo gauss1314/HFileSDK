@@ -154,7 +154,6 @@ CMAKE_ARGS=(
   -B "${RELEASE_BUILD_DIR}"
   -DCMAKE_BUILD_TYPE=Release
   -DHFILE_ENABLE_TESTS=OFF
-  -DHFILE_ENABLE_BENCHMARKS=OFF
   -DHFILE_ENABLE_JAVA_TESTS=OFF   # Maven not required; JAR built separately
   -DHFILE_BUILD_JNI_LIB=ON        # always build libhfilesdk.so
 )

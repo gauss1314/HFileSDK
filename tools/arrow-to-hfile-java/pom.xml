@@ -6,19 +6,21 @@
   <modelVersion>4.0.0</modelVersion>
 
   <groupId>io.hfilesdk</groupId>
-  <artifactId>hfile-bulkload-perf</artifactId>
+  <artifactId>arrow-to-hfile-java</artifactId>
   <version>1.0.0</version>
   <packaging>jar</packaging>
 
-  <name>HFileSDK BulkLoad Performance Runner</name>
-  <description>Generates fixed Arrow scenario matrices, compares JNI and pure Java Arrow-to-HFile implementations, and reports structured timing statistics.</description>
+  <name>HFileSDK Arrow-to-HFile Java Converter</name>
+  <description>Converts Arrow IPC Stream files to HFile with the native Java HBase writer.</description>
 
   <properties>
     <maven.compiler.source>21</maven.compiler.source>
     <maven.compiler.target>21</maven.compiler.target>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-    <main.class>io.hfilesdk.perf.BulkLoadPerfRunner</main.class>
+    <main.class>io.hfilesdk.converter.javaimpl.ArrowToHFileJavaConverter</main.class>
     <arrow.version>16.1.0</arrow.version>
+    <hbase.version>2.6.1</hbase.version>
+    <hadoop.version>3.3.6</hadoop.version>
     <junit.version>5.10.2</junit.version>
   </properties>
 
@@ -44,14 +46,24 @@
       <version>${arrow.version}</version>
     </dependency>
     <dependency>
-      <groupId>io.hfilesdk</groupId>
-      <artifactId>arrow-to-hfile</artifactId>
-      <version>4.0.0</version>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-server</artifactId>
+      <version>${hbase.version}</version>
     </dependency>
     <dependency>
-      <groupId>io.hfilesdk</groupId>
-      <artifactId>arrow-to-hfile-java</artifactId>
-      <version>1.0.0</version>
+      <groupId>org.apache.hbase</groupId>
+      <artifactId>hbase-common</artifactId>
+      <version>${hbase.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-common</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.lz4</groupId>
+      <artifactId>lz4-java</artifactId>
+      <version>1.8.0</version>
     </dependency>
     <dependency>
       <groupId>org.junit.jupiter</groupId>
@@ -90,6 +102,7 @@
             <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
               <mainClass>${main.class}</mainClass>
             </transformer>
+            <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
           </transformers>
           <filters>
             <filter>

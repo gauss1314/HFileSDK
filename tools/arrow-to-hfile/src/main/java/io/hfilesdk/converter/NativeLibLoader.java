@@ -126,6 +126,7 @@ public final class NativeLibLoader {
         // subsequent System.loadLibrary("hfilesdk") from the same ClassLoader
         // that resolves to the same file will be a no-op.
         System.load(absolutePath);
+        System.setProperty("hfilesdk.native.loaded", "true");
 
         // Step B: Append the directory to the JVM's internal usr_paths list so
         // that System.loadLibrary("hfilesdk") in HFileSDK's static block succeeds.
