@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "bloom/compound_bloom_filter_writer.h"
+#include <span>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -9,6 +10,12 @@ using namespace hfile::bloom;
 
 static std::vector<uint8_t> make_key(const std::string& s) {
     return std::vector<uint8_t>(s.begin(), s.end());
+}
+
+static std::span<const uint8_t> block_payload(const std::vector<uint8_t>& block) {
+    const auto payload_size =
+        static_cast<size_t>(read_be32(block.data() + 29)) - kBlockHeaderSize;
+    return {block.data() + kBlockHeaderSize, payload_size};
 }
 
 TEST(BloomFilter, EmptyBloom) {
@@ -195,4 +202,50 @@ TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
         EXPECT_GT(key_len, 0);
         p += static_cast<size_t>(key_len);
     }
+}
+
+TEST(BloomFilter, GZipCompressedBlocksRoundTrip) {
+    CompoundBloomFilterWriter raw(BloomType::Row, 0.01, 1024);
+    CompoundBloomFilterWriter compressed(BloomType::Row, 0.01, 1024);
+    for (int i = 0; i < 64; ++i) {
+        auto key = make_key("row_" + std::to_string(i));
+        raw.add(key);
+        compressed.add(key);
+    }
+
+    auto gzip = codec::Compressor::create(Compression::GZip, 6);
+    ASSERT_NE(gzip, nullptr);
+
+    std::vector<uint8_t> raw_chunk;
+    std::vector<uint8_t> raw_meta;
+    std::vector<uint8_t> compressed_chunk;
+    std::vector<uint8_t> compressed_meta;
+
+    ASSERT_TRUE(raw.finish_data_blocks(raw_chunk, 8192));
+    raw.finish_meta_block(raw_meta);
+    ASSERT_TRUE(compressed.finish_data_blocks(compressed_chunk, 8192, gzip.get()));
+    compressed.finish_meta_block(compressed_meta, gzip.get());
+
+    ASSERT_EQ(std::string(raw_chunk.begin(), raw_chunk.begin() + 8), "BLMFBLK2");
+    ASSERT_EQ(std::string(compressed_chunk.begin(), compressed_chunk.begin() + 8), "BLMFBLK2");
+    ASSERT_EQ(std::string(raw_meta.begin(), raw_meta.begin() + 8), "BLMFMET2");
+    ASSERT_EQ(std::string(compressed_meta.begin(), compressed_meta.begin() + 8), "BLMFMET2");
+
+    std::vector<uint8_t> decompressed_chunk(read_be32(compressed_chunk.data() + 12));
+    auto chunk_status = gzip->decompress(
+        block_payload(compressed_chunk), decompressed_chunk.data(), decompressed_chunk.size());
+    ASSERT_TRUE(chunk_status.ok()) << chunk_status.message();
+    auto raw_chunk_payload = block_payload(raw_chunk);
+    EXPECT_EQ(decompressed_chunk.size(), raw_chunk_payload.size());
+    EXPECT_TRUE(std::equal(decompressed_chunk.begin(), decompressed_chunk.end(),
+                           raw_chunk_payload.begin()));
+
+    std::vector<uint8_t> decompressed_meta(read_be32(compressed_meta.data() + 12));
+    auto meta_status = gzip->decompress(
+        block_payload(compressed_meta), decompressed_meta.data(), decompressed_meta.size());
+    ASSERT_TRUE(meta_status.ok()) << meta_status.message();
+    auto raw_meta_payload = block_payload(raw_meta);
+    EXPECT_EQ(decompressed_meta.size(), raw_meta_payload.size());
+    EXPECT_TRUE(std::equal(decompressed_meta.begin(), decompressed_meta.end(),
+                           raw_meta_payload.begin()));
 }

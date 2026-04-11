@@ -239,4 +239,5 @@ cmake --build "${ROOT_DIR}/${BUILD_DIR}" --target hfile_coverage_ci
 echo ""
 echo "Coverage summary: ${ROOT_DIR}/${BUILD_DIR}/coverage/summary.txt"
 echo "Coverage HTML:    ${ROOT_DIR}/${BUILD_DIR}/coverage/html/index.html"
+echo "Coverage matrix:  ${ROOT_DIR}/${BUILD_DIR}/coverage/html/feature-matrix.html"
 echo "CI artifacts:     ${ROOT_DIR}/${BUILD_DIR}/artifacts"

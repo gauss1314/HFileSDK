@@ -8,6 +8,45 @@ set(HFILE_COVERAGE_ARTIFACTS_HTML_DIR "${HFILE_COVERAGE_ARTIFACTS_ROOT}/coverage
 set(HFILE_COVERAGE_ARTIFACTS_SUMMARY "${HFILE_COVERAGE_ARTIFACTS_ROOT}/coverage-summary.txt")
 set(HFILE_COVERAGE_ARTIFACTS_PROFDATA "${HFILE_COVERAGE_ARTIFACTS_ROOT}/coverage.profdata")
 set(HFILE_COVERAGE_IGNORE_REGEX "(^/Applications/|^/Library/|^/usr/|.*/\\.conda-hfilesdk/|.*/build/)")
+set(HFILE_COVERAGE_MATRIX_FRAGMENT "@CMAKE_SOURCE_DIR@/cmake/coverage_feature_matrix_fragment.html")
+
+function(hfile_write_feature_matrix_page target_path)
+  file(READ "${HFILE_COVERAGE_MATRIX_FRAGMENT}" HFILE_COVERAGE_MATRIX_HTML)
+  set(HFILE_COVERAGE_MATRIX_PAGE
+"<!doctype html>
+<html lang=\"zh-CN\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>HFileSDK 覆盖矩阵</title>
+</head>
+<body>
+${HFILE_COVERAGE_MATRIX_HTML}
+</body>
+</html>
+")
+  file(WRITE "${target_path}" "${HFILE_COVERAGE_MATRIX_PAGE}")
+endfunction()
+
+function(hfile_inject_feature_matrix index_path)
+  if(NOT EXISTS "${index_path}")
+    message(FATAL_ERROR "Coverage HTML entry not found: ${index_path}")
+  endif()
+  file(READ "${HFILE_COVERAGE_MATRIX_FRAGMENT}" HFILE_COVERAGE_MATRIX_HTML)
+  file(READ "${index_path}" HFILE_COVERAGE_INDEX_HTML)
+  if(HFILE_COVERAGE_INDEX_HTML MATCHES "HFileSDK 正交功能点覆盖矩阵")
+    return()
+  endif()
+  string(FIND "${HFILE_COVERAGE_INDEX_HTML}" "<body>" HFILE_COVERAGE_BODY_POS)
+  if(HFILE_COVERAGE_BODY_POS EQUAL -1)
+    set(HFILE_COVERAGE_INDEX_WITH_MATRIX "${HFILE_COVERAGE_MATRIX_HTML}\n${HFILE_COVERAGE_INDEX_HTML}")
+  else()
+    string(REPLACE "<body>" "<body>\n${HFILE_COVERAGE_MATRIX_HTML}\n" HFILE_COVERAGE_INDEX_WITH_MATRIX "${HFILE_COVERAGE_INDEX_HTML}")
+  endif()
+  file(WRITE "${index_path}" "${HFILE_COVERAGE_INDEX_WITH_MATRIX}")
+  get_filename_component(HFILE_COVERAGE_INDEX_DIR "${index_path}" DIRECTORY)
+  hfile_write_feature_matrix_page("${HFILE_COVERAGE_INDEX_DIR}/feature-matrix.html")
+endfunction()
 
 include("@CMAKE_BINARY_DIR@/hfile_coverage_targets.cmake")
 
@@ -100,6 +139,8 @@ if(NOT HFILE_SHOW_STATUS EQUAL 0)
   message(FATAL_ERROR "llvm-cov show failed")
 endif()
 
+hfile_inject_feature_matrix("${HFILE_COVERAGE_HTML_DIR}/index.html")
+
 file(COPY "${HFILE_COVERAGE_HTML_DIR}" DESTINATION "${HFILE_COVERAGE_ARTIFACTS_ROOT}")
 file(RENAME
   "${HFILE_COVERAGE_ARTIFACTS_ROOT}/html"
@@ -115,4 +156,5 @@ file(COPY_FILE
 
 message(STATUS "Coverage summary: ${HFILE_COVERAGE_SUMMARY}")
 message(STATUS "Coverage HTML: ${HFILE_COVERAGE_HTML_DIR}/index.html")
+message(STATUS "Coverage matrix HTML: ${HFILE_COVERAGE_HTML_DIR}/feature-matrix.html")
 message(STATUS "Coverage artifacts: ${HFILE_COVERAGE_ARTIFACTS_ROOT}")

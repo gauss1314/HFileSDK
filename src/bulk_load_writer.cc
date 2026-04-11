@@ -446,6 +446,14 @@ private:
         WriterOptions cf_opts       = opts_;
         cf_opts.column_family       = cf;
         cf_opts.sort_mode           = WriterOptions::SortMode::PreSortedVerified;
+        auto error_callback = [this, cf_opts](const RowError& err) {
+            if (cf_opts.error_policy == ErrorPolicy::SkipRow) {
+                kv_skipped_.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (cf_opts.error_callback) {
+                cf_opts.error_callback(err);
+            }
+        };
 
         auto [writer, status] = HFileWriter::builder()
             .set_path(file_path.string())
@@ -458,6 +466,7 @@ private:
             .set_fsync_policy(cf_opts.fsync_policy)
             .set_error_policy(cf_opts.error_policy)
             .set_max_error_count(cf_opts.max_error_count)
+            .set_error_callback(error_callback)
             .set_max_row_key_bytes(cf_opts.max_row_key_bytes)
             .set_max_value_bytes(cf_opts.max_value_bytes)
             .set_max_memory(cf_opts.max_memory_bytes)

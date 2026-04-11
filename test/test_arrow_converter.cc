@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include "arrow/arrow_to_kv_converter.h"
+#include "codec/compressor.h"
 #include "convert/converter.h"
 #include <hfile/types.h>
 
@@ -17,6 +18,8 @@
 #include <chrono>
 #include <fstream>
 #include <atomic>
+#include <map>
+#include <span>
 
 using namespace hfile;
 using namespace hfile::arrow_convert;
@@ -104,6 +107,38 @@ static void write_bytes(const fs::path& path, std::string_view bytes) {
     ASSERT_TRUE(out.is_open());
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     out.close();
+}
+
+struct BlockView {
+    std::string magic;
+    uint32_t uncompressed_size;
+    std::span<const uint8_t> payload;
+};
+
+static std::vector<uint8_t> read_file(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>(
+        std::istreambuf_iterator<char>(in),
+        std::istreambuf_iterator<char>());
+}
+
+static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
+    std::vector<BlockView> blocks;
+    const size_t limit = data.size() - kTrailerFixedSize;
+    size_t offset = 0;
+    while (offset + kBlockHeaderSize <= limit) {
+        const auto on_disk_size_without_header = read_be32(data.data() + offset + 8);
+        const auto on_disk_data_with_header = read_be32(data.data() + offset + 29);
+        const auto payload_size =
+            static_cast<size_t>(on_disk_data_with_header) - kBlockHeaderSize;
+        blocks.push_back(BlockView{
+            std::string(reinterpret_cast<const char*>(data.data() + offset), 8),
+            read_be32(data.data() + offset + 12),
+            {data.data() + offset + kBlockHeaderSize, payload_size},
+        });
+        offset += kBlockHeaderSize + on_disk_size_without_header;
+    }
+    return blocks;
 }
 
 // ─── Wide Table ───────────────────────────────────────────────────────────────
@@ -690,6 +725,102 @@ TEST(ArrowConverter, ConvertSupportsExcludedColumnPrefixes) {
     EXPECT_EQ(result.error_code, ErrorCode::OK);
     EXPECT_EQ(result.arrow_rows_read, 2);
     EXPECT_TRUE(fs::exists(hfile_path));
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
+    arrow::StringBuilder meta_builder;
+    arrow::StringBuilder id_builder;
+    arrow::StringBuilder payload_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(meta_builder.Append("meta-2"));
+    ARROW_EXPECT_OK(meta_builder.Append("meta-1"));
+    ARROW_EXPECT_OK(id_builder.Append("row-2"));
+    ARROW_EXPECT_OK(id_builder.Append("row-1"));
+    ARROW_EXPECT_OK(payload_builder.Append("drop-2"));
+    ARROW_EXPECT_OK(payload_builder.Append("drop-1"));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+
+    std::shared_ptr<arrow::Array> meta_arr, id_arr, payload_arr, city_arr;
+    ARROW_EXPECT_OK(meta_builder.Finish(&meta_arr));
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(payload_builder.Finish(&payload_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("_hoodie_commit_time", arrow::utf8()),
+        arrow::field("id", arrow::utf8()),
+        arrow::field("payload", arrow::utf8()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(
+        schema, 2, {meta_arr, id_arr, payload_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::GZip;
+    opts.excluded_columns = {"payload"};
+    opts.excluded_column_prefixes = {"_hoodie"};
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    ASSERT_TRUE(fs::exists(hfile_path));
+
+    auto file_bytes = read_file(hfile_path);
+    auto blocks = scan_blocks(file_bytes);
+    auto gzip = codec::Compressor::create(Compression::GZip, 6);
+    ASSERT_NE(gzip, nullptr);
+
+    std::map<std::string, int> counts;
+    std::string decompressed_data_blocks;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*" &&
+            block.magic != "BLMFBLK2" &&
+            block.magic != "BLMFMET2" &&
+            block.magic != "FILEINF2" &&
+            block.magic != "IDXROOT2") {
+            continue;
+        }
+
+        std::vector<uint8_t> decompressed(block.uncompressed_size);
+        auto status = gzip->decompress(
+            block.payload, decompressed.data(), decompressed.size());
+        ASSERT_TRUE(status.ok()) << block.magic << " " << status.message();
+        counts[block.magic]++;
+        if (block.magic == "DATABLK*") {
+            decompressed_data_blocks.append(
+                reinterpret_cast<const char*>(decompressed.data()), decompressed.size());
+        }
+    }
+
+    EXPECT_GE(counts["DATABLK*"], 1);
+    EXPECT_GE(counts["IDXROOT2"], 1);
+    EXPECT_GE(counts["FILEINF2"], 1);
+    EXPECT_GE(counts["BLMFBLK2"], 1);
+    EXPECT_GE(counts["BLMFMET2"], 1);
+
+    auto row1_pos = decompressed_data_blocks.find("row-1");
+    auto row2_pos = decompressed_data_blocks.find("row-2");
+    ASSERT_NE(row1_pos, std::string::npos);
+    ASSERT_NE(row2_pos, std::string::npos);
+    EXPECT_LT(row1_pos, row2_pos);
+    EXPECT_EQ(decompressed_data_blocks.find("payload"), std::string::npos);
+    EXPECT_EQ(decompressed_data_blocks.find("_hoodie_commit_time"), std::string::npos);
+    EXPECT_NE(decompressed_data_blocks.find("city"), std::string::npos);
+
     fs::remove_all(dir);
 }
 

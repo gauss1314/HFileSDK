@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <hfile/writer.h>
 #include <hfile/types.h>
+#include "codec/compressor.h"
 #include "meta/trailer_builder.h"
 
 #include <filesystem>
@@ -9,6 +10,8 @@
 #include <string>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <span>
 
 namespace fs = std::filesystem;
 using namespace hfile;
@@ -25,6 +28,96 @@ static std::vector<uint8_t> read_file(const fs::path& p) {
     return std::vector<uint8_t>(
         std::istreambuf_iterator<char>(f),
         std::istreambuf_iterator<char>());
+}
+
+struct BlockView {
+    std::string magic;
+    uint32_t uncompressed_size;
+    std::span<const uint8_t> payload;
+};
+
+static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
+    std::vector<BlockView> blocks;
+    const size_t limit = data.size() - kTrailerFixedSize;
+    size_t offset = 0;
+    while (offset + kBlockHeaderSize <= limit) {
+        const auto on_disk_size_without_header = read_be32(data.data() + offset + 8);
+        const auto on_disk_data_with_header = read_be32(data.data() + offset + 29);
+        const auto payload_size =
+            static_cast<size_t>(on_disk_data_with_header) - kBlockHeaderSize;
+        blocks.push_back(BlockView{
+            std::string(reinterpret_cast<const char*>(data.data() + offset), 8),
+            read_be32(data.data() + offset + 12),
+            {data.data() + offset + kBlockHeaderSize, payload_size},
+        });
+        offset += kBlockHeaderSize + on_disk_size_without_header;
+    }
+    return blocks;
+}
+
+static void verify_compressed_major_blocks_round_trip(Compression compression,
+                                                      const std::string& name) {
+    auto path = tmp_path(name);
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(compression)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::Row)
+        .set_block_size(256)
+        .build();
+    ASSERT_TRUE(s.ok()) << s.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    std::string payload(512, 'x');
+    for (int i = 0; i < 64; ++i) {
+        char row[32];
+        std::snprintf(row, sizeof(row), "row%05d", i);
+        rk.assign(row, row + std::strlen(row));
+        fam = {'c', 'f'};
+        q = {'c', 'o', 'l'};
+        auto value = payload + std::to_string(i);
+        v.assign(value.begin(), value.end());
+        KeyValue kv;
+        kv.row = rk;
+        kv.family = fam;
+        kv.qualifier = q;
+        kv.timestamp = 100000 - i;
+        kv.key_type = KeyType::Put;
+        kv.value = v;
+        ASSERT_TRUE(w->append(kv).ok());
+    }
+    ASSERT_TRUE(w->finish().ok());
+
+    auto file_bytes = read_file(path);
+    auto blocks = scan_blocks(file_bytes);
+    auto codec = codec::Compressor::create(compression, 6);
+    ASSERT_NE(codec, nullptr);
+
+    std::map<std::string, int> counts;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*" &&
+            block.magic != "BLMFBLK2" &&
+            block.magic != "BLMFMET2" &&
+            block.magic != "FILEINF2" &&
+            block.magic != "IDXROOT2") {
+            continue;
+        }
+
+        std::vector<uint8_t> decompressed(block.uncompressed_size);
+        auto status = codec->decompress(
+            block.payload, decompressed.data(), decompressed.size());
+        ASSERT_TRUE(status.ok()) << block.magic << " " << status.message();
+        counts[block.magic]++;
+    }
+
+    EXPECT_GE(counts["DATABLK*"], 1);
+    EXPECT_GE(counts["IDXROOT2"], 1);
+    EXPECT_GE(counts["FILEINF2"], 1);
+    EXPECT_GE(counts["BLMFBLK2"], 1);
+    EXPECT_GE(counts["BLMFMET2"], 1);
+
+    fs::remove(path);
 }
 
 static KeyValue make_kv(std::vector<uint8_t>& rk,
@@ -649,4 +742,20 @@ TEST(HFileWriter, BloomFileInfoContainsBloomTypeAndLastBloomKey) {
     EXPECT_NE(content.find("row99"), std::string::npos);
 
     fs::remove(path);
+}
+
+TEST(HFileWriter, LZ4RoundTripAcrossMajorBlockTypes) {
+    verify_compressed_major_blocks_round_trip(Compression::LZ4, "lz4_roundtrip_major_blocks");
+}
+
+TEST(HFileWriter, ZstdRoundTripAcrossMajorBlockTypes) {
+    verify_compressed_major_blocks_round_trip(Compression::Zstd, "zstd_roundtrip_major_blocks");
+}
+
+TEST(HFileWriter, SnappyRoundTripAcrossMajorBlockTypes) {
+    verify_compressed_major_blocks_round_trip(Compression::Snappy, "snappy_roundtrip_major_blocks");
+}
+
+TEST(HFileWriter, GZipRoundTripAcrossMajorBlockTypes) {
+    verify_compressed_major_blocks_round_trip(Compression::GZip, "gzip_roundtrip_major_blocks");
 }

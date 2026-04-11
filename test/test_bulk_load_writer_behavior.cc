@@ -192,6 +192,31 @@ TEST(BulkLoadWriterBehavior, SkipBatchSkipsWholeBatch) {
     fs::remove_all(dir);
 }
 
+TEST(BulkLoadWriterBehavior, SkipRowKeepsValidRowsInSameBatch) {
+    auto dir = temp_dir("skip_row");
+    auto [writer, status] = BulkLoadWriter::builder()
+        .set_output_dir(dir.string())
+        .set_column_families({"cf"})
+        .set_partitioner(RegionPartitioner::none())
+        .set_error_policy(ErrorPolicy::SkipRow)
+        .set_max_value_bytes(8)
+        .build();
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    std::string oversized(32, 'x');
+    auto batch = make_wide_batch(
+        {std::string("row1"), std::string("row_bad"), std::string("row2")},
+        {"v1", oversized, "v2"});
+    ASSERT_TRUE(writer->write_batch(*batch, MappingMode::WideTable).ok());
+
+    auto [result, finish_status] = writer->finish();
+    ASSERT_TRUE(finish_status.ok()) << finish_status.message();
+    EXPECT_EQ(result.total_entries, 2u);
+    EXPECT_EQ(result.skipped_rows, 1u);
+    EXPECT_EQ(result.files.size(), 1u);
+    fs::remove_all(dir);
+}
+
 TEST(BulkLoadWriterBehavior, MaxOpenFilesRollsOutputFiles) {
     auto dir = temp_dir("max_open_files");
     auto [writer, status] = BulkLoadWriter::builder()

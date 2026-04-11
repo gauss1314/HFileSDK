@@ -4,6 +4,7 @@
 #include <vector>
 #include <numeric>
 #include <cstring>
+#include <set>
 
 using namespace hfile;
 using namespace hfile::codec;
@@ -57,10 +58,45 @@ TEST_P(CompressorTest, MaxCompressedSizeAdequate) {
     EXPECT_LE(n, max_sz);
 }
 
+TEST(CompressorStandalone, GZipCompressionLevelsRoundTrip) {
+    std::vector<uint8_t> input(256 * 1024);
+    for (size_t i = 0; i < input.size(); ++i)
+        input[i] = static_cast<uint8_t>('a' + (i % 4));
+
+    std::vector<size_t> compressed_sizes;
+    compressed_sizes.reserve(9);
+    std::set<size_t> unique_sizes;
+
+    for (int level = 1; level <= 9; ++level) {
+        auto c = Compressor::create(Compression::GZip, level);
+        ASSERT_NE(c, nullptr);
+
+        std::vector<uint8_t> compressed(c->max_compressed_size(input.size()));
+        size_t comp_len = c->compress(input, compressed.data(), compressed.size());
+        ASSERT_GT(comp_len, 0u) << "level=" << level;
+        ASSERT_GE(comp_len, 2u);
+        EXPECT_EQ(compressed[0], 0x1f);
+        EXPECT_EQ(compressed[1], 0x8b);
+
+        std::vector<uint8_t> decompressed(input.size());
+        auto s = c->decompress(
+            {compressed.data(), comp_len}, decompressed.data(), decompressed.size());
+        EXPECT_TRUE(s.ok()) << "level=" << level << " " << s.message();
+        EXPECT_EQ(decompressed, input);
+
+        compressed_sizes.push_back(comp_len);
+        unique_sizes.insert(comp_len);
+    }
+
+    EXPECT_LE(compressed_sizes.back(), compressed_sizes.front());
+    EXPECT_GT(unique_sizes.size(), 1u);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     AllCodecs, CompressorTest,
     ::testing::Values(
         CompressTestParam{Compression::None,   "None"},
+        CompressTestParam{Compression::GZip,   "GZip"},
         CompressTestParam{Compression::LZ4,    "LZ4"},
         CompressTestParam{Compression::Zstd,   "Zstd"},
         CompressTestParam{Compression::Snappy, "Snappy"}

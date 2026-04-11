@@ -469,6 +469,7 @@ set(GTEST_SOURCES
   test/test_region_partitioner.cc
   test/test_cf_grouper.cc
   test/test_io_writers.cc
+  test/test_memory_allocators.cc
   test/test_jni_json_utils.cc
   test/test_bulk_load_writer_behavior.cc
 )
@@ -561,9 +562,16 @@ if(HFILE_ENABLE_COVERAGE)
   foreach(TGT IN LISTS HFILE_COVERAGE_OBJECT_TARGETS)
     string(APPEND HFILE_COVERAGE_OBJECT_LINES "  \"$<TARGET_FILE:${TGT}>\"\n")
   endforeach()
+  set(HFILE_COVERAGE_TEST_BINARY_LINES "")
+  foreach(TGT IN LISTS HFILE_TEST_TARGETS)
+    string(APPEND HFILE_COVERAGE_TEST_BINARY_LINES "${TGT}|$<TARGET_FILE:${TGT}>\n")
+  endforeach()
   file(GENERATE
     OUTPUT "${CMAKE_BINARY_DIR}/hfile_coverage_targets.cmake"
     CONTENT "set(HFILE_COVERAGE_OBJECTS\n${HFILE_COVERAGE_OBJECT_LINES})\n")
+  file(GENERATE
+    OUTPUT "${CMAKE_BINARY_DIR}/hfile_coverage_test_binaries.txt"
+    CONTENT "${HFILE_COVERAGE_TEST_BINARY_LINES}")
   configure_file(
     "${CMAKE_SOURCE_DIR}/cmake/llvm_cov_report.cmake.in"
     "${CMAKE_BINARY_DIR}/llvm_cov_report.cmake"

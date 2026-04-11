@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include "io/atomic_file_writer.h"
 #include "io/buffered_writer.h"
 
 #include <filesystem>
@@ -70,4 +71,35 @@ TEST(IOWriters, BufferedWriterCloseIsIdempotent) {
     ASSERT_TRUE(writer.close().ok());
     ASSERT_TRUE(writer.close().ok());
     fs::remove(path);
+}
+
+TEST(IOWriters, AtomicFileWriterCommitPublishesFinalFile) {
+    auto path = temp_file("atomic_commit");
+    AtomicFileWriter writer(path.string(), 8);
+
+    std::vector<uint8_t> payload = {'o', 'k'};
+    auto temp_path = writer.temp_path();
+    ASSERT_TRUE(writer.write(payload).ok());
+    ASSERT_TRUE(fs::exists(temp_path));
+    ASSERT_TRUE(writer.commit().ok());
+
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_FALSE(fs::exists(temp_path));
+    EXPECT_EQ(read_all(path), payload);
+    fs::remove(path);
+}
+
+TEST(IOWriters, AtomicFileWriterAbortRemovesTempFile) {
+    auto path = temp_file("atomic_abort");
+    AtomicFileWriter writer(path.string(), 8);
+
+    std::vector<uint8_t> payload = {'n', 'o'};
+    auto temp_path = writer.temp_path();
+    ASSERT_TRUE(writer.write(payload).ok());
+    ASSERT_TRUE(fs::exists(temp_path));
+
+    writer.abort();
+
+    EXPECT_FALSE(fs::exists(temp_path));
+    EXPECT_FALSE(fs::exists(path));
 }
