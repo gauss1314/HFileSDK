@@ -82,6 +82,7 @@ struct WriterOptions {
 
     // ── Comparator & checksum ──────────────────────────────────────────────
     std::string  comparator          = std::string(kCellComparator);
+    int64_t      file_create_time_ms = 0;
     uint32_t     bytes_per_checksum  = kBytesPerChecksum;
 
     // ── Sort mode ──────────────────────────────────────────────────────────

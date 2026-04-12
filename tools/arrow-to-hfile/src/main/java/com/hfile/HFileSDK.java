@@ -148,6 +148,7 @@ public class HFileSDK {
      *   <li>{@code error_policy}               — {@code "strict" | "skip_row" | "skip_batch"}
      *   <li>{@code bloom_type}                 — {@code "none" | "row" | "rowcol"}
      *   <li>{@code max_memory_bytes}           — soft SDK memory budget in bytes, 0 = unlimited
+     *   <li>{@code default_timestamp_ms}       — fixed timestamp written into generated cells, 0 = use current time
      *   <li>{@code excluded_columns}           — JSON string array of column names to exclude
      *                                            from HBase KV output (exact match, case-sensitive).
      *                                            Does NOT affect row key construction.
@@ -199,6 +200,7 @@ public class HFileSDK {
         private String columnFamily       = "cf";
         private String dataBlockEncoding  = "FAST_DIFF";
         private long   maxMemoryBytes     = 0;
+        private long   defaultTimestampMs = 0;
 
         public Builder compression(String c)       { compression = c;       return this; }
         public Builder compressionLevel(int l)     { compressionLevel = l;  return this; }
@@ -206,6 +208,7 @@ public class HFileSDK {
         public Builder columnFamily(String cf)     { columnFamily = cf;     return this; }
         public Builder dataBlockEncoding(String e) { dataBlockEncoding = e; return this; }
         public Builder maxMemoryBytes(long v)      { maxMemoryBytes = v;    return this; }
+        public Builder defaultTimestampMs(long v)  { defaultTimestampMs = v; return this; }
 
         /**
          * Build and configure an {@link HFileSDK} instance.
@@ -214,9 +217,10 @@ public class HFileSDK {
             HFileSDK sdk = new HFileSDK();
             String cfg = String.format(
                 "{\"compression\":\"%s\",\"compression_level\":%d,\"block_size\":%d," +
-                "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\",\"max_memory_bytes\":%d}",
+                "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\",\"max_memory_bytes\":%d," +
+                "\"default_timestamp_ms\":%d}",
                 compression, compressionLevel, blockSize, columnFamily, dataBlockEncoding,
-                maxMemoryBytes);
+                maxMemoryBytes, defaultTimestampMs);
             int rc = sdk.configure(cfg);
             if (rc != OK) {
                 throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());

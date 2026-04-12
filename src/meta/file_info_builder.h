@@ -96,22 +96,44 @@ public:
         set_bytes(std::string(fileinfo::kLenOfBiggestCell), {buf, 8});
     }
 
+    void set_key_of_biggest_cell(std::span<const uint8_t> key) {
+        set_bytes(std::string(fileinfo::kKeyOfBiggestCell), key);
+    }
+
+    void set_tags_compressed(bool compressed) {
+        uint8_t value = compressed ? 1 : 0;
+        set_bytes(std::string(fileinfo::kTagsCompressed), {&value, 1});
+    }
+
+    void set_delete_family_count(uint64_t v) {
+        uint8_t buf[8]; write_be64(buf, v);
+        set_bytes(std::string(fileinfo::kDeleteFamilyCount), {buf, 8});
+    }
+
+    void set_historical(bool historical) {
+        uint8_t value = historical ? 1 : 0;
+        set_bytes(std::string(fileinfo::kHistorical), {&value, 1});
+    }
+
     Status validate_required_fields() const {
         static const std::string kRequiredKeys[] = {
             std::string(fileinfo::kLastKey),
             std::string(fileinfo::kAvgKeyLen),
             std::string(fileinfo::kAvgValueLen),
-            std::string(fileinfo::kMaxTagsLen),
-            std::string(fileinfo::kKeyValueVersion),
-            std::string(fileinfo::kMaxMemstoreTsKey),
-            std::string(fileinfo::kComparator),
-            std::string(fileinfo::kDataBlockEncoding),
             std::string(fileinfo::kCreateTimeTs),
+            std::string(fileinfo::kKeyOfBiggestCell),
             std::string(fileinfo::kLenOfBiggestCell),
+            std::string(fileinfo::kDeleteFamilyCount),
+            std::string(fileinfo::kHistorical),
         };
         for (const auto& key : kRequiredKeys) {
             if (!entries_.count(key))
                 return Status::InvalidArg("FileInfo missing mandatory field: " + key);
+        }
+        if (entries_.count(std::string(fileinfo::kMaxTagsLen))
+            && !entries_.count(std::string(fileinfo::kTagsCompressed))) {
+            return Status::InvalidArg("FileInfo missing mandatory field: "
+                                      + std::string(fileinfo::kTagsCompressed));
         }
         return Status::OK();
     }

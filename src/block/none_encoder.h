@@ -17,9 +17,6 @@ public:
 
     bool append(const KeyValue& kv) override {
         size_t kv_size = kv.encoded_size();
-        if (!buffer_.empty() && buffer_.size() + kv_size > block_size_)
-            return false;  // block full
-
         size_t old_size = buffer_.size();
         buffer_.resize(old_size + kv_size);
         serialize_kv(kv, buffer_.data() + old_size);

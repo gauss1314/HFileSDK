@@ -52,6 +52,7 @@ public final class ConvertOptions {
     private final String errorPolicy;
     private final int    blockSize;
     private final long   maxMemoryBytes;
+    private final long   defaultTimestampMs;
 
     // ── Column exclusion ──────────────────────────────────────────────────────
     private final List<String> excludedColumns;
@@ -74,6 +75,7 @@ public final class ConvertOptions {
         this.errorPolicy            = b.errorPolicy;
         this.blockSize              = b.blockSize;
         this.maxMemoryBytes         = requireNonNegative(b.maxMemoryBytes, "maxMemoryBytes");
+        this.defaultTimestampMs     = requireNonNegative(b.defaultTimestampMs, "defaultTimestampMs");
         this.excludedColumns        = Collections.unmodifiableList(new ArrayList<>(b.excludedColumns));
         this.excludedColumnPrefixes = Collections.unmodifiableList(new ArrayList<>(b.excludedColumnPrefixes));
         this.nativeLibPath          = b.nativeLibPath;
@@ -105,6 +107,7 @@ public final class ConvertOptions {
     public String       errorPolicy()              { return errorPolicy; }
     public int          blockSize()                { return blockSize; }
     public long         maxMemoryBytes()           { return maxMemoryBytes; }
+    public long         defaultTimestampMs()       { return defaultTimestampMs; }
     public List<String> excludedColumns()          { return excludedColumns; }
     public List<String> excludedColumnPrefixes()   { return excludedColumnPrefixes; }
     public String       nativeLibPath()            { return nativeLibPath; }
@@ -131,6 +134,10 @@ public final class ConvertOptions {
         if (maxMemoryBytes > 0) {
             if (sb.length() > 1) sb.append(',');
             sb.append("\"max_memory_bytes\":").append(maxMemoryBytes);
+        }
+        if (defaultTimestampMs > 0) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"default_timestamp_ms\":").append(defaultTimestampMs);
         }
         appendStrArray(sb, "excluded_columns",         excludedColumns);
         appendStrArray(sb, "excluded_column_prefixes", excludedColumnPrefixes);
@@ -176,6 +183,7 @@ public final class ConvertOptions {
         private String errorPolicy       = "skip_row";
         private int    blockSize         = 65536;
         private long   maxMemoryBytes;
+        private long   defaultTimestampMs;
         private final ArrayList<String> excludedColumns        = new ArrayList<>();
         private final ArrayList<String> excludedColumnPrefixes = new ArrayList<>();
         private String nativeLibPath;
@@ -214,6 +222,7 @@ public final class ConvertOptions {
         public Builder errorPolicy(String v)       { errorPolicy = v;       return this; }
         public Builder blockSize(int v)            { blockSize = v;         return this; }
         public Builder maxMemoryBytes(long v)      { maxMemoryBytes = v;    return this; }
+        public Builder defaultTimestampMs(long v)  { defaultTimestampMs = v; return this; }
 
         /**
          * Exclude one column by exact name from HBase KV output.

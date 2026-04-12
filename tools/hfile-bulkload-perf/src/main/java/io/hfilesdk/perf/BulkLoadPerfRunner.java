@@ -50,6 +50,7 @@ public final class BulkLoadPerfRunner {
     private static final String DEFAULT_ERROR_POLICY = "skip_row";
     private static final int DEFAULT_BLOCK_SIZE = 65536;
     private static final String DEFAULT_WORK_DIR = "/tmp/hfilesdk-bulkload-perf";
+    private static final long DEFAULT_TIMESTAMP_MS = 1_715_678_900_123L;
     private static final String IMPL_JNI = "arrow-to-hfile";
     private static final String IMPL_JAVA = "arrow-to-hfile-java";
     private static final String STRATEGY_DIRECT = "DIRECT-CONVERT";
@@ -473,6 +474,7 @@ public final class BulkLoadPerfRunner {
             .bloomType(config.bloom())
             .errorPolicy(config.errorPolicy())
             .blockSize(config.blockSize())
+            .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
             .maxMemoryBytes(sdkMaxMemoryBytes)
             // Preserve JNI directory-conversion semantics: a worker may still
             // convert multiple Arrow files according to the configured parallelism.
@@ -533,6 +535,7 @@ public final class BulkLoadPerfRunner {
                 .bloomType(config.bloom())
                 .errorPolicy(config.errorPolicy())
                 .blockSize(config.blockSize())
+                .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
                 .maxMemoryBytes(sdkMaxMemoryBytes)
                 .nativeLibPath(config.nativeLib())
                 .build()
@@ -592,6 +595,7 @@ public final class BulkLoadPerfRunner {
                     .dataBlockEncoding(config.encoding())
                     .bloomType(config.bloom())
                     .blockSize(config.blockSize())
+                    .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
                     .build()
             );
             resultJsons.add(result.toJson());

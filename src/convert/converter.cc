@@ -704,18 +704,34 @@ ConvertResult convert(const ConvertOptions& opts) {
     // ── 4. Open HFile writer ─────────────────────────────────────────────
     WriterOptions wo          = opts.writer_opts;
     wo.column_family          = opts.column_family;
+    if (wo.file_create_time_ms <= 0 && opts.default_timestamp > 0)
+        wo.file_create_time_ms = opts.default_timestamp;
     wo.sort_mode              = WriterOptions::SortMode::PreSortedVerified;
 
     auto [writer, ws] = HFileWriter::builder()
         .set_path(opts.hfile_path)
         .set_column_family(wo.column_family)
         .set_compression(wo.compression)
+        .set_compression_level(wo.compression_level)
         .set_block_size(wo.block_size)
         .set_data_block_encoding(wo.data_block_encoding)
         .set_bloom_type(wo.bloom_type)
+        .set_bloom_error_rate(wo.bloom_error_rate)
+        .set_comparator(wo.comparator)
+        .set_file_create_time_ms(wo.file_create_time_ms)
         .set_sort_mode(wo.sort_mode)
+        .set_include_tags(wo.include_tags)
+        .set_include_mvcc(wo.include_mvcc)
         .set_fsync_policy(wo.fsync_policy)
         .set_error_policy(wo.error_policy)
+        .set_max_error_count(wo.max_error_count)
+        .set_error_callback(wo.error_callback)
+        .set_max_row_key_bytes(wo.max_row_key_bytes)
+        .set_max_value_bytes(wo.max_value_bytes)
+        .set_max_memory(wo.max_memory_bytes)
+        .set_min_free_disk(wo.min_free_disk_bytes)
+        .set_disk_check_interval(wo.disk_check_interval_bytes)
+        .set_max_open_files(wo.max_open_files)
         .build();
 
     if (!ws.ok()) {

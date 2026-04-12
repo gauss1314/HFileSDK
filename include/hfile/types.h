@@ -180,7 +180,7 @@ inline constexpr size_t kBlockHeaderSize = 33;
 
 // ─── Checksum ─────────────────────────────────────────────────────────────────
 inline constexpr uint8_t  kChecksumTypeCRC32C = 2;
-inline constexpr uint32_t kBytesPerChecksum   = 512;
+inline constexpr uint32_t kBytesPerChecksum   = 16 * 1024;
 
 // ─── HFile versions ──────────────────────────────────────────────────────────
 inline constexpr uint32_t kHFileMajorVersion = 3;
@@ -231,6 +231,8 @@ inline constexpr std::string_view kLastKey           = "hfile.LASTKEY";
 inline constexpr std::string_view kAvgKeyLen         = "hfile.AVG_KEY_LEN";
 inline constexpr std::string_view kAvgValueLen       = "hfile.AVG_VALUE_LEN";
 inline constexpr std::string_view kCreateTimeTs      = "hfile.CREATE_TIME_TS";
+inline constexpr std::string_view kTagsCompressed    = "hfile.TAGS_COMPRESSED";
+inline constexpr std::string_view kKeyOfBiggestCell  = "hfile.KEY_OF_BIGGEST_CELL";
 inline constexpr std::string_view kMaxTagsLen        = "hfile.MAX_TAGS_LEN";
 inline constexpr std::string_view kLenOfBiggestCell  = "hfile.LEN_OF_BIGGEST_CELL";
 inline constexpr std::string_view kKeyValueVersion   = "KEY_VALUE_VERSION";
@@ -239,13 +241,21 @@ inline constexpr std::string_view kComparator        = "hfile.COMPARATOR";
 inline constexpr std::string_view kDataBlockEncoding = "DATA_BLOCK_ENCODING";
 inline constexpr std::string_view kBloomFilterType   = "BLOOM_FILTER_TYPE";
 inline constexpr std::string_view kLastBloomKey      = "LAST_BLOOM_KEY";
+inline constexpr std::string_view kDeleteFamilyCount = "DELETE_FAMILY_COUNT";
+inline constexpr std::string_view kHistorical        = "HISTORICAL";
 } // namespace fileinfo
 
 // ─── Comparator class names ───────────────────────────────────────────────────
 inline constexpr std::string_view kCellComparator =
+    "org.apache.hadoop.hbase.InnerStoreCellComparator";
+inline constexpr std::string_view kCellComparatorImpl =
     "org.apache.hadoop.hbase.CellComparatorImpl";
 inline constexpr std::string_view kMetaCellComparator =
     "org.apache.hadoop.hbase.MetaCellComparator";
+inline constexpr std::string_view kLegacyKeyValueComparator =
+    "org.apache.hadoop.hbase.KeyValue$KVComparator";
+inline constexpr std::string_view kLegacyMetaKeyValueComparator =
+    "org.apache.hadoop.hbase.KeyValue$MetaComparator";
 
 // ─── KeyValue structure ───────────────────────────────────────────────────────
 /// Non-owning view of a single HBase KeyValue.

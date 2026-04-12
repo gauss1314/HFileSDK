@@ -55,11 +55,13 @@ public:
         Builder& set_path(std::string path);
         Builder& set_column_family(std::string cf);
         Builder& set_compression(Compression c);
+        Builder& set_compression_level(int level);
         Builder& set_block_size(size_t sz);
         Builder& set_data_block_encoding(Encoding enc);
         Builder& set_bloom_type(BloomType bt);
         Builder& set_bloom_error_rate(double r);
         Builder& set_comparator(std::string cmp);
+        Builder& set_file_create_time_ms(int64_t ts_ms);
         Builder& set_sort_mode(WriterOptions::SortMode m);
         Builder& set_include_tags(bool v);
         Builder& set_include_mvcc(bool v);

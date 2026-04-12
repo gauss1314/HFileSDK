@@ -11,9 +11,11 @@ public final class JavaConvertOptions {
     private final String rowKeyRule;
     private final String columnFamily;
     private final String compression;
+    private final int compressionLevel;
     private final String dataBlockEncoding;
     private final String bloomType;
     private final int blockSize;
+    private final long defaultTimestampMs;
     private final List<String> excludedColumns;
     private final List<String> excludedPrefixes;
 
@@ -24,11 +26,13 @@ public final class JavaConvertOptions {
         this.rowKeyRule = requireText(builder.rowKeyRule, "rowKeyRule");
         this.columnFamily = builder.columnFamily == null || builder.columnFamily.isBlank() ? "cf" : builder.columnFamily;
         this.compression = builder.compression == null || builder.compression.isBlank() ? "GZ" : builder.compression;
+        this.compressionLevel = requireCompressionLevel(builder.compressionLevel, "compressionLevel");
         this.dataBlockEncoding = builder.dataBlockEncoding == null || builder.dataBlockEncoding.isBlank()
             ? "NONE"
             : builder.dataBlockEncoding;
         this.bloomType = builder.bloomType == null || builder.bloomType.isBlank() ? "ROW" : builder.bloomType;
         this.blockSize = builder.blockSize <= 0 ? 65536 : builder.blockSize;
+        this.defaultTimestampMs = requireNonNegative(builder.defaultTimestampMs, "defaultTimestampMs");
         this.excludedColumns = List.copyOf(builder.excludedColumns);
         this.excludedPrefixes = List.copyOf(builder.excludedPrefixes);
     }
@@ -61,6 +65,10 @@ public final class JavaConvertOptions {
         return compression;
     }
 
+    public int compressionLevel() {
+        return compressionLevel;
+    }
+
     public String dataBlockEncoding() {
         return dataBlockEncoding;
     }
@@ -71,6 +79,10 @@ public final class JavaConvertOptions {
 
     public int blockSize() {
         return blockSize;
+    }
+
+    public long defaultTimestampMs() {
+        return defaultTimestampMs;
     }
 
     public List<String> excludedColumns() {
@@ -88,6 +100,20 @@ public final class JavaConvertOptions {
         return value;
     }
 
+    private static long requireNonNegative(long value, String name) {
+        if (value < 0) {
+            throw new IllegalArgumentException(name + " 不能小于 0");
+        }
+        return value;
+    }
+
+    private static int requireCompressionLevel(int value, String name) {
+        if (value < 0 || value > 9) {
+            throw new IllegalArgumentException(name + " 必须在 0-9 之间");
+        }
+        return value;
+    }
+
     public static final class Builder {
         private String arrowPath;
         private String hfilePath;
@@ -95,9 +121,11 @@ public final class JavaConvertOptions {
         private String rowKeyRule;
         private String columnFamily = "cf";
         private String compression = "GZ";
+        private int compressionLevel = 1;
         private String dataBlockEncoding = "NONE";
         private String bloomType = "ROW";
         private int blockSize = 65536;
+        private long defaultTimestampMs;
         private final List<String> excludedColumns = new ArrayList<>();
         private final List<String> excludedPrefixes = new ArrayList<>();
 
@@ -133,6 +161,11 @@ public final class JavaConvertOptions {
             return this;
         }
 
+        public Builder compressionLevel(int compressionLevel) {
+            this.compressionLevel = compressionLevel;
+            return this;
+        }
+
         public Builder dataBlockEncoding(String dataBlockEncoding) {
             this.dataBlockEncoding = dataBlockEncoding;
             return this;
@@ -145,6 +178,11 @@ public final class JavaConvertOptions {
 
         public Builder blockSize(int blockSize) {
             this.blockSize = blockSize;
+            return this;
+        }
+
+        public Builder defaultTimestampMs(long defaultTimestampMs) {
+            this.defaultTimestampMs = defaultTimestampMs;
             return this;
         }
 

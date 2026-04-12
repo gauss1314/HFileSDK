@@ -372,13 +372,11 @@ TEST(HFileWriter, FileInfoContainsMandatoryFields) {
     EXPECT_NE(content.find("hfile.LASTKEY"),           std::string::npos);
     EXPECT_NE(content.find("hfile.AVG_KEY_LEN"),       std::string::npos);
     EXPECT_NE(content.find("hfile.AVG_VALUE_LEN"),     std::string::npos);
-    EXPECT_NE(content.find("hfile.MAX_TAGS_LEN"),      std::string::npos);
-    EXPECT_NE(content.find("hfile.KEY_VALUE_VERSION"), std::string::npos);
-    EXPECT_NE(content.find("hfile.MAX_MEMSTORE_TS_KEY"), std::string::npos);
-    EXPECT_NE(content.find("hfile.COMPARATOR"),        std::string::npos);
-    EXPECT_NE(content.find("DATA_BLOCK_ENCODING"), std::string::npos);
     EXPECT_NE(content.find("hfile.CREATE_TIME_TS"), std::string::npos);
+    EXPECT_NE(content.find("hfile.KEY_OF_BIGGEST_CELL"), std::string::npos);
     EXPECT_NE(content.find("hfile.LEN_OF_BIGGEST_CELL"), std::string::npos);
+    EXPECT_NE(content.find("DELETE_FAMILY_COUNT"), std::string::npos);
+    EXPECT_NE(content.find("HISTORICAL"), std::string::npos);
 
     fs::remove(path);
 }

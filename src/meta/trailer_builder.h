@@ -12,6 +12,18 @@
 namespace hfile {
 namespace meta {
 
+inline std::string hbase1_compatible_comparator_name(
+        const std::string& comparator_class_name) {
+    if (comparator_class_name == kCellComparatorImpl
+            || comparator_class_name == kCellComparator) {
+        return std::string(kLegacyKeyValueComparator);
+    }
+    if (comparator_class_name == kMetaCellComparator) {
+        return std::string(kLegacyMetaKeyValueComparator);
+    }
+    return comparator_class_name;
+}
+
 /// Builds and serializes the HFile v3 Trailer.
 ///
 /// Layout at file tail:
@@ -33,7 +45,9 @@ public:
     void set_num_data_index_levels(uint32_t v)         { proto_.set_num_data_index_levels(v); }
     void set_first_data_block_offset(uint64_t v)       { proto_.set_first_data_block_offset(v); }
     void set_last_data_block_offset(uint64_t v)        { proto_.set_last_data_block_offset(v); }
-    void set_comparator_class_name(const std::string& v) { proto_.set_comparator_class_name(v); }
+    void set_comparator_class_name(const std::string& v) {
+        proto_.set_comparator_class_name(hbase1_compatible_comparator_name(v));
+    }
     void set_compression_codec(uint32_t v)             { proto_.set_compression_codec(v); }
 
     /// Serialize trailer and append to `out`.

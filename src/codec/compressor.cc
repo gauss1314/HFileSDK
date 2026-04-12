@@ -225,51 +225,87 @@ public:
         , level_(level <= 0 ? Z_DEFAULT_COMPRESSION : level) {}
 
     size_t max_compressed_size(size_t n) const noexcept override {
-        // gzip adds 10-byte header + 8-byte trailer on top of deflate bound
-        return compressBound(static_cast<uLong>(n)) + 32;
+        // Match JDK GZIPOutputStream layout:
+        // fixed 10-byte header + raw deflate payload + 8-byte trailer.
+        return compressBound(static_cast<uLong>(n)) + 18;
     }
 
     size_t compress(std::span<const uint8_t> input,
                     uint8_t* output, size_t capacity) const noexcept override {
+        static constexpr uint8_t kGzipHeader[10] = {
+            0x1f, 0x8b, 0x08, 0x00,
+            0x00, 0x00, 0x00, 0x00,
+            0x00, 0xff
+        };
+        if (capacity < sizeof(kGzipHeader) + 8) return 0;
+
+        std::memcpy(output, kGzipHeader, sizeof(kGzipHeader));
+
         z_stream strm{};
         strm.next_in   = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.data()));
         strm.avail_in  = static_cast<uInt>(input.size());
-        strm.next_out  = reinterpret_cast<Bytef*>(output);
-        strm.avail_out = static_cast<uInt>(capacity);
+        strm.next_out  = reinterpret_cast<Bytef*>(output + sizeof(kGzipHeader));
+        strm.avail_out = static_cast<uInt>(capacity - sizeof(kGzipHeader) - 8);
 
-        // windowBits = MAX_WBITS + 16 (31) → RFC 1952 gzip format.
-        //
-        // HBase clusters may or may not have native Hadoop zlib:
-        //   - WITH native zlib:  ZlibDecompressor(DEFAULT_HEADER, windowBits=15)
-        //                        → only handles RFC 1950 zlib format
-        //   - WITHOUT native:    BuiltInGzipDecompressor (pure Java)
-        //                        → strictly requires RFC 1952 gzip (checks 0x1f 0x8b)
-        //
-        // We produce gzip format because BuiltInGzipDecompressor is the more
-        // restrictive consumer.  If the local `hbase hfile` tool fails because
-        // the local machine HAS native zlib, disable it for testing:
-        //   HADOOP_OPTS="-Dhadoop.native.lib=false" hbase hfile -m -v -f <path>
+        // Match JDK GZIPOutputStream / HBase ReusableStreamGzipCodec:
+        // fixed gzip header + raw deflate payload + little-endian trailer.
         int ret = deflateInit2(&strm, level_, Z_DEFLATED,
-                               MAX_WBITS + 16, /*memLevel=*/8,
+                               -MAX_WBITS, /*memLevel=*/8,
                                Z_DEFAULT_STRATEGY);
         if (ret != Z_OK) return 0;
 
-        ret = deflate(&strm, Z_FINISH);
-        size_t compressed_size = strm.total_out;
+        while (strm.avail_in > 0) {
+            ret = deflate(&strm, Z_NO_FLUSH);
+            if (ret != Z_OK) {
+                deflateEnd(&strm);
+                return 0;
+            }
+            if (strm.avail_out == 0) {
+                deflateEnd(&strm);
+                return 0;
+            }
+        }
+
+        do {
+            ret = deflate(&strm, Z_FINISH);
+            if (ret != Z_OK && ret != Z_STREAM_END) {
+                deflateEnd(&strm);
+                return 0;
+            }
+            if (ret != Z_STREAM_END && strm.avail_out == 0) {
+                deflateEnd(&strm);
+                return 0;
+            }
+        } while (ret != Z_STREAM_END);
+
+        size_t deflated_size = strm.total_out;
         deflateEnd(&strm);
 
-        if (ret != Z_STREAM_END) return 0;
-        return compressed_size;
+        const uint32_t crc = static_cast<uint32_t>(
+            ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
+                    static_cast<uInt>(input.size())));
+        const uint32_t input_size = static_cast<uint32_t>(input.size());
+        uint8_t* trailer = output + sizeof(kGzipHeader) + deflated_size;
+        trailer[0] = static_cast<uint8_t>(crc & 0xff);
+        trailer[1] = static_cast<uint8_t>((crc >> 8) & 0xff);
+        trailer[2] = static_cast<uint8_t>((crc >> 16) & 0xff);
+        trailer[3] = static_cast<uint8_t>((crc >> 24) & 0xff);
+        trailer[4] = static_cast<uint8_t>(input_size & 0xff);
+        trailer[5] = static_cast<uint8_t>((input_size >> 8) & 0xff);
+        trailer[6] = static_cast<uint8_t>((input_size >> 16) & 0xff);
+        trailer[7] = static_cast<uint8_t>((input_size >> 24) & 0xff);
+        return sizeof(kGzipHeader) + deflated_size + 8;
     }
 
     Status decompress(std::span<const uint8_t> compressed,
                       uint8_t* output, size_t output_size) const noexcept override {
+        uint8_t scratch = 0;
         z_stream strm{};
         strm.next_in   = const_cast<Bytef*>(
             reinterpret_cast<const Bytef*>(compressed.data()));
         strm.avail_in  = static_cast<uInt>(compressed.size());
-        strm.next_out  = reinterpret_cast<Bytef*>(output);
-        strm.avail_out = static_cast<uInt>(output_size);
+        strm.next_out  = reinterpret_cast<Bytef*>(output_size > 0 ? output : &scratch);
+        strm.avail_out = static_cast<uInt>(output_size > 0 ? output_size : 1);
 
         // windowBits = MAX_WBITS + 32 (47) → auto-detect zlib or gzip format.
         // This lets our decompress() handle files written by either format,
@@ -277,12 +313,34 @@ public:
         int ret = inflateInit2(&strm, MAX_WBITS + 32);
         if (ret != Z_OK) return Status::Corruption("inflateInit2 failed");
 
-        ret = inflate(&strm, Z_FINISH);
-        inflateEnd(&strm);
-
-        if (ret != Z_STREAM_END)
+        for (;;) {
+            ret = inflate(&strm, Z_NO_FLUSH);
+            if (ret == Z_STREAM_END) {
+                break;
+            }
+            if (ret == Z_OK) {
+                if (strm.avail_out == 0) {
+                    inflateEnd(&strm);
+                    return Status::InvalidArg("GZip decompress: output buffer too small");
+                }
+                continue;
+            }
+            if (ret == Z_BUF_ERROR && strm.avail_in == 0) {
+                inflateEnd(&strm);
+                return Status::Corruption("GZip decompress truncated input");
+            }
+            inflateEnd(&strm);
             return Status::Corruption("GZip decompress failed (inflate returned "
                                       + std::to_string(ret) + ")");
+        }
+        const auto total_out = static_cast<size_t>(strm.total_out);
+        inflateEnd(&strm);
+
+        if (total_out != output_size) {
+            return Status::Corruption("GZip decompressed size mismatch (expected "
+                                      + std::to_string(output_size) + ", got "
+                                      + std::to_string(total_out) + ")");
+        }
         return Status::OK();
     }
 

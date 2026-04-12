@@ -42,6 +42,7 @@ public final class BatchConvertOptions {
     public final String errorPolicy;
     public final int    blockSize;
     public final long   maxMemoryBytes;
+    public final long   defaultTimestampMs;
     public final List<String> excludedColumnPrefixes;
     public final List<String> excludedColumns;
 
@@ -83,6 +84,7 @@ public final class BatchConvertOptions {
         this.errorPolicy           = b.errorPolicy;
         this.blockSize             = b.blockSize;
         this.maxMemoryBytes        = requireNonNegative(b.maxMemoryBytes, "maxMemoryBytes");
+        this.defaultTimestampMs    = requireNonNegative(b.defaultTimestampMs, "defaultTimestampMs");
         this.excludedColumnPrefixes = b.excludedColumnPrefixes != null
                                       ? List.copyOf(b.excludedColumnPrefixes) : List.of();
         this.excludedColumns       = b.excludedColumns != null
@@ -124,6 +126,7 @@ public final class BatchConvertOptions {
         private String     errorPolicy       = "skip_row";
         private int        blockSize         = 65536;
         private long       maxMemoryBytes;
+        private long       defaultTimestampMs;
         private List<String> excludedColumnPrefixes;
         private List<String> excludedColumns;
         private int        parallelism;
@@ -147,6 +150,7 @@ public final class BatchConvertOptions {
         public Builder errorPolicy(String v)         { errorPolicy = v;           return this; }
         public Builder blockSize(int v)              { blockSize = v;             return this; }
         public Builder maxMemoryBytes(long v)        { maxMemoryBytes = v;        return this; }
+        public Builder defaultTimestampMs(long v)    { defaultTimestampMs = v;    return this; }
         public Builder excludedColumnPrefixes(List<String> v) { excludedColumnPrefixes = v; return this; }
         public Builder excludedColumns(List<String> v)        { excludedColumns = v;        return this; }
         /** Number of concurrent conversions. Default: CPU count. */

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <cstdio>
 #include <mutex>
+#include <limits>
 #include <sstream>
 #include <unordered_set>
 #include <vector>
@@ -34,6 +35,7 @@ struct InstanceState {
     WriterOptions writer_opts;
     ConvertResult last_result;
     std::string   last_result_json{"{}"};
+    int64_t       default_timestamp_ms{0};
     // Column exclusion settings (set via configure())
     std::vector<std::string> excluded_columns;
     std::vector<std::string> excluded_column_prefixes;
@@ -72,7 +74,6 @@ static ConvertResult make_error_result(int code, std::string message) {
 // ─── Per-instance config / state (set via configure()) ──────────────────────
 static std::mutex                           g_config_mutex;
 static std::vector<hfile::jni::InstanceState> g_instance_states;
-
 static void cleanup_instance_states_locked(JNIEnv* env) {
     auto it = g_instance_states.begin();
     while (it != g_instance_states.end()) {
@@ -120,13 +121,14 @@ static hfile::WriterOptions get_instance_writer_opts(JNIEnv* env, jobject obj) {
 /// Called once per convert() invocation under the lock, then used without lock.
 struct InstanceSnapshot {
     hfile::WriterOptions     writer_opts;
+    int64_t                  default_timestamp_ms;
     std::vector<std::string> excluded_columns;
     std::vector<std::string> excluded_column_prefixes;
 };
 static InstanceSnapshot get_instance_snapshot(JNIEnv* env, jobject obj) {
     std::lock_guard<std::mutex> lk(g_config_mutex);
     const auto& s = get_or_create_instance_state_locked(env, obj);
-    return {s.writer_opts, s.excluded_columns, s.excluded_column_prefixes};
+    return {s.writer_opts, s.default_timestamp_ms, s.excluded_columns, s.excluded_column_prefixes};
 }
 
 // ─── JNI exports ─────────────────────────────────────────────────────────────
@@ -208,6 +210,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
 
         auto snap = get_instance_snapshot(env, obj);
         opts.writer_opts  = snap.writer_opts;
+        opts.default_timestamp = snap.default_timestamp_ms;
         opts.excluded_columns         = snap.excluded_columns;
         opts.excluded_column_prefixes = snap.excluded_column_prefixes;
 
@@ -313,6 +316,7 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             "bloom_type",
             "include_mvcc",
             "max_memory_bytes",
+            "default_timestamp_ms",
             // Column exclusion — used for Hudi / CDC metadata columns
             "excluded_columns",          // ["col1","col2",...]  exact names
             "excluded_column_prefixes"   // ["_hoodie","_cdc_"]  prefix match
@@ -386,6 +390,11 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         if (auto mm = hfile::jni::config_int(cfg, "max_memory_bytes")) {
             if (*mm < 0) return fail_config("max_memory_bytes must be >= 0");
             next_opts.max_memory_bytes = static_cast<size_t>(*mm);
+        }
+
+        if (auto ts = hfile::jni::config_int(cfg, "default_timestamp_ms")) {
+            if (*ts < 0) return fail_config("default_timestamp_ms must be >= 0");
+            state.default_timestamp_ms = *ts;
         }
 
         // ── Column exclusion ──────────────────────────────────────────────────

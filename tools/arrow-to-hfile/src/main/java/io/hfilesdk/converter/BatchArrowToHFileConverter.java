@@ -150,6 +150,7 @@ public class BatchArrowToHFileConverter {
                     .errorPolicy(opts.errorPolicy)
                     .blockSize(opts.blockSize)
                     .maxMemoryBytes(opts.maxMemoryBytes)
+                    .defaultTimestampMs(opts.defaultTimestampMs)
                     .excludedColumnPrefixes(opts.excludedColumnPrefixes)
                     .excludedColumns(opts.excludedColumns)
                     .build();

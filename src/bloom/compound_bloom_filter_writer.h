@@ -13,36 +13,51 @@
 namespace hfile {
 namespace bloom {
 
-/// Murmur3 32-bit hash (fast, good distribution).
-inline uint32_t murmur3_32(const uint8_t* data, size_t len, uint32_t seed = 0) noexcept {
-    constexpr uint32_t c1 = 0xCC9E2D51u;
-    constexpr uint32_t c2 = 0x1B873593u;
-    uint32_t h = seed;
-    size_t   nblocks = len / 4;
+/// HBase-compatible MurmurHash (same algorithm as org.apache.hadoop.hbase.util.MurmurHash).
+inline int32_t murmur_hash(const uint8_t* data, size_t len, int32_t seed = 0) noexcept {
+    constexpr int32_t m = 0x5bd1e995;
+    constexpr int32_t r = 24;
+    int32_t h = seed ^ static_cast<int32_t>(len);
 
-    for (size_t i = 0; i < nblocks; ++i) {
-        uint32_t k;
-        std::memcpy(&k, data + i * 4, 4);
-        k *= c1; k = (k << 15) | (k >> 17); k *= c2;
-        h ^= k;  h = (h << 13) | (h >> 19); h = h * 5 + 0xE6546B64u;
+    const size_t len_4 = len >> 2;
+    for (size_t i = 0; i < len_4; ++i) {
+        const size_t i_4 = i << 2;
+        int32_t k = static_cast<int32_t>(data[i_4 + 3]);
+        k <<= 8;
+        k |= static_cast<int32_t>(data[i_4 + 2] & 0xff);
+        k <<= 8;
+        k |= static_cast<int32_t>(data[i_4 + 1] & 0xff);
+        k <<= 8;
+        k |= static_cast<int32_t>(data[i_4 + 0] & 0xff);
+        k *= m;
+        k ^= static_cast<int32_t>(static_cast<uint32_t>(k) >> r);
+        k *= m;
+        h *= m;
+        h ^= k;
     }
-    const uint8_t* tail = data + nblocks * 4;
-    uint32_t k = 0;
-    switch (len & 3) {
-    case 3: k ^= static_cast<uint32_t>(tail[2]) << 16; [[fallthrough]];
-    case 2: k ^= static_cast<uint32_t>(tail[1]) << 8;  [[fallthrough]];
-    case 1: k ^= tail[0];
-        k *= c1; k = (k << 15) | (k >> 17); k *= c2; h ^= k;
+
+    const size_t len_m = len_4 << 2;
+    const size_t left = len - len_m;
+    if (left != 0) {
+        if (left >= 3) h ^= static_cast<int32_t>(data[len_m + 2]) << 16;
+        if (left >= 2) h ^= static_cast<int32_t>(data[len_m + 1]) << 8;
+        if (left >= 1) h ^= static_cast<int32_t>(data[len_m]);
+        h *= m;
     }
-    h ^= static_cast<uint32_t>(len);
-    h ^= h >> 16; h *= 0x85EBCA6Bu; h ^= h >> 13; h *= 0xC2B2AE35u; h ^= h >> 16;
+
+    h ^= static_cast<int32_t>(static_cast<uint32_t>(h) >> 13);
+    h *= m;
+    h ^= static_cast<int32_t>(static_cast<uint32_t>(h) >> 15);
     return h;
 }
 
 struct BloomWriteResult {
     int64_t  bloom_meta_offset{-1};
     int64_t  bloom_data_offset{-1};
+    int64_t  last_block_offset{-1};
     uint32_t total_key_count{0};
+    uint64_t bloom_chunk_uncompressed_bytes_with_headers{0};
+    uint64_t bloom_meta_uncompressed_bytes_with_headers{0};
     bool     enabled{false};
 };
 
@@ -50,7 +65,6 @@ struct BloomWriteResult {
 /// Each bloom filter chunk corresponds to roughly one data block.
 class CompoundBloomFilterWriter {
 public:
-    static constexpr int     kNumHashFunctions = 5;
     static constexpr int     kBloomFormatVersion = 3;
     static constexpr int     kHashTypeMurmur3 = 1;
     static constexpr double  kDefaultErrorRate  = 0.01;
@@ -58,14 +72,20 @@ public:
 
     CompoundBloomFilterWriter(BloomType type        = BloomType::Row,
                               double    error_rate   = kDefaultErrorRate,
-                              size_t    expected_kvs = 1'000'000)
-        : type_{type}, error_rate_{error_rate} {
+                              size_t    expected_kvs = 1'000'000,
+                              std::string comparator_class_name = {})
+        : type_{type},
+          error_rate_{error_rate},
+          comparator_class_name_{std::move(comparator_class_name)} {
         if (type == BloomType::None) return;
-        // bits_per_key = -log(errorRate) / (ln2)^2
-        double bpk   = -std::log(error_rate) / (0.693147 * 0.693147);
-        bits_per_key_ = static_cast<int>(std::ceil(bpk));
-        chunk_keys_  = static_cast<uint32_t>(
-            std::min<size_t>(expected_kvs / 4 + 1, kMaxChunkSize * 8 / bits_per_key_));
+        chunk_byte_size_ = compute_foldable_byte_size(static_cast<long long>(kMaxChunkSize * 8), kMaxFold);
+        long long bit_size = static_cast<long long>(chunk_byte_size_) * 8;
+        chunk_keys_ = static_cast<uint32_t>(compute_ideal_max_keys(bit_size, error_rate_));
+        hash_count_ = compute_optimal_function_count(static_cast<int>(chunk_keys_), bit_size);
+        chunk_keys_ = static_cast<uint32_t>(compute_max_keys(bit_size, error_rate_, hash_count_));
+        if (expected_kvs > 0 && chunk_keys_ > expected_kvs) {
+            chunk_keys_ = static_cast<uint32_t>(expected_kvs);
+        }
         init_chunk();
     }
 
@@ -99,8 +119,10 @@ public:
     /// and must be called explicitly by the writer when a data block is finalized).
     void finish_chunk() {
         if (type_ == BloomType::None || cur_keys_ == 0) return;
+        compact_chunk();
         chunks_.push_back(std::move(cur_chunk_));
         chunk_key_counts_.push_back(cur_keys_);
+        chunk_max_keys_.push_back(cur_chunk_max_keys_);
         chunk_first_keys_.push_back(std::move(cur_first_key_));
         cur_keys_ = 0;
         init_chunk();
@@ -112,16 +134,29 @@ public:
     /// Returns true if any bloom data was produced.
     bool finish_data_blocks(std::vector<uint8_t>& blocks_out,
                             int64_t current_file_offset,
+                            int64_t prev_block_offset,
+                            BloomWriteResult* result,
                             codec::Compressor* compressor = nullptr) {
         if (type_ == BloomType::None) return false;
         if (cur_keys_ > 0) finish_chunk();
         if (chunks_.empty()) return false;
 
         chunk_offsets_.reserve(chunks_.size());
+        chunk_on_disk_sizes_.reserve(chunks_.size());
+        int64_t current_prev_block_offset = -1;
         for (size_t i = 0; i < chunks_.size(); ++i) {
-            chunk_offsets_.push_back(
-                current_file_offset + static_cast<int64_t>(blocks_out.size()));
-            write_bloom_chunk_block(blocks_out, chunks_[i], compressor);
+            int64_t block_offset = current_file_offset + static_cast<int64_t>(blocks_out.size());
+            chunk_offsets_.push_back(block_offset);
+            size_t before_size = blocks_out.size();
+            write_bloom_chunk_block(blocks_out, chunks_[i], current_prev_block_offset, compressor);
+            chunk_on_disk_sizes_.push_back(
+                static_cast<uint32_t>(blocks_out.size() - before_size));
+            current_prev_block_offset = block_offset;
+            if (result) {
+                result->last_block_offset = block_offset;
+                result->bloom_chunk_uncompressed_bytes_with_headers +=
+                    static_cast<uint64_t>(kBlockHeaderSize + chunks_[i].size());
+            }
         }
         return true;
     }
@@ -131,8 +166,10 @@ public:
     /// `meta_block_file_offset` is the absolute file offset where this block starts
     /// (used to build the meta root index entry pointing to BLMFMET2).
     void finish_meta_block(std::vector<uint8_t>& meta_out,
+                           int64_t prev_block_offset,
+                           BloomWriteResult* result = nullptr,
                            codec::Compressor* compressor = nullptr) {
-        write_bloom_meta_block(meta_out, compressor);
+        write_bloom_meta_block(meta_out, prev_block_offset, result, compressor);
     }
 
     bool      is_enabled()     const noexcept { return type_ != BloomType::None; }
@@ -148,37 +185,91 @@ public:
         if (type_ == BloomType::None || (chunks_.empty() && cur_keys_ == 0))
             return result;
 
-        if (!finish_data_blocks(meta_blocks_out, current_offset)) return result;
+            if (!finish_data_blocks(meta_blocks_out, current_offset, 0, &result)) return result;
 
         result.enabled         = true;
         result.total_key_count = total_keys_;
         result.bloom_data_offset = current_offset;
         result.bloom_meta_offset =
             current_offset + static_cast<int64_t>(meta_blocks_out.size());
-        finish_meta_block(meta_blocks_out);
+        finish_meta_block(meta_blocks_out, result.last_block_offset, &result);
         return result;
     }
 
 private:
     void init_chunk() {
-        size_t bits = static_cast<size_t>(chunk_keys_) * bits_per_key_;
-        bits = (bits + 63) & ~63u;  // round up to 64
-        cur_chunk_.assign((bits + 7) / 8, 0);
+        cur_chunk_.assign(chunk_byte_size_, 0);
+        cur_chunk_max_keys_ = chunk_keys_;
     }
 
     void set_bits(std::span<const uint8_t> key) noexcept {
         if (cur_chunk_.empty()) return;
-        uint32_t h1 = murmur3_32(key.data(), key.size(), 0);
-        uint32_t h2 = murmur3_32(key.data(), key.size(), h1);
-        uint32_t nbits = static_cast<uint32_t>(cur_chunk_.size() * 8);
-        for (int i = 0; i < kNumHashFunctions; ++i) {
-            uint32_t bit = (h1 + static_cast<uint32_t>(i) * h2) % nbits;
-            cur_chunk_[bit >> 3] |= 1u << (bit & 7);
+        int32_t hash1 = murmur_hash(key.data(), key.size(), 0);
+        int32_t hash2 = murmur_hash(key.data(), key.size(), hash1);
+        int32_t composite_hash = hash1;
+        int32_t nbits = static_cast<int32_t>(cur_chunk_.size() * 8);
+        for (int i = 0; i < hash_count_; ++i) {
+            int32_t bit = composite_hash % nbits;
+            if (bit < 0) bit = -bit;
+            cur_chunk_[static_cast<size_t>(bit >> 3)] |= static_cast<uint8_t>(1u << (bit & 7));
+            composite_hash += hash2;
         }
+    }
+
+    void compact_chunk() {
+        if (cur_chunk_.empty() || cur_keys_ == 0) return;
+        size_t pieces = 1;
+        size_t new_byte_size = cur_chunk_.size();
+        uint32_t new_max_keys = cur_chunk_max_keys_;
+        while ((new_byte_size & 1u) == 0u && new_max_keys > (cur_keys_ << 1)) {
+            pieces <<= 1;
+            new_byte_size >>= 1;
+            new_max_keys >>= 1;
+        }
+        if (pieces <= 1) return;
+
+        for (size_t piece = 1; piece < pieces; ++piece) {
+            size_t src_off = piece * new_byte_size;
+            for (size_t pos = 0; pos < new_byte_size; ++pos) {
+                cur_chunk_[pos] |= cur_chunk_[src_off + pos];
+            }
+        }
+        cur_chunk_.resize(new_byte_size);
+        cur_chunk_max_keys_ = new_max_keys;
+    }
+
+    static constexpr int kMaxFold = 7;
+    static constexpr double kLog2Squared = 0.4804530139182014;
+
+    static size_t compute_foldable_byte_size(long long bit_size, int fold_factor) {
+        long long byte_size = (bit_size + 7) / 8;
+        int mask = (1 << fold_factor) - 1;
+        if ((byte_size & mask) != 0) {
+            byte_size >>= fold_factor;
+            ++byte_size;
+            byte_size <<= fold_factor;
+        }
+        return static_cast<size_t>(byte_size);
+    }
+
+    static long long compute_ideal_max_keys(long long bit_size, double error_rate) {
+        return static_cast<long long>(bit_size * (kLog2Squared / -std::log(error_rate)));
+    }
+
+    static long long compute_max_keys(long long bit_size, double error_rate, int hash_count) {
+        return static_cast<long long>(
+            -bit_size * 1.0 / hash_count *
+            std::log(1 - std::exp(std::log(error_rate) / hash_count)));
+    }
+
+    static int compute_optimal_function_count(int max_keys, long long bit_size) {
+        long long ratio = bit_size / std::max(1, max_keys);
+        return std::max(1, static_cast<int>(std::ceil(std::log(2.0) * ratio)));
     }
 
     void write_bloom_chunk_block(std::vector<uint8_t>& out,
                                  const std::vector<uint8_t>& chunk_data,
+                                 int64_t prev_block_offset,
                                  codec::Compressor* compressor = nullptr) {
         // Optionally compress the chunk data
         std::span<const uint8_t> payload{chunk_data.data(), chunk_data.size()};
@@ -204,7 +295,7 @@ private:
         std::memcpy(p, kBloomChunkMagic.data(), 8); p += 8;
         write_be32(p, static_cast<uint32_t>(payload.size() + checksum_buf.size())); p += 4;
         write_be32(p, static_cast<uint32_t>(chunk_data.size()));  p += 4; // uncompressed original size
-        write_be64(p, 0);                                          p += 8;
+        write_be64(p, static_cast<uint64_t>(prev_block_offset));   p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, kBytesPerChecksum); p += 4;
         write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
@@ -217,6 +308,8 @@ private:
     }
 
     void write_bloom_meta_block(std::vector<uint8_t>& out,
+                                int64_t prev_block_offset,
+                                BloomWriteResult* result,
                                 codec::Compressor* compressor = nullptr) {
         // Bloom meta block format (HBase compatible):
         // version(4B BE) + totalByteSize(8B BE) + hashCount(4B BE) + hashType(4B BE)
@@ -227,7 +320,8 @@ private:
 
         // ── Step 1: serialize bloom meta data into temp buffer ────────────────
         uint8_t comparator_len_buf[10];
-        const int comparator_len_size = encode_writable_vint(comparator_len_buf, 0);
+        const int comparator_len_size = encode_writable_vint(
+            comparator_len_buf, static_cast<int64_t>(comparator_class_name_.size()));
         size_t index_payload_size = 0;
         for (const auto& first_key : chunk_first_keys_) {
             uint8_t key_len_buf[10];
@@ -237,6 +331,7 @@ private:
         }
         size_t data_size = 4 + 8 + 4 + 4 + 8 + 8 + 4
                          + static_cast<size_t>(comparator_len_size)
+                         + comparator_class_name_.size()
                          + index_payload_size;
 
         std::vector<uint8_t> raw_data(data_size);
@@ -246,21 +341,25 @@ private:
         uint64_t total_bytes = 0;
         for (const auto& c : chunks_) total_bytes += c.size();
         write_be64(dp, total_bytes); dp += 8;
-        write_be32(dp, static_cast<uint32_t>(kNumHashFunctions)); dp += 4;
+        write_be32(dp, static_cast<uint32_t>(hash_count_)); dp += 4;
         write_be32(dp, static_cast<uint32_t>(kHashTypeMurmur3)); dp += 4;
         write_be64(dp, static_cast<uint64_t>(total_keys_)); dp += 8;
         uint64_t total_max_keys = 0;
-        for (uint32_t c : chunk_key_counts_) total_max_keys += c;
+        for (uint32_t c : chunk_max_keys_) total_max_keys += c;
         write_be64(dp, total_max_keys); dp += 8;
         write_be32(dp, static_cast<uint32_t>(chunks_.size())); dp += 4;
         std::memcpy(dp, comparator_len_buf, static_cast<size_t>(comparator_len_size));
         dp += comparator_len_size;
+        if (!comparator_class_name_.empty()) {
+            std::memcpy(dp, comparator_class_name_.data(), comparator_class_name_.size());
+            dp += comparator_class_name_.size();
+        }
         for (size_t i = 0; i < chunks_.size(); ++i) {
             uint8_t key_len_buf[10];
             const int key_len_size = encode_writable_vint(
                 key_len_buf, static_cast<int64_t>(chunk_first_keys_[i].size()));
             write_be64(dp, static_cast<uint64_t>(chunk_offsets_[i])); dp += 8;
-            write_be32(dp, static_cast<uint32_t>(chunks_[i].size())); dp += 4;
+            write_be32(dp, chunk_on_disk_sizes_[i]); dp += 4;
             std::memcpy(dp, key_len_buf, static_cast<size_t>(key_len_size));
             dp += key_len_size;
             std::memcpy(dp, chunk_first_keys_[i].data(), chunk_first_keys_[i].size());
@@ -293,7 +392,7 @@ private:
         std::memcpy(p, kBloomMetaMagic.data(), 8); p += 8;
         write_be32(p, static_cast<uint32_t>(payload.size() + checksum_buf.size())); p += 4;
         write_be32(p, static_cast<uint32_t>(data_size)); p += 4;  // uncompressed original size
-        write_be64(p, 0);                                 p += 8;
+        write_be64(p, static_cast<uint64_t>(prev_block_offset)); p += 8;
         *p++ = kChecksumTypeCRC32C;
         write_be32(p, kBytesPerChecksum); p += 4;
         write_be32(p, static_cast<uint32_t>(on_disk_data_with_header)); p += 4;
@@ -309,20 +408,30 @@ private:
             checksum_buf.data());
         std::memcpy(out.data() + off + kBlockHeaderSize + payload.size(),
                     checksum_buf.data(), checksum_buf.size());
+        if (result) {
+            result->bloom_meta_uncompressed_bytes_with_headers =
+                static_cast<uint64_t>(kBlockHeaderSize + raw_data.size());
+        }
     }
 
     BloomType              type_;
     double                 error_rate_;
     int                    bits_per_key_{10};
     uint32_t               chunk_keys_{4096};
+    int                    hash_count_{5};
+    size_t                 chunk_byte_size_{kMaxChunkSize};
+    uint32_t               cur_chunk_max_keys_{0};
 
     std::vector<uint8_t>                 cur_chunk_;
     std::vector<uint8_t>                 cur_first_key_;
     uint32_t                             cur_keys_{0};
     uint32_t                             total_keys_{0};
+    std::string                          comparator_class_name_;
     std::vector<std::vector<uint8_t>>    chunks_;
     std::vector<std::vector<uint8_t>>    chunk_first_keys_;
     std::vector<uint32_t>                chunk_key_counts_;
+    std::vector<uint32_t>                chunk_max_keys_;
+    std::vector<uint32_t>                chunk_on_disk_sizes_;
     std::vector<int64_t>                 chunk_offsets_;
 };
 

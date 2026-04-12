@@ -71,6 +71,7 @@ final class ArrowToHFileJavaConverterTest {
                 .tableName("perf_table")
                 .rowKeyRule("USER_ID,0,false,0")
                 .columnFamily("cf")
+                .defaultTimestampMs(1_715_678_900_123L)
                 .build()
         );
 
@@ -91,6 +92,7 @@ final class ArrowToHFileJavaConverterTest {
             Cell firstCell = scanner.getCell();
             assertEquals("user-0001", new String(firstCell.getRowArray(), firstCell.getRowOffset(), firstCell.getRowLength(), StandardCharsets.UTF_8));
             assertEquals("EVENT_TIME", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
+            assertEquals(1_715_678_900_123L, firstCell.getTimestamp());
 
             HFileInfo fileInfo = ((HFileReaderImpl) reader).getHFileInfo();
             assertNotNull(fileInfo.get(org.apache.hadoop.hbase.util.Bytes.toBytes("BLOOM_FILTER_TYPE")));

@@ -41,6 +41,7 @@ import org.apache.hadoop.hbase.io.hfile.CacheConfig;
 import org.apache.hadoop.hbase.io.hfile.HFileContext;
 import org.apache.hadoop.hbase.io.hfile.HFileContextBuilder;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.io.compress.zlib.ZlibCompressor;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -82,21 +83,27 @@ public final class ArrowToHFileJavaConverter {
             }
 
             Configuration configuration = HBaseConfiguration.create();
+            configureGzipCodec(configuration, options.compressionLevel());
             FileSystem fileSystem = createLocalFileSystem(configuration);
             Path outputPath = new Path(hfilePath.toString());
             byte[] columnFamily = Bytes.toBytes(options.columnFamily());
             Compression.Algorithm compression = normalizeCompression(options.compression());
             DataBlockEncoding encoding = normalizeEncoding(options.dataBlockEncoding());
             BloomType bloomType = BloomType.valueOf(options.bloomType().toUpperCase(Locale.ROOT));
+            long createTimeMs = options.defaultTimestampMs() > 0
+                ? options.defaultTimestampMs()
+                : System.currentTimeMillis();
 
             HFileContextBuilder contextBuilder = new HFileContextBuilder()
                 .withCompression(compression)
                 .withDataBlockEncoding(encoding)
                 .withCellComparator(CellComparatorImpl.COMPARATOR)
                 .withBlockSize(options.blockSize())
+                .withBytesPerCheckSum(16 * 1024)
+                .withCreateTime(createTimeMs)
                 .withColumnFamily(columnFamily)
                 .withIncludesTags(true)
-                .withIncludesMvcc(true)
+                .withIncludesMvcc(false)
                 .withCompressTags(false);
             if (!options.tableName().isBlank()) {
                 contextBuilder.withTableName(Bytes.toBytes(options.tableName()));
@@ -138,7 +145,14 @@ public final class ArrowToHFileJavaConverter {
                         sortIndex.size()
                     );
                     try {
-                        kvWritten = writeSortedRows(writer, columnFamily, storedBatches, projectedSchema, sortIndex);
+                        kvWritten = writeSortedRows(
+                            writer,
+                            columnFamily,
+                            storedBatches,
+                            projectedSchema,
+                            sortIndex,
+                            options.defaultTimestampMs()
+                        );
                     } finally {
                         writer.close();
                     }
@@ -236,9 +250,11 @@ public final class ArrowToHFileJavaConverter {
                 .rowKeyRule(required(commandLine, "rule"))
                 .columnFamily(commandLine.getOptionValue("cf", "cf"))
                 .compression(commandLine.getOptionValue("compression", "GZ"))
+                .compressionLevel(parseCompressionLevel(commandLine.getOptionValue("compression-level", "1")))
                 .dataBlockEncoding(commandLine.getOptionValue("encoding", "NONE"))
                 .bloomType(commandLine.getOptionValue("bloom", "ROW"))
                 .blockSize(parsePositiveInt(commandLine.getOptionValue("block-size", "65536"), "block-size"))
+                .defaultTimestampMs(parseNonNegativeLong(commandLine.getOptionValue("timestamp-ms", "0"), "timestamp-ms"))
                 .excludedColumns(parseCsv(commandLine.getOptionValue("exclude-cols", "")))
                 .excludedPrefixes(parseCsv(commandLine.getOptionValue("exclude-prefix", "")))
                 .build();
@@ -265,9 +281,11 @@ public final class ArrowToHFileJavaConverter {
         options.addOption(Option.builder().longOpt("rule").hasArg().argName("RULE").desc("rowKeyRule").build());
         options.addOption(Option.builder().longOpt("cf").hasArg().argName("CF").desc("列族名，默认 cf").build());
         options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法，默认 GZ").build());
+        options.addOption(Option.builder().longOpt("compression-level").hasArg().argName("N").desc("GZ 压缩级别，默认 1").build());
         options.addOption(Option.builder().longOpt("encoding").hasArg().argName("ENC").desc("Data Block Encoding，默认 NONE").build());
         options.addOption(Option.builder().longOpt("bloom").hasArg().argName("TYPE").desc("Bloom 类型，默认 ROW").build());
         options.addOption(Option.builder().longOpt("block-size").hasArg().argName("BYTES").desc("block size，默认 65536").build());
+        options.addOption(Option.builder().longOpt("timestamp-ms").hasArg().argName("MILLIS").desc("固定写入时间戳，默认 0=使用当前时间").build());
         options.addOption(Option.builder().longOpt("exclude-cols").hasArg().argName("COL1,COL2").desc("排除列名").build());
         options.addOption(Option.builder().longOpt("exclude-prefix").hasArg().argName("PFX1,PFX2").desc("排除列名前缀").build());
         options.addOption(Option.builder().longOpt("help").desc("显示帮助").build());
@@ -295,6 +313,32 @@ public final class ArrowToHFileJavaConverter {
         }
         if (value <= 0) {
             throw new IllegalArgumentException("--" + optionName + " 必须为正整数");
+        }
+        return value;
+    }
+
+    private static long parseNonNegativeLong(String raw, String optionName) {
+        long value;
+        try {
+            value = Long.parseLong(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("--" + optionName + " 必须为非负整数");
+        }
+        if (value < 0) {
+            throw new IllegalArgumentException("--" + optionName + " 必须为非负整数");
+        }
+        return value;
+    }
+
+    private static int parseCompressionLevel(String raw) {
+        int value;
+        try {
+            value = Integer.parseInt(raw);
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("--compression-level 必须为 0-9 之间的整数");
+        }
+        if (value < 0 || value > 9) {
+            throw new IllegalArgumentException("--compression-level 必须为 0-9 之间的整数");
         }
         return value;
     }
@@ -347,6 +391,28 @@ public final class ArrowToHFileJavaConverter {
         RawLocalFileSystem fileSystem = new RawLocalFileSystem();
         fileSystem.initialize(java.net.URI.create("file:///"), configuration);
         return fileSystem;
+    }
+
+    private static void configureGzipCodec(Configuration configuration, int compressionLevel) {
+        configuration.set("hbase.io.compress.gz.codec", FixedLevelGzipCodec.class.getName());
+        configuration.setInt(FixedLevelGzipCodec.LEVEL_KEY, compressionLevel <= 0
+            ? FixedLevelGzipCodec.DEFAULT_LEVEL
+            : compressionLevel);
+        configuration.setEnum("zlib.compress.level",
+            compressionLevel <= 1
+                ? ZlibCompressor.CompressionLevel.BEST_SPEED
+                : ZlibCompressor.CompressionLevel.valueOf(switch (compressionLevel) {
+                    case 2 -> "TWO";
+                    case 3 -> "THREE";
+                    case 4 -> "FOUR";
+                    case 5 -> "FIVE";
+                    case 6 -> "SIX";
+                    case 7 -> "SEVEN";
+                    case 8 -> "EIGHT";
+                    case 9 -> "BEST_COMPRESSION";
+                    default -> "DEFAULT_COMPRESSION";
+                }));
+        Compression.Algorithm.GZ.reload(configuration);
     }
 
     private static StoreFileWriter createStoreFileWriter(Configuration configuration,
@@ -448,7 +514,8 @@ public final class ArrowToHFileJavaConverter {
                                         byte[] columnFamily,
                                         List<VectorSchemaRoot> storedBatches,
                                         ProjectedSchema projectedSchema,
-                                        List<SortEntry> sortIndex) throws IOException {
+                                        List<SortEntry> sortIndex,
+                                        long defaultTimestampMs) throws IOException {
         long kvWritten = 0L;
         List<GroupedCell> cells = new ArrayList<>();
 
@@ -473,7 +540,7 @@ public final class ArrowToHFileJavaConverter {
 
             cells.sort(Comparator.comparing(GroupedCell::name));
             String previousQualifier = null;
-            long timestamp = System.currentTimeMillis();
+            long timestamp = defaultTimestampMs > 0 ? defaultTimestampMs : System.currentTimeMillis();
             for (GroupedCell cell : cells) {
                 if (cell.name().equals(previousQualifier)) {
                     continue;

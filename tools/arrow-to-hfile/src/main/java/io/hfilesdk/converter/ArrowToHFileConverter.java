@@ -229,6 +229,7 @@ public class ArrowToHFileConverter {
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
         int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
         long   maxMemoryBytes = parseLong(cmd.getOptionValue("max-memory-mb", "0"), 0) * 1024L * 1024L;
+        long   defaultTimestampMs = parseLong(cmd.getOptionValue("timestamp-ms", "0"), 0);
 
         // ── Validate input file ────────────────────────────────────────────
         Path arrowFilePath = Paths.get(arrowPath);
@@ -283,6 +284,7 @@ public class ArrowToHFileConverter {
                 .errorPolicy(errorPolicy)
                 .blockSize(blockSize)
                 .maxMemoryBytes(maxMemoryBytes);
+            optsBuilder.defaultTimestampMs(defaultTimestampMs);
 
             // Column exclusion — exact names
             if (cmd.hasOption("exclude-cols")) {
@@ -358,6 +360,7 @@ public class ArrowToHFileConverter {
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
         int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
         long   maxMemoryBytes = parseLong(cmd.getOptionValue("max-memory-mb", "0"), 0) * 1024L * 1024L;
+        long   defaultTimestampMs = parseLong(cmd.getOptionValue("timestamp-ms", "0"), 0);
         int    parallelism = parseInt(cmd.getOptionValue("parallelism",
             String.valueOf(Runtime.getRuntime().availableProcessors())),
             Runtime.getRuntime().availableProcessors());
@@ -389,6 +392,7 @@ public class ArrowToHFileConverter {
             .errorPolicy(errorPolicy)
             .blockSize(blockSize)
             .maxMemoryBytes(maxMemoryBytes)
+            .defaultTimestampMs(defaultTimestampMs)
             .parallelism(parallelism)
             .skipExisting(skipExisting)
             .nativeLibPath(nativeLib);
@@ -515,7 +519,7 @@ public class ArrowToHFileConverter {
             .desc("Compression: none|lz4|zstd|snappy|GZ    [default: GZ, also accepts gzip]")
             .hasArg().argName("ALG").build());
         o.addOption(Option.builder().longOpt("compression-level")
-            .desc("Compression level 1(fastest)-9(best ratio) [default: 1]")
+            .desc("Compression level 1(fastest)-9(best ratio), 0 = codec default [default: 1]")
             .hasArg().argName("N").build());
         o.addOption(Option.builder().longOpt("encoding")
             .desc("Encoding: NONE|PREFIX|DIFF|FAST_DIFF     [default: FAST_DIFF]")
@@ -529,6 +533,9 @@ public class ArrowToHFileConverter {
         o.addOption(Option.builder().longOpt("max-memory-mb")
             .desc("Soft SDK memory budget in MiB            [default: unlimited]")
             .hasArg().argName("MiB").build());
+        o.addOption(Option.builder().longOpt("timestamp-ms")
+            .desc("Fixed cell timestamp in milliseconds      [default: current time]")
+            .hasArg().argName("MILLIS").build());
         o.addOption(Option.builder().longOpt("fsync-policy")
             .desc("Fsync: safe|fast|paranoid                [default: safe]")
             .hasArg().argName("POLICY").build());

@@ -40,6 +40,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 final class HFileConsistencyTest {
+    private static final long FIXED_TIMESTAMP_MS = 1_715_678_900_123L;
 
     @Test
     void jniAndPureJavaProduceEquivalentReadableHFiles(@TempDir Path tempDir) throws Exception {
@@ -60,8 +61,10 @@ final class HFileConsistencyTest {
                 .rowKeyRule("USER_ID,0,false,0")
                 .columnFamily("cf")
                 .compression("GZ")
+                .compressionLevel(1)
                 .dataBlockEncoding("NONE")
                 .bloomType("row")
+                .defaultTimestampMs(FIXED_TIMESTAMP_MS)
                 .build()
         );
         assertTrue(jniResult.isSuccess(), jniResult.summary());
@@ -74,14 +77,17 @@ final class HFileConsistencyTest {
                 .rowKeyRule("USER_ID,0,false,0")
                 .columnFamily("cf")
                 .compression("GZ")
+                .compressionLevel(1)
                 .dataBlockEncoding("NONE")
                 .bloomType("ROW")
+                .defaultTimestampMs(FIXED_TIMESTAMP_MS)
                 .build()
         );
         assertTrue(javaResult.isSuccess(), javaResult.summary());
 
         try (ReaderSnapshot jniReader = openReader(jniHFile);
              ReaderSnapshot javaReader = openReader(javaHFile)) {
+            assertEquals(-1L, Files.mismatch(jniHFile, javaHFile), "JNI/Java HFile bytes should match exactly");
             assertEquals(jniReader.cells(), javaReader.cells());
             assertEquals(Compression.Algorithm.GZ, jniReader.reader().getFileContext().getCompression());
             assertEquals(Compression.Algorithm.GZ, javaReader.reader().getFileContext().getCompression());
@@ -150,6 +156,7 @@ final class HFileConsistencyTest {
                 Bytes.toStringBinary(CellUtil.cloneRow(cell)) + "|" +
                 Bytes.toStringBinary(CellUtil.cloneFamily(cell)) + "|" +
                 Bytes.toStringBinary(CellUtil.cloneQualifier(cell)) + "|" +
+                cell.getTimestamp() + "|" +
                 Bytes.toStringBinary(CellUtil.cloneValue(cell)) + "|" +
                 cell.getType()
             );

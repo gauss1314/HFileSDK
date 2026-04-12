@@ -20,8 +20,12 @@ fi
 
 detect_jobs() {
   if [[ "${IS_MACOS}" -eq 1 ]]; then
-    sysctl -n hw.ncpu
-    return 0
+    local n
+    n="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+    if [[ -n "${n}" && "${n}" =~ ^[0-9]+$ && "${n}" -gt 0 ]]; then
+      echo "${n}"
+      return 0
+    fi
   fi
   if [[ "${IS_LINUX}" -eq 1 ]]; then
     if command -v nproc >/dev/null 2>&1; then

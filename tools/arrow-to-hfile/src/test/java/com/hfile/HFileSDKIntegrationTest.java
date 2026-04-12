@@ -80,6 +80,36 @@ public class HFileSDKIntegrationTest {
     }
 
     @Test
+    void configureAcceptsFixedDefaultTimestamp(@TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");
+        writeArrowStream(arrowPath, List.of("row2", "row1"), List.of("value2", "value1"));
+
+        HFileSDK sdk = new HFileSDK();
+        int configureRc = sdk.configure("""
+            {
+              "compression":"none",
+              "column_family":"cf",
+              "data_block_encoding":"NONE",
+              "bloom_type":"row",
+              "include_mvcc":0,
+              "default_timestamp_ms":1715678900123
+            }
+            """);
+        assertEquals(HFileSDK.OK, configureRc);
+
+        assertEquals(HFileSDK.OK, sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "ID,0,false,0"));
+        String lastResult = sdk.getLastResult();
+        assertTrue(lastResult.contains("\"error_code\":0"));
+        assertTrue(Files.exists(hfilePath));
+        assertTrue(Files.size(hfilePath) > 0);
+    }
+
+    @Test
     void instanceStateIsIsolatedAcrossSdkObjects() {
         HFileSDK sdk1 = new HFileSDK();
         HFileSDK sdk2 = new HFileSDK();

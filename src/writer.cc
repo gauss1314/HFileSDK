@@ -30,6 +30,12 @@
 
 namespace hfile {
 
+namespace {
+
+constexpr std::string_view kGeneralBloomMetaKey = "GENERAL_BLOOM_META";
+
+}  // namespace
+
 // ─── Minimal structured logger (no spdlog dep, writes to stderr) ─────────────
 // Format: [LEVEL] hfile: message
 namespace log {
@@ -90,6 +96,92 @@ static size_t estimate_owned_kv_bytes(const OwnedKeyValue& kv) noexcept {
          + kv.qualifier.size()
          + kv.value.size()
          + kv.tags.size();
+}
+
+static void copy_key_only(const KeyValue& kv, OwnedKeyValue* out) {
+    out->row.assign(kv.row.begin(), kv.row.end());
+    out->family.assign(kv.family.begin(), kv.family.end());
+    out->qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+    out->timestamp = kv.timestamp;
+    out->key_type = kv.key_type;
+    out->value.clear();
+    out->tags.clear();
+    out->memstore_ts = 0;
+    out->has_memstore_ts = false;
+}
+
+static bool midpoint_bytes(std::span<const uint8_t> left,
+                           std::span<const uint8_t> right,
+                           std::vector<uint8_t>* out) {
+    size_t min_len = std::min(left.size(), right.size());
+    size_t diff_idx = 0;
+    for (; diff_idx < min_len; ++diff_idx) {
+        uint8_t left_byte = left[diff_idx];
+        uint8_t right_byte = right[diff_idx];
+        if (left_byte > right_byte) {
+            throw std::invalid_argument("Left key component sorts after right component");
+        }
+        if (left_byte != right_byte) {
+            break;
+        }
+    }
+
+    if (diff_idx == min_len) {
+        if (left.size() > right.size()) {
+            throw std::invalid_argument("Left key component sorts after right component");
+        }
+        if (left.size() < right.size()) {
+            out->resize(min_len + 1);
+            std::memcpy(out->data(), right.data(), min_len + 1);
+            (*out)[min_len] = 0x00;
+            return true;
+        }
+        return false;
+    }
+
+    out->resize(diff_idx + 1);
+    std::memcpy(out->data(), left.data(), diff_idx + 1);
+    (*out)[diff_idx] = static_cast<uint8_t>((*out)[diff_idx] + 1);
+    return true;
+}
+
+static std::vector<uint8_t> serialize_index_key(std::span<const uint8_t> row,
+                                                std::span<const uint8_t> family,
+                                                std::span<const uint8_t> qualifier) {
+    KeyValue kv;
+    kv.row = row;
+    kv.family = family;
+    kv.qualifier = qualifier;
+    kv.timestamp = std::numeric_limits<int64_t>::max();
+    kv.key_type = KeyType::Maximum;
+
+    std::vector<uint8_t> key(kv.key_length());
+    block::serialize_key(kv, key.data());
+    return key;
+}
+
+static std::vector<uint8_t> compute_midpoint_key(const KeyValue* left,
+                                                 const KeyValue& right) {
+    if (left == nullptr) {
+        std::vector<uint8_t> key(right.key_length());
+        block::serialize_key(right, key.data());
+        return key;
+    }
+
+    std::vector<uint8_t> midpoint;
+    if (midpoint_bytes(left->row, right.row, &midpoint)) {
+        return serialize_index_key(midpoint, {}, {});
+    }
+    if (midpoint_bytes(left->family, right.family, &midpoint)) {
+        return serialize_index_key(right.row, midpoint, {});
+    }
+    if (midpoint_bytes(left->qualifier, right.qualifier, &midpoint)) {
+        return serialize_index_key(right.row, right.family, midpoint);
+    }
+
+    std::vector<uint8_t> key(right.key_length());
+    block::serialize_key(right, key.data());
+    return key;
 }
 
 static uint32_t hbase_compression_codec(Compression c) noexcept {
@@ -174,8 +266,13 @@ public:
                                                       opts_.block_size);
         compressor_ = codec::Compressor::create(opts_.compression,
                                                  opts_.compression_level);
+        const std::string bloom_comparator =
+            opts_.bloom_type == BloomType::RowCol
+                ? std::string(kCellComparatorImpl)
+                : std::string();
         bloom_      = std::make_unique<bloom::CompoundBloomFilterWriter>(
-                          opts_.bloom_type, opts_.bloom_error_rate);
+                          opts_.bloom_type, opts_.bloom_error_rate, 1'000'000,
+                          bloom_comparator);
 
         compress_buf_.resize(compressor_->max_compressed_size(opts_.block_size + 65536));
         if (budget_) {
@@ -277,11 +374,18 @@ public:
         if (bloom_result.enabled) {
             bloom_result.bloom_data_offset = writer_->position();
             std::vector<uint8_t> bloom_chunk_buf;
-            bloom_->finish_data_blocks(bloom_chunk_buf, writer_->position(),
-                                        compressor_.get());
+            bloom_->finish_data_blocks(
+                bloom_chunk_buf,
+                writer_->position(),
+                prev_block_offset_,
+                &bloom_result,
+                compressor_.get());
             if (!bloom_chunk_buf.empty()) {
                 HFILE_RETURN_IF_ERROR(
                     writer_->write({bloom_chunk_buf.data(), bloom_chunk_buf.size()}));
+                prev_block_offset_ = bloom_result.last_block_offset;
+                total_uncompressed_bytes_ +=
+                    bloom_result.bloom_chunk_uncompressed_bytes_with_headers;
             }
         }
 
@@ -289,7 +393,7 @@ public:
         // HBase load-on-open order:
         //   1. [Intermediate Index Blocks]  (IDXINTE2, large files only)
         //   2. Root Data Index              (IDXROOT2)
-        //   3. Meta Root Index              (IDXROOT2, one entry → BLMFMET2 offset)
+        //   3. Meta Root Index              (IDXROOT2, usually empty for bulk-load files)
         //   4. FileInfo                     (FILEINF2)
         //   5. Bloom Meta Block             (BLMFMET2)
         //
@@ -304,47 +408,52 @@ public:
         const int64_t root_block_offset =
             load_on_open_offset + static_cast<int64_t>(intermed_buf.size());
         auto root_block = build_raw_block(
-            kRootIndexMagic, {root_buf.data(), root_buf.size()}, prev_block_offset_);
-        std::vector<uint8_t> bloom_meta_block;
+            kRootIndexMagic, {root_buf.data(), root_buf.size()}, /* prev same-type */ -1);
         std::vector<uint8_t> file_info_block;
-        if (bloom_result.enabled) {
-            bloom_->finish_meta_block(bloom_meta_block, compressor_.get());
-        }
-
-        static const uint8_t kBloomMetaKey[] = "GENERAL_BLOOM_META";
-        const uint32_t bloom_meta_key_len = static_cast<uint32_t>(sizeof(kBloomMetaKey) - 1);
-        std::vector<uint8_t> meta_root_payload(4, 0);
         const int64_t meta_root_offset =
             root_block_offset + static_cast<int64_t>(root_block.size());
+        size_t file_info_payload_size = 0;
+        HFILE_RETURN_IF_ERROR(build_file_info_block(
+            /* prev same-type */ -1,
+            bloom_result,
+            &file_info_block,
+            &file_info_payload_size));
+        std::vector<uint8_t> bloom_meta_block;
         if (bloom_result.enabled) {
-            uint8_t key_len_buf[10];
-            const int key_len_size = encode_writable_vint(
-                key_len_buf, static_cast<int64_t>(bloom_meta_key_len));
-            meta_root_payload.resize(4 + 8 + 4 + static_cast<size_t>(key_len_size) +
-                                     bloom_meta_key_len);
-            auto meta_root_probe = build_raw_block(
-                kRootIndexMagic, {meta_root_payload.data(), meta_root_payload.size()},
-                root_block_offset);
-            const int64_t file_info_offset =
-                meta_root_offset + static_cast<int64_t>(meta_root_probe.size());
-            std::vector<uint8_t> file_info_block_probe;
-            HFILE_RETURN_IF_ERROR(
-                build_file_info_block(meta_root_offset, bloom_result, &file_info_block_probe));
-            const int64_t bloom_meta_offset =
-                file_info_offset + static_cast<int64_t>(file_info_block_probe.size());
-            uint8_t* mp = meta_root_payload.data();
-            write_be32(mp, 1);                              mp += 4;
-            write_be64(mp, bloom_meta_offset);             mp += 8;
-            write_be32(mp, static_cast<uint32_t>(bloom_meta_block.size())); mp += 4;
-            std::memcpy(mp, key_len_buf, static_cast<size_t>(key_len_size));
-            mp += key_len_size;
-            std::memcpy(mp, kBloomMetaKey, bloom_meta_key_len);
-            bloom_result.bloom_meta_offset = bloom_meta_offset;
+            bloom_->finish_meta_block(
+                bloom_meta_block,
+                /* prev same-type */ -1,
+                &bloom_result,
+                compressor_.get());
         }
-        auto meta_root_block = build_raw_block(
-            kRootIndexMagic, {meta_root_payload.data(), meta_root_payload.size()},
-            root_block_offset);
-        HFILE_RETURN_IF_ERROR(build_file_info_block(meta_root_offset, bloom_result, &file_info_block));
+
+        std::vector<uint8_t> meta_root_block;
+        size_t meta_root_payload_size = 0;
+        if (bloom_result.enabled) {
+            size_t meta_root_block_size = 0;
+            for (int i = 0; i < 4; ++i) {
+                const int64_t bloom_meta_offset =
+                    meta_root_offset
+                    + static_cast<int64_t>(meta_root_block_size)
+                    + static_cast<int64_t>(file_info_block.size());
+                auto meta_root_payload = build_meta_root_payload(
+                    bloom_meta_offset,
+                    static_cast<int32_t>(bloom_meta_block.size()));
+                auto candidate = build_raw_block(
+                    kRootIndexMagic,
+                    {meta_root_payload.data(), meta_root_payload.size()},
+                    root_block_offset);
+                meta_root_payload_size = meta_root_payload.size();
+                if (i > 0 && candidate.size() == meta_root_block_size) {
+                    meta_root_block = std::move(candidate);
+                    break;
+                }
+                meta_root_block_size = candidate.size();
+                meta_root_block = std::move(candidate);
+            }
+        } else {
+            meta_root_block = build_raw_block(kRootIndexMagic, {}, root_block_offset);
+        }
 
         if (!intermed_buf.empty()) {
             HFILE_RETURN_IF_ERROR(
@@ -352,12 +461,19 @@ public:
         }
         HFILE_RETURN_IF_ERROR(writer_->write(root_block));
         HFILE_RETURN_IF_ERROR(writer_->write(meta_root_block));
+        total_uncompressed_bytes_ +=
+            static_cast<uint64_t>(kBlockHeaderSize + meta_root_payload_size);
 
         int64_t file_info_offset = writer_->position();
         HFILE_RETURN_IF_ERROR(writer_->write(file_info_block));
+        total_uncompressed_bytes_ +=
+            static_cast<uint64_t>(kBlockHeaderSize + file_info_payload_size);
 
         if (bloom_result.enabled) {
+            bloom_result.bloom_meta_offset = writer_->position();
             HFILE_RETURN_IF_ERROR(writer_->write(bloom_meta_block));
+            total_uncompressed_bytes_ +=
+                bloom_result.bloom_meta_uncompressed_bytes_with_headers;
         }
 
         // 6. Trailer
@@ -405,11 +521,13 @@ private:
         }
 
         int64_t block_offset = writer_->position();
-
-        // Seal the current bloom chunk for this data block.
-        // The chunk bytes are collected internally; they will be written to disk
-        // as BLMFBLK2 blocks immediately after all data blocks (non-scanned section).
-        bloom_->finish_chunk();
+        KeyValue prev_block_last_key_view;
+        const KeyValue* prev_block_last_key = nullptr;
+        if (has_prev_block_last_kv_) {
+            prev_block_last_key_view = prev_block_last_kv_.as_view();
+            prev_block_last_key = &prev_block_last_key_view;
+        }
+        auto index_key = compute_midpoint_key(prev_block_last_key, first_kv_in_block_.as_view());
 
         // Compress
         size_t comp_len = compressor_->compress(raw, compress_buf_.data(),
@@ -421,10 +539,13 @@ private:
         if (opts_.compression == Compression::None) compressed = raw;
 
         HFILE_RETURN_IF_ERROR(
-            write_data_block(raw.size(), compressed, encoder_->first_key(), block_offset));
+            write_data_block(raw.size(), index_key, compressed, block_offset));
 
-        total_uncompressed_bytes_ += raw.size();
+        total_uncompressed_bytes_ += static_cast<uint64_t>(kBlockHeaderSize + raw.size());
         ++data_block_count_;
+        copy_key_only(last_kv_.as_view(), &prev_block_last_kv_);
+        has_prev_block_last_kv_ = true;
+        has_first_kv_in_block_ = false;
         if (opts_.fsync_policy == FsyncPolicy::Paranoid &&
             opts_.fsync_block_interval > 0 &&
             (data_block_count_ % opts_.fsync_block_interval) == 0) {
@@ -436,8 +557,8 @@ private:
 
     // ── Write a data block with header + checksums ─────────────────────────────
     Status write_data_block(size_t uncompressed_size,
+                             std::span<const uint8_t> index_key,
                              std::span<const uint8_t> compressed_data,
-                             std::span<const uint8_t> first_key,
                              int64_t block_offset) {
         uint32_t on_disk_data_with_header =
             static_cast<uint32_t>(kBlockHeaderSize + compressed_data.size());
@@ -474,7 +595,7 @@ private:
         if (first_data_block_offset_ < 0)
             first_data_block_offset_ = block_offset;
         last_data_block_offset_ = block_offset;
-        index_writer_.add_entry(first_key,
+        index_writer_.add_entry(index_key,
                                 block_offset,
                                 static_cast<int32_t>(kBlockHeaderSize + on_disk_size_without_header));
 
@@ -539,22 +660,46 @@ private:
         return block;
     }
 
+    std::vector<uint8_t> build_meta_root_payload(int64_t bloom_meta_offset,
+                                                 int32_t bloom_meta_size) const {
+        uint8_t key_len_buf[10];
+        const int key_len_size = encode_writable_vint(
+            key_len_buf, static_cast<int64_t>(kGeneralBloomMetaKey.size()));
+        std::vector<uint8_t> payload;
+        payload.resize(4 + 8 + 4 + static_cast<size_t>(key_len_size)
+                       + kGeneralBloomMetaKey.size());
+        uint8_t* p = payload.data();
+        write_be32(p, 1u); p += 4;
+        write_be64(p, static_cast<uint64_t>(bloom_meta_offset)); p += 8;
+        write_be32(p, static_cast<uint32_t>(bloom_meta_size)); p += 4;
+        std::memcpy(p, key_len_buf, static_cast<size_t>(key_len_size)); p += key_len_size;
+        std::memcpy(p, kGeneralBloomMetaKey.data(), kGeneralBloomMetaKey.size());
+        return payload;
+    }
+
     Status build_file_info_block(int64_t prev_block_offset,
                                  const bloom::BloomWriteResult& bloom_result,
-                                 std::vector<uint8_t>* out) {
+                                 std::vector<uint8_t>* out,
+                                 size_t* payload_size_out = nullptr) {
         meta::FileInfoBuilder fib;
         fib.set_last_key({last_key_.data(), last_key_.size()});
         fib.set_avg_key_len(entry_count_ > 0
             ? static_cast<uint32_t>(total_key_bytes_ / entry_count_) : 0);
         fib.set_avg_value_len(entry_count_ > 0
             ? static_cast<uint32_t>(total_value_bytes_ / entry_count_) : 0);
-        fib.set_max_tags_len(max_tags_len_);
-        fib.set_key_value_version(1);
-        fib.set_max_memstore_ts(has_mvcc_cells_ ? max_memstore_ts_ : 0);
-        fib.set_comparator(opts_.comparator);
-        fib.set_data_block_encoding(opts_.data_block_encoding);
-        fib.set_create_time();
+        if (has_mvcc_cells_) {
+            fib.set_key_value_version(1);
+            fib.set_max_memstore_ts(max_memstore_ts_);
+        }
+        fib.set_create_time(opts_.file_create_time_ms);
+        fib.set_key_of_biggest_cell({key_of_biggest_cell_.data(), key_of_biggest_cell_.size()});
         fib.set_len_of_biggest_cell(static_cast<uint64_t>(max_cell_size_));
+        fib.set_delete_family_count(0);
+        fib.set_historical(false);
+        if (opts_.include_tags) {
+            fib.set_max_tags_len(max_tags_len_);
+            fib.set_tags_compressed(false);
+        }
         if (bloom_result.enabled) {
             fib.set_bloom_filter_type(opts_.bloom_type);
             fib.set_last_bloom_key({last_bloom_key_.data(), last_bloom_key_.size()});
@@ -563,6 +708,9 @@ private:
 
         std::vector<uint8_t> fi_bytes;
         fib.finish(fi_bytes);
+        if (payload_size_out) {
+            *payload_size_out = fi_bytes.size();
+        }
         *out = build_raw_block(kFileInfoMagic, {fi_bytes.data(), fi_bytes.size()},
                                prev_block_offset);
         return Status::OK();
@@ -577,9 +725,9 @@ private:
         tb.set_file_info_offset(static_cast<uint64_t>(file_info_offset));
         tb.set_load_on_open_offset(static_cast<uint64_t>(load_on_open_offset));
         tb.set_uncompressed_data_index_size(idx.uncompressed_size);
-        tb.set_total_uncompressed_bytes(total_uncompressed_bytes_);
-        tb.set_data_index_count(data_block_count_);
-        tb.set_meta_index_count(bloom.enabled ? 1u : 0u);
+        tb.set_total_uncompressed_bytes(total_uncompressed_bytes_ + kTrailerFixedSize);
+        tb.set_data_index_count(idx.num_root_entries);
+        tb.set_meta_index_count(bloom.enabled ? 1 : 0);
         tb.set_entry_count(entry_count_);
         tb.set_num_data_index_levels(static_cast<uint32_t>(idx.num_levels));
         tb.set_first_data_block_offset(
@@ -600,13 +748,7 @@ private:
     void save_last_key(const KeyValue& kv, bool keep_for_validation) {
         last_key_.resize(kv.key_length());
         block::serialize_key(kv, last_key_.data());
-        if (keep_for_validation) {
-            last_kv_.row.assign(kv.row.begin(), kv.row.end());
-            last_kv_.family.assign(kv.family.begin(), kv.family.end());
-            last_kv_.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
-            last_kv_.timestamp = kv.timestamp;
-            last_kv_.key_type  = kv.key_type;
-        }
+        copy_key_only(kv, &last_kv_);
     }
 
     void save_first_key(const KeyValue& kv) {
@@ -625,12 +767,19 @@ private:
             has_mvcc_cells_ = true;
             max_memstore_ts_ = std::max<uint64_t>(max_memstore_ts_, kv.memstore_ts);
         }
-        int mvcc_len = kv.has_memstore_ts
-            ? writable_vint_size(static_cast<int64_t>(kv.memstore_ts))
-            : 0;
-        size_t cell_size = 4 + 4 + kl + kv.value.size() + 2 + kv.tags.size()
-                         + static_cast<size_t>(mvcc_len);
-        max_cell_size_ = std::max(max_cell_size_, cell_size);
+        // HBase persists hfile.LEN_OF_BIGGEST_CELL using
+        // PrivateCellUtil.estimatedSerializedSizeOf(cell), i.e.
+        // cell.getSerializedSize() + 4. That estimate is based on the logical
+        // KeyValue/RPC serialization shape, not the final HFile on-disk bytes.
+        size_t cell_size = 4 + 4 + kl + kv.value.size() + 4;
+        if (!kv.tags.empty()) {
+            cell_size += 2 + kv.tags.size();
+        }
+        if (cell_size > max_cell_size_) {
+            max_cell_size_ = cell_size;
+            key_of_biggest_cell_.resize(kv.key_length());
+            block::serialize_key(kv, key_of_biggest_cell_.data());
+        }
     }
 
     Status maybe_check_disk_space(size_t encoded_bytes) {
@@ -654,23 +803,45 @@ private:
             bool increment_entry_count,
             bool record_stats,
             bool verify_sort) {
+        int cmp = 1;
+        if (written_entry_count_ > 0) {
+            cmp = compare_keys(kv, last_kv_.as_view());
+        }
         if (verify_sort && written_entry_count_ > 0) {
-            int cmp = compare_keys(kv, last_kv_.as_view());
             if (cmp <= 0)
                 return Status::InvalidArg("SORT_ORDER_VIOLATION: KV out of order");
         }
 
         HFILE_RETURN_IF_ERROR(maybe_check_disk_space(kv.encoded_size()));
 
+        if (!encoder_->empty() && encoder_->current_size() >= opts_.block_size && cmp != 0) {
+            HFILE_RETURN_IF_ERROR(flush_data_block());
+        }
+
+        if (encoder_->empty()) {
+            copy_key_only(kv, &first_kv_in_block_);
+            has_first_kv_in_block_ = true;
+        }
+
         if (!encoder_->append(kv)) {
             HFILE_RETURN_IF_ERROR(flush_data_block());
+            if (encoder_->empty()) {
+                copy_key_only(kv, &first_kv_in_block_);
+                has_first_kv_in_block_ = true;
+            }
             if (!encoder_->append(kv))
                 return Status::Internal("Failed to append KV even after flush");
         }
 
-        bloom_->add(kv.row);
-        if (opts_.bloom_type == BloomType::RowCol)
+        if (opts_.bloom_type == BloomType::Row) {
+            if (last_bloom_key_.empty() ||
+                last_bloom_key_.size() != kv.row.size() ||
+                std::memcmp(last_bloom_key_.data(), kv.row.data(), kv.row.size()) != 0) {
+                bloom_->add(kv.row);
+            }
+        } else if (opts_.bloom_type == BloomType::RowCol) {
             bloom_->add_row_col(kv.row, kv.qualifier);
+        }
         if (opts_.bloom_type == BloomType::Row) {
             last_bloom_key_.assign(kv.row.begin(), kv.row.end());
         } else if (opts_.bloom_type == BloomType::RowCol) {
@@ -738,7 +909,10 @@ private:
     std::vector<uint8_t>   last_key_;
     std::vector<uint8_t>   last_bloom_key_;
     std::vector<uint8_t>   first_key_;
+    std::vector<uint8_t>   key_of_biggest_cell_;
     OwnedKeyValue          last_kv_;
+    OwnedKeyValue          first_kv_in_block_;
+    OwnedKeyValue          prev_block_last_kv_;
     std::vector<OwnedKeyValue> auto_sorted_kvs_;
 
     // ── Production: resource management ──────────────────────────────────────
@@ -759,6 +933,8 @@ private:
     uint32_t max_tags_len_           = 0;
     uint64_t max_memstore_ts_        = 0;
     bool     has_mvcc_cells_         = false;
+    bool     has_first_kv_in_block_  = false;
+    bool     has_prev_block_last_kv_ = false;
     size_t   max_cell_size_          = 0;
     int64_t  first_data_block_offset_ = -1;
     int64_t  last_data_block_offset_  = -1;
@@ -820,6 +996,9 @@ HFileWriter::Builder& HFileWriter::Builder::set_column_family(std::string cf) {
 HFileWriter::Builder& HFileWriter::Builder::set_compression(Compression c) {
     opts_.compression = c; return *this;
 }
+HFileWriter::Builder& HFileWriter::Builder::set_compression_level(int level) {
+    opts_.compression_level = level; return *this;
+}
 HFileWriter::Builder& HFileWriter::Builder::set_block_size(size_t sz) {
     opts_.block_size = sz; return *this;
 }
@@ -834,6 +1013,9 @@ HFileWriter::Builder& HFileWriter::Builder::set_bloom_error_rate(double r) {
 }
 HFileWriter::Builder& HFileWriter::Builder::set_comparator(std::string cmp) {
     opts_.comparator = std::move(cmp); return *this;
+}
+HFileWriter::Builder& HFileWriter::Builder::set_file_create_time_ms(int64_t ts_ms) {
+    opts_.file_create_time_ms = ts_ms; return *this;
 }
 HFileWriter::Builder& HFileWriter::Builder::set_sort_mode(WriterOptions::SortMode m) {
     opts_.sort_mode = m; return *this;
