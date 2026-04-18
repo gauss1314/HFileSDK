@@ -132,21 +132,26 @@ public:
     /// Records each chunk's absolute file offset (needed by the meta block).
     /// Call from the writer's non-scanned section, after all data blocks.
     /// Returns true if any bloom data was produced.
-    bool finish_data_blocks(std::vector<uint8_t>& blocks_out,
-                            int64_t current_file_offset,
-                            int64_t prev_block_offset,
-                            BloomWriteResult* result,
-                            codec::Compressor* compressor = nullptr) {
-        if (type_ == BloomType::None) return false;
-        if (cur_keys_ > 0) finish_chunk();
-        if (chunks_.empty()) return false;
+    bool flush_ready_data_blocks(std::vector<uint8_t>& blocks_out,
+                                 int64_t current_file_offset,
+                                 int64_t prev_block_offset,
+                                 BloomWriteResult* result,
+                                 codec::Compressor* compressor = nullptr) {
+        if (type_ == BloomType::None || chunks_.empty()) return false;
 
-        chunk_offsets_.reserve(chunks_.size());
-        chunk_on_disk_sizes_.reserve(chunks_.size());
-        int64_t current_prev_block_offset = -1;
+        if (result && result->bloom_data_offset < 0) {
+            result->bloom_data_offset = current_file_offset;
+        }
+
+        chunk_offsets_.reserve(chunk_offsets_.size() + chunks_.size());
+        chunk_on_disk_sizes_.reserve(chunk_on_disk_sizes_.size() + chunks_.size());
+        chunk_byte_sizes_.reserve(chunk_byte_sizes_.size() + chunks_.size());
+
+        int64_t current_prev_block_offset = prev_block_offset;
         for (size_t i = 0; i < chunks_.size(); ++i) {
             int64_t block_offset = current_file_offset + static_cast<int64_t>(blocks_out.size());
             chunk_offsets_.push_back(block_offset);
+            chunk_byte_sizes_.push_back(static_cast<uint32_t>(chunks_[i].size()));
             size_t before_size = blocks_out.size();
             write_bloom_chunk_block(blocks_out, chunks_[i], current_prev_block_offset, compressor);
             chunk_on_disk_sizes_.push_back(
@@ -158,7 +163,20 @@ public:
                     static_cast<uint64_t>(kBlockHeaderSize + chunks_[i].size());
             }
         }
+
+        chunks_.clear();
         return true;
+    }
+
+    bool finish_data_blocks(std::vector<uint8_t>& blocks_out,
+                            int64_t current_file_offset,
+                            int64_t prev_block_offset,
+                            BloomWriteResult* result,
+                            codec::Compressor* compressor = nullptr) {
+        if (type_ == BloomType::None) return false;
+        if (cur_keys_ > 0) finish_chunk();
+        return flush_ready_data_blocks(
+            blocks_out, current_file_offset, prev_block_offset, result, compressor);
     }
 
     /// Serialise the BLMFMET2 bloom meta block into `meta_out`.
@@ -173,7 +191,10 @@ public:
     }
 
     bool      is_enabled()     const noexcept { return type_ != BloomType::None; }
-    bool      has_data()       const noexcept { return !chunks_.empty() || cur_keys_ > 0; }
+    bool      has_data()       const noexcept {
+        return !chunks_.empty() || !chunk_offsets_.empty() || cur_keys_ > 0;
+    }
+    bool      has_ready_chunks() const noexcept { return !chunks_.empty(); }
     uint32_t  total_keys()     const noexcept { return total_keys_; }
     BloomType bloom_type()     const noexcept { return type_; }
 
@@ -339,7 +360,7 @@ private:
 
         write_be32(dp, kBloomFormatVersion); dp += 4;
         uint64_t total_bytes = 0;
-        for (const auto& c : chunks_) total_bytes += c.size();
+        for (uint32_t size : chunk_byte_sizes_) total_bytes += size;
         write_be64(dp, total_bytes); dp += 8;
         write_be32(dp, static_cast<uint32_t>(hash_count_)); dp += 4;
         write_be32(dp, static_cast<uint32_t>(kHashTypeMurmur3)); dp += 4;
@@ -347,14 +368,14 @@ private:
         uint64_t total_max_keys = 0;
         for (uint32_t c : chunk_max_keys_) total_max_keys += c;
         write_be64(dp, total_max_keys); dp += 8;
-        write_be32(dp, static_cast<uint32_t>(chunks_.size())); dp += 4;
+        write_be32(dp, static_cast<uint32_t>(chunk_offsets_.size())); dp += 4;
         std::memcpy(dp, comparator_len_buf, static_cast<size_t>(comparator_len_size));
         dp += comparator_len_size;
         if (!comparator_class_name_.empty()) {
             std::memcpy(dp, comparator_class_name_.data(), comparator_class_name_.size());
             dp += comparator_class_name_.size();
         }
-        for (size_t i = 0; i < chunks_.size(); ++i) {
+        for (size_t i = 0; i < chunk_offsets_.size(); ++i) {
             uint8_t key_len_buf[10];
             const int key_len_size = encode_writable_vint(
                 key_len_buf, static_cast<int64_t>(chunk_first_keys_[i].size()));
@@ -431,6 +452,7 @@ private:
     std::vector<std::vector<uint8_t>>    chunk_first_keys_;
     std::vector<uint32_t>                chunk_key_counts_;
     std::vector<uint32_t>                chunk_max_keys_;
+    std::vector<uint32_t>                chunk_byte_sizes_;
     std::vector<uint32_t>                chunk_on_disk_sizes_;
     std::vector<int64_t>                 chunk_offsets_;
 };

@@ -28,5 +28,13 @@ size_t compute_hfile_checksums(
     uint32_t bytes_per_chunk,
     uint8_t* out_checksums) noexcept;
 
+/// Compute per-chunk CRC32C for the logical concatenation of two buffers
+/// without materialising a temporary combined buffer.
+size_t compute_hfile_checksums_split(
+    std::span<const uint8_t> first,
+    std::span<const uint8_t> second,
+    uint32_t bytes_per_chunk,
+    uint8_t* out_checksums) noexcept;
+
 } // namespace checksum
 } // namespace hfile

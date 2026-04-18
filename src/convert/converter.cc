@@ -16,6 +16,7 @@
 #include <arrow/util/byte_size.h>
 
 #include <algorithm>
+#include <deque>
 #include <unordered_set>
 #include <vector>
 #include <string>
@@ -147,14 +148,20 @@ static arrow::Result<std::shared_ptr<arrow::Schema>> apply_schema_removal(
 // ─── SortEntry ────────────────────────────────────────────────────────────────
 
 struct SortEntry {
-    std::string row_key;     // fully built row key string
+    std::string_view row_key; // view into Arrow string data or owned_row_keys
     int32_t     batch_idx;   // which RecordBatch (0-based)
     int32_t     row_idx;     // row within that batch
 };
 
-struct GroupedCell {
+struct PendingCell {
     std::string_view     qualifier;
-    std::vector<uint8_t> value;
+    const arrow::Array*  column;
+    int32_t              row_idx;
+};
+
+struct BatchColumnRef {
+    std::string_view     qualifier;
+    const arrow::Array*  column;
 };
 
 static std::span<const uint8_t> as_bytes(const std::string& s) {
@@ -168,6 +175,11 @@ static std::span<const uint8_t> as_bytes(std::string_view s) {
 static Status scalar_to_bytes(const arrow::Array& arr,
                               int64_t row,
                               std::vector<uint8_t>* out);
+
+static Status scalar_to_bytes_view(const arrow::Array& arr,
+                                   int64_t row,
+                                   std::vector<uint8_t>* scratch,
+                                   std::span<const uint8_t>* out);
 
 // ─── Arrow scalar → UTF-8 string (for rowValue building) ──────────────────────
 
@@ -372,6 +384,61 @@ static Status scalar_to_bytes(const arrow::Array& arr, int64_t row, std::vector<
     }
 }
 
+static Status scalar_to_bytes_view(const arrow::Array& arr,
+                                   int64_t row,
+                                   std::vector<uint8_t>* scratch,
+                                   std::span<const uint8_t>* out) {
+    scratch->clear();
+    *out = {};
+    if (arr.IsNull(row)) return Status::OK();
+
+    using T = arrow::Type;
+    auto t = arr.type_id();
+
+    switch (t) {
+    case T::STRING: {
+        auto& sa = static_cast<const arrow::StringArray&>(arr);
+        auto sv = sa.GetView(row);
+        *out = {
+            reinterpret_cast<const uint8_t*>(sv.data()),
+            static_cast<size_t>(sv.size())
+        };
+        return Status::OK();
+    }
+    case T::LARGE_STRING: {
+        auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
+        auto sv = sa.GetView(row);
+        *out = {
+            reinterpret_cast<const uint8_t*>(sv.data()),
+            static_cast<size_t>(sv.size())
+        };
+        return Status::OK();
+    }
+    case T::BINARY: {
+        auto& ba = static_cast<const arrow::BinaryArray&>(arr);
+        auto sv = ba.GetView(row);
+        *out = {
+            reinterpret_cast<const uint8_t*>(sv.data()),
+            static_cast<size_t>(sv.size())
+        };
+        return Status::OK();
+    }
+    case T::LARGE_BINARY: {
+        auto& ba = static_cast<const arrow::LargeBinaryArray&>(arr);
+        auto sv = ba.GetView(row);
+        *out = {
+            reinterpret_cast<const uint8_t*>(sv.data()),
+            static_cast<size_t>(sv.size())
+        };
+        return Status::OK();
+    }
+    default:
+        HFILE_RETURN_IF_ERROR(scalar_to_bytes(arr, row, scratch));
+        *out = {scratch->data(), scratch->size()};
+        return Status::OK();
+    }
+}
+
 // ─── Open Arrow IPC Stream file ───────────────────────────────────────────────
 
 static arrow::Result<std::shared_ptr<arrow::ipc::RecordBatchStreamReader>>
@@ -388,6 +455,7 @@ static Status build_sort_index(
         int                                 max_col_idx,
         const std::vector<int>&             removal_indices,   // sorted desc, applied per-batch
         std::vector<SortEntry>&             index_out,
+        std::deque<std::string>&            owned_row_keys_out,
         std::vector<std::shared_ptr<arrow::RecordBatch>>& batches_out,
         memory::MemoryBudget*               budget,
         ConvertResult&                      result) {
@@ -451,6 +519,11 @@ static Status build_sort_index(
     std::vector<std::string> owned_fields(
         max_col_idx >= 0 ? static_cast<size_t>(max_col_idx + 1) : 0);
     std::vector<std::string_view> fields(owned_fields.size());
+    const int direct_col_idx = rkb.direct_passthrough_col_index();
+    const bool direct_string_fast_path =
+        direct_col_idx >= 0 &&
+        (filtered_schema->field(direct_col_idx)->type()->id() == arrow::Type::STRING ||
+         filtered_schema->field(direct_col_idx)->type()->id() == arrow::Type::LARGE_STRING);
 
     while (true) {
         auto s = reader->ReadNext(&raw_batch);
@@ -480,6 +553,32 @@ static Status build_sort_index(
         batches_out.push_back(batch);    // store the FILTERED batch
 
         for (int64_t r = 0; r < n_rows; ++r) {
+            if (direct_string_fast_path) {
+                std::string_view rk_view;
+                const auto& direct_column = *batch->column(direct_col_idx);
+                if (direct_column.IsNull(r)) {
+                    result.kv_skipped_count++;
+                    continue;
+                }
+                if (direct_column.type_id() == arrow::Type::STRING) {
+                    auto view = static_cast<const arrow::StringArray&>(direct_column).GetView(r);
+                    rk_view = std::string_view(view.data(), view.size());
+                } else {
+                    auto view = static_cast<const arrow::LargeStringArray&>(direct_column).GetView(r);
+                    rk_view = std::string_view(view.data(), view.size());
+                }
+                if (rk_view.empty()) {
+                    result.kv_skipped_count++;
+                    continue;
+                }
+                if (budget) {
+                    auto reserve_status = budget->reserve(sizeof(SortEntry) + rk_view.size());
+                    if (!reserve_status.ok()) return reserve_status;
+                }
+                index_out.push_back({rk_view, batch_idx, static_cast<int32_t>(r)});
+                continue;
+            }
+
             std::fill(fields.begin(), fields.end(), std::string_view{});
             for (int c : referenced_col_indices) {
                 auto field_status = scalar_to_string(*batch->column(c), r,
@@ -494,7 +593,7 @@ static Status build_sort_index(
 
             if (rk.empty()) {
                 result.kv_skipped_count++;
-                rk = "";
+                continue;
             }
 
             if (budget) {
@@ -502,7 +601,8 @@ static Status build_sort_index(
                 if (!reserve_status.ok()) return reserve_status;
             }
 
-            index_out.push_back({std::move(rk), batch_idx, static_cast<int32_t>(r)});
+            owned_row_keys_out.push_back(std::move(rk));
+            index_out.push_back({owned_row_keys_out.back(), batch_idx, static_cast<int32_t>(r)});
         }
 
         result.arrow_batches_read++;
@@ -512,44 +612,82 @@ static Status build_sort_index(
     return Status::OK();
 }
 
+static std::vector<BatchColumnRef> build_sorted_columns(
+        const std::shared_ptr<arrow::RecordBatch>& batch) {
+    std::vector<BatchColumnRef> refs;
+    refs.reserve(static_cast<size_t>(batch->num_columns()));
+    auto schema = batch->schema();
+    for (int c = 0; c < batch->num_columns(); ++c) {
+        refs.push_back({schema->field(c)->name(), batch->column(c).get()});
+    }
+    std::sort(refs.begin(), refs.end(),
+              [](const BatchColumnRef& a, const BatchColumnRef& b) {
+                  return a.qualifier < b.qualifier;
+              });
+    return refs;
+}
+
+static Status append_single_row_cells(
+        HFileWriter&                        writer,
+        const std::vector<BatchColumnRef>&  columns,
+        int32_t                             row_idx,
+        std::string_view                    row_key,
+        const std::string&                  cf,
+        int64_t                             default_ts,
+        int64_t*                            kv_written,
+        int64_t*                            kv_skipped) {
+    int64_t ts = default_ts > 0 ? default_ts
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    auto row_bytes = as_bytes(row_key);
+    auto cf_bytes = as_bytes(cf);
+    std::vector<uint8_t> value_scratch;
+    std::span<const uint8_t> value_bytes;
+
+    for (const auto& column_ref : columns) {
+        if (column_ref.column->IsNull(row_idx)) continue;
+
+        auto value_status = scalar_to_bytes_view(
+            *column_ref.column, row_idx, &value_scratch, &value_bytes);
+        if (!value_status.ok()) {
+            clog::warn("Cell skipped (" + std::string(row_key) + "/" +
+                       std::string(column_ref.qualifier) + "): " +
+                       value_status.message());
+            if (kv_skipped) ++(*kv_skipped);
+            continue;
+        }
+        if (value_bytes.empty()) continue;
+
+        auto before_entry_count = writer.entry_count();
+        auto s = writer.append(row_bytes, cf_bytes, as_bytes(column_ref.qualifier),
+                               ts, value_bytes);
+        if (!s.ok()) return s;
+        auto after_entry_count = writer.entry_count();
+        if (after_entry_count > before_entry_count) {
+            if (kv_written) ++(*kv_written);
+        } else if (kv_skipped) {
+            ++(*kv_skipped);
+        }
+    }
+    return Status::OK();
+}
+
 // ─── Write KVs for one row in sorted qualifier order ─────────────────────────
 
 static Status append_grouped_row_cells(
         HFileWriter&                        writer,
-        std::vector<GroupedCell>&           cells,
-        const std::string&                  row_key,
+        std::vector<PendingCell>&           cells,
+        std::string_view                    row_key,
         const std::string&                  cf,
         int64_t                             default_ts,
         size_t                              source_row_count,   // how many Arrow rows mapped here
         int64_t*                            kv_written,
         int64_t*                            kv_skipped) {
     std::sort(cells.begin(), cells.end(),
-              [](const GroupedCell& a, const GroupedCell& b) {
+              [](const PendingCell& a, const PendingCell& b) {
                   return a.qualifier < b.qualifier;
               });
-
-    // Deduplicate: when the same qualifier appears multiple times under the same
-    // row key (i.e. multiple Arrow source rows mapped to this HBase row key),
-    // keep only the first occurrence (first-in-sort-order wins).
-    //
-    // NOTE: we do NOT log per-qualifier here.  The caller logs ONE group-level
-    // warning via clog::warn before calling this function, so the user sees
-    // exactly one line per row-key collision — not one line per column.
-    {
-        size_t write_pos = 0;
-        for (size_t read_pos = 0; read_pos < cells.size(); ++read_pos) {
-            if (write_pos > 0 &&
-                cells[write_pos - 1].qualifier == cells[read_pos].qualifier) {
-                // Silently count: the group-level warning was already emitted.
-                if (kv_skipped) ++(*kv_skipped);
-                continue;
-            }
-            if (read_pos != write_pos)
-                cells[write_pos] = std::move(cells[read_pos]);
-            ++write_pos;
-        }
-        cells.resize(write_pos);
-    }
     (void)source_row_count;  // available for future per-qualifier logging if needed
 
     int64_t ts = default_ts > 0 ? default_ts
@@ -558,11 +696,30 @@ static Status append_grouped_row_cells(
 
     auto row_bytes = as_bytes(row_key);
     auto cf_bytes = as_bytes(cf);
+    std::vector<uint8_t> value_scratch;
+    std::span<const uint8_t> value_bytes;
+    std::string_view committed_qualifier;
+    bool has_committed_qualifier = false;
 
     for (const auto& cell : cells) {
+        if (has_committed_qualifier && committed_qualifier == cell.qualifier) {
+            if (kv_skipped) ++(*kv_skipped);
+            continue;
+        }
+
+        auto value_status = scalar_to_bytes_view(
+            *cell.column, cell.row_idx, &value_scratch, &value_bytes);
+        if (!value_status.ok()) {
+            clog::warn("Cell skipped (" + std::string(row_key) + "/" + std::string(cell.qualifier) +
+                       "): " + value_status.message());
+            if (kv_skipped) ++(*kv_skipped);
+            continue;
+        }
+        if (value_bytes.empty()) continue;
+
         auto before_entry_count = writer.entry_count();
         auto s = writer.append(row_bytes, cf_bytes, as_bytes(cell.qualifier),
-                               ts, cell.value);
+                               ts, value_bytes);
         if (!s.ok()) return s;
         auto after_entry_count = writer.entry_count();
         if (after_entry_count > before_entry_count) {
@@ -570,6 +727,8 @@ static Status append_grouped_row_cells(
         } else if (kv_skipped) {
             ++(*kv_skipped);
         }
+        committed_qualifier = cell.qualifier;
+        has_committed_qualifier = true;
     }
     return Status::OK();
 }
@@ -645,6 +804,7 @@ ConvertResult convert(const ConvertOptions& opts) {
     // ── 4. First pass: build sort index (load all batches into memory) ────
     clog::info("Pass 1: building sort index...");
     std::vector<SortEntry> sort_index;
+    std::deque<std::string> owned_row_keys;
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
     std::unique_ptr<memory::MemoryBudget> budget;
     if (opts.writer_opts.max_memory_bytes > 0)
@@ -658,30 +818,13 @@ ConvertResult convert(const ConvertOptions& opts) {
     {
         Status s = build_sort_index(opts.arrow_path, rkb, max_col_idx,
                                     removal_indices,
-                                    sort_index, batches, budget.get(), result);
+                                    sort_index, owned_row_keys, batches, budget.get(), result);
         if (!s.ok()) {
             update_memory_metrics();
             result.error_code = map_pass1_status_to_error_code(s);
             result.error_message = s.message();
             clog::err("Pass 1 failed: " + s.message());
             return result;
-        }
-    }
-
-    // Filter out empty row keys (rows that failed key generation).
-    // If a memory budget is active, release the quota reserved for each
-    // discarded SortEntry — they were reserved but will never be used.
-    {
-        size_t before = sort_index.size();
-        sort_index.erase(
-            std::remove_if(sort_index.begin(), sort_index.end(),
-                           [](const SortEntry& e){ return e.row_key.empty(); }),
-            sort_index.end());
-        size_t erased = before - sort_index.size();
-        if (budget && erased > 0) {
-            // Each empty-key entry reserved exactly sizeof(SortEntry) + 0 bytes
-            // (rk.size() == 0 at the time of reservation).
-            budget->release(erased * sizeof(SortEntry));
         }
     }
 
@@ -706,7 +849,7 @@ ConvertResult convert(const ConvertOptions& opts) {
     wo.column_family          = opts.column_family;
     if (wo.file_create_time_ms <= 0 && opts.default_timestamp > 0)
         wo.file_create_time_ms = opts.default_timestamp;
-    wo.sort_mode              = WriterOptions::SortMode::PreSortedVerified;
+    wo.sort_mode              = WriterOptions::SortMode::PreSortedTrusted;
 
     auto [writer, ws] = HFileWriter::builder()
         .set_path(opts.hfile_path)
@@ -749,34 +892,18 @@ ConvertResult convert(const ConvertOptions& opts) {
     int64_t progress_step = std::max(int64_t(1),
         static_cast<int64_t>(sort_index.size()) / 20);
     int64_t rows_done = 0;
-    std::vector<GroupedCell> cells;
+    std::vector<PendingCell> cells;
+    std::vector<std::vector<BatchColumnRef>> sorted_batch_columns;
+    sorted_batch_columns.reserve(batches.size());
+    for (const auto& batch : batches)
+        sorted_batch_columns.push_back(build_sorted_columns(batch));
 
     for (size_t i = 0; i < sort_index.size();) {
-        const std::string& row_key = sort_index[i].row_key;
+        const std::string_view row_key = sort_index[i].row_key;
         cells.clear();
 
         size_t j = i;
-        for (; j < sort_index.size() && sort_index[j].row_key == row_key; ++j) {
-            const auto& entry = sort_index[j];
-            const auto& batch = batches[static_cast<size_t>(entry.batch_idx)];
-            auto schema = batch->schema();
-            int num_cols = batch->num_columns();
-            if (cells.capacity() < static_cast<size_t>(num_cols))
-                cells.reserve(static_cast<size_t>(num_cols));
-            for (int c = 0; c < num_cols; ++c) {
-                if (batch->column(c)->IsNull(entry.row_idx)) continue;
-                std::vector<uint8_t> val;
-                auto value_status = scalar_to_bytes(*batch->column(c), entry.row_idx, &val);
-                if (!value_status.ok()) {
-                    clog::warn("Cell skipped (" + row_key + "/" + schema->field(c)->name() +
-                               "): " + value_status.message());
-                    ++result.kv_skipped_count;
-                    continue;
-                }
-                if (val.empty()) continue;
-                cells.push_back({schema->field(c)->name(), std::move(val)});
-            }
-        }
+        for (; j < sort_index.size() && sort_index[j].row_key == row_key; ++j) {}
 
         int64_t kv_written = 0;
         int64_t kv_skipped = 0;
@@ -788,8 +915,8 @@ ConvertResult convert(const ConvertOptions& opts) {
         if (source_rows > 1) {
             // Truncate key for readability — raw bytes may not be printable.
             std::string display_key = row_key.size() > 64
-                ? row_key.substr(0, 64) + "...(+" + std::to_string(row_key.size() - 64) + "B)"
-                : row_key;
+                ? std::string(row_key.substr(0, 64)) + "...(+" + std::to_string(row_key.size() - 64) + "B)"
+                : std::string(row_key);
             clog::warn("DUPLICATE_KEY: row key '" + display_key +
                        "' was produced by " + std::to_string(source_rows) +
                        " source rows — keeping first, discarding " +
@@ -798,12 +925,39 @@ ConvertResult convert(const ConvertOptions& opts) {
             ++result.duplicate_key_count;
         }
 
-        auto s = append_grouped_row_cells(*writer, cells, row_key,
-                                          opts.column_family,
-                                          opts.default_timestamp,
-                                          source_rows,
-                                          &kv_written,
-                                          &kv_skipped);
+        Status s;
+        if (source_rows == 1) {
+            const auto& entry = sort_index[i];
+            s = append_single_row_cells(
+                *writer,
+                sorted_batch_columns[static_cast<size_t>(entry.batch_idx)],
+                entry.row_idx,
+                row_key,
+                opts.column_family,
+                opts.default_timestamp,
+                &kv_written,
+                &kv_skipped);
+        } else {
+            for (size_t k = i; k < j; ++k) {
+                const auto& entry = sort_index[k];
+                const auto& batch = batches[static_cast<size_t>(entry.batch_idx)];
+                auto schema = batch->schema();
+                int num_cols = batch->num_columns();
+                if (cells.capacity() < cells.size() + static_cast<size_t>(num_cols))
+                    cells.reserve(cells.size() + static_cast<size_t>(num_cols));
+                for (int c = 0; c < num_cols; ++c) {
+                    const auto* column = batch->column(c).get();
+                    if (column->IsNull(entry.row_idx)) continue;
+                    cells.push_back({schema->field(c)->name(), column, entry.row_idx});
+                }
+            }
+            s = append_grouped_row_cells(*writer, cells, row_key,
+                                         opts.column_family,
+                                         opts.default_timestamp,
+                                         source_rows,
+                                         &kv_written,
+                                         &kv_skipped);
+        }
         if (!s.ok()) {
             // Only SORT_ORDER_VIOLATION is fatal — it indicates a logic bug
             // (the sort index or HFileWriter is broken).  Other errors (I/O,
@@ -817,7 +971,7 @@ ConvertResult convert(const ConvertOptions& opts) {
                 return result;
             }
             // Non-fatal: log, count as skipped, continue with next row group
-            clog::warn("Row group skipped (" + row_key + "): " + s.message());
+            clog::warn("Row group skipped (" + std::string(row_key) + "): " + s.message());
             result.kv_skipped_count += static_cast<int64_t>(j - i);
             i = j;
             continue;

@@ -74,6 +74,10 @@ public:
 
     const std::vector<RowKeySegment>& segments() const noexcept { return segments_; }
 
+    /// Returns the column index when the rule is a simple direct column pass-through
+    /// with no reverse / padding / encoding. Returns -1 otherwise.
+    int direct_passthrough_col_index() const noexcept;
+
 private:
     std::vector<RowKeySegment> segments_;
     int                        max_col_index_ = -1;

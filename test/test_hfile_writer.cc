@@ -55,6 +55,27 @@ static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
     return blocks;
 }
 
+static hfile::pb::FileTrailerProto parse_trailer_proto(
+        const std::vector<uint8_t>& data) {
+    EXPECT_GE(data.size(), kTrailerFixedSize);
+    const size_t trailer_off = data.size() - kTrailerFixedSize;
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(data.data() + trailer_off), 8),
+              "TRABLK\"$");
+
+    uint64_t pb_size = 0;
+    const int prefix_len = decode_varint64(data.data() + trailer_off + 8, pb_size);
+    EXPECT_GT(prefix_len, 0);
+    EXPECT_GE(data.size(),
+              trailer_off + 8 + static_cast<size_t>(prefix_len) + pb_size + kTrailerVersionSize);
+
+    hfile::pb::FileTrailerProto proto;
+    const bool ok = proto.ParseFromArray(
+        data.data() + trailer_off + 8 + prefix_len,
+        static_cast<int>(pb_size));
+    EXPECT_TRUE(ok);
+    return proto;
+}
+
 static void verify_compressed_major_blocks_round_trip(Compression compression,
                                                       const std::string& name) {
     auto path = tmp_path(name);
@@ -206,6 +227,48 @@ TEST(HFileWriter, SingleKV) {
 
     EXPECT_TRUE(fs::exists(path));
     EXPECT_GT(fs::file_size(path), 100u);  // header + data block + index + trailer
+    fs::remove(path);
+}
+
+TEST(HFileWriter, TrailerTotalUncompressedBytesCountsEmptyMetaRootBlock) {
+    auto path = tmp_path("trailer_total_uncompressed_bytes");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    ASSERT_TRUE(w->append(make_kv(rk, fam, q, v, "row001", "col1", 1000, "value1")).ok());
+    ASSERT_TRUE(w->append(make_kv(rk, fam, q, v, "row002", "col1", 999, "value2")).ok());
+    ASSERT_TRUE(w->finish().ok());
+
+    const auto data = read_file(path);
+    const auto blocks = scan_blocks(data);
+    const auto trailer = parse_trailer_proto(data);
+
+    uint64_t expected_total_uncompressed_bytes = kTrailerFixedSize;
+    bool skipped_data_root = false;
+    for (const auto& block : blocks) {
+        const bool is_data_index_block =
+            block.magic == "IDXINTE2" ||
+            (block.magic == "IDXROOT2" && !skipped_data_root);
+        if (block.magic == "IDXROOT2" && !skipped_data_root) {
+            skipped_data_root = true;
+        }
+        if (is_data_index_block) {
+            continue;
+        }
+        expected_total_uncompressed_bytes +=
+            static_cast<uint64_t>(kBlockHeaderSize + block.uncompressed_size);
+    }
+
+    EXPECT_EQ(trailer.meta_index_count(), 0u);
+    EXPECT_EQ(trailer.total_uncompressed_bytes(), expected_total_uncompressed_bytes);
+
     fs::remove(path);
 }
 
@@ -676,18 +739,13 @@ TEST(HFileWriter, BloomMetaRootContainsRealOffsetAndSize) {
     auto bloom_meta = content.find("BLMFMET2");
     ASSERT_NE(bloom_meta, std::string::npos);
 
-    const uint8_t* payload = data.data() + second_root + kBlockHeaderSize;
-    uint32_t count = read_be32(payload);
-    ASSERT_EQ(count, 1u);
-    uint64_t offset = read_be64(payload + 4);
-    uint32_t data_size = read_be32(payload + 12);
-    int64_t key_len = 0;
-    int key_len_size = decode_writable_vint(payload + 16, key_len);
-    ASSERT_EQ(offset, static_cast<uint64_t>(bloom_meta));
-    ASSERT_GT(data_size, 0u);
-    ASSERT_EQ(key_len, 18u);
-    EXPECT_EQ(std::string(reinterpret_cast<const char*>(payload + 16 + key_len_size), key_len),
-              "GENERAL_BLOOM_META");
+    uint32_t on_disk_size_without_header = read_be32(data.data() + second_root + 8);
+    uint32_t uncompressed_size = read_be32(data.data() + second_root + 12);
+    uint32_t on_disk_data_with_header = read_be32(data.data() + second_root + 29);
+    size_t payload_size = static_cast<size_t>(on_disk_data_with_header) - kBlockHeaderSize;
+    EXPECT_EQ(uncompressed_size, 0u);
+    EXPECT_EQ(on_disk_size_without_header, 4u);
+    EXPECT_EQ(payload_size, 0u);
 
     fs::remove(path);
 }

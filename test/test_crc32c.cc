@@ -58,3 +58,24 @@ TEST(CRC32C, ChunkChecksums) {
     EXPECT_EQ(c0, stored0);
     EXPECT_EQ(c1, stored1);
 }
+
+TEST(CRC32C, SplitChunkChecksumsMatchContiguous) {
+    std::vector<uint8_t> header(33);
+    std::iota(header.begin(), header.end(), 0x11);
+    std::vector<uint8_t> payload(4096);
+    std::iota(payload.begin(), payload.end(), 0x21);
+
+    std::vector<uint8_t> contiguous;
+    contiguous.reserve(header.size() + payload.size());
+    contiguous.insert(contiguous.end(), header.begin(), header.end());
+    contiguous.insert(contiguous.end(), payload.begin(), payload.end());
+
+    size_t checksum_count = (contiguous.size() + 511) / 512;
+    std::vector<uint8_t> expected(checksum_count * 4);
+    std::vector<uint8_t> actual(checksum_count * 4);
+
+    EXPECT_EQ(
+        compute_hfile_checksums(contiguous.data(), contiguous.size(), 512, expected.data()),
+        compute_hfile_checksums_split(header, payload, 512, actual.data()));
+    EXPECT_EQ(expected, actual);
+}

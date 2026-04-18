@@ -146,6 +146,30 @@ static std::string base64_encode(std::span<const uint8_t> data) {
     return out;
 }
 
+static void append_segment_value(std::string* out,
+                                 const RowKeySegment& seg,
+                                 std::string_view value) {
+    const size_t pad_len = seg.pad_len > 0 ? static_cast<size_t>(seg.pad_len) : 0;
+    const size_t deficit = pad_len > value.size() ? (pad_len - value.size()) : 0;
+
+    if (!seg.reverse) {
+        if (!seg.pad_right && deficit > 0)
+            out->append(deficit, seg.pad_char);
+        if (!value.empty())
+            out->append(value.data(), value.size());
+        if (seg.pad_right && deficit > 0)
+            out->append(deficit, seg.pad_char);
+        return;
+    }
+
+    if (seg.pad_right && deficit > 0)
+        out->append(deficit, seg.pad_char);
+    for (auto it = value.rbegin(); it != value.rend(); ++it)
+        out->push_back(*it);
+    if (!seg.pad_right && deficit > 0)
+        out->append(deficit, seg.pad_char);
+}
+
 static Status encode_long_or_short(const RowKeySegment& seg,
                                    std::string_view value,
                                    std::string* out) {
@@ -297,31 +321,46 @@ std::string RowKeyBuilder::build(const std::vector<std::string_view>& fields) {
     return out;
 }
 
+int RowKeyBuilder::direct_passthrough_col_index() const noexcept {
+    if (segments_.size() != 1) return -1;
+    const auto& seg = segments_.front();
+    if (seg.type != RowKeySegment::Type::ColumnRef) return -1;
+    if (seg.reverse) return -1;
+    if (seg.pad_len != 0) return -1;
+    return seg.col_index;
+}
+
 Status RowKeyBuilder::build_checked(const std::vector<std::string_view>& fields, std::string* out) {
     out->clear();
-    out->reserve(64);
+    if (out->capacity() < 64)
+        out->reserve(64);
+    std::string encoded_value;
 
     for (const auto& seg : segments_) {
         if (seg.type == RowKeySegment::Type::Random) {
-            *out += random_digits(seg.pad_len);
+            const int len = std::max(seg.pad_len, 0);
+            out->reserve(out->size() + static_cast<size_t>(len));
+            std::uniform_int_distribution<int> dist(0, 8);
+            for (int i = 0; i < len; ++i)
+                out->push_back(static_cast<char>('0' + dist(rng_)));
             continue;
         }
 
-        std::string val;
-        if (seg.type == RowKeySegment::Type::Fill) {
-            val.clear();
-        } else {
+        std::string_view value;
+        if (seg.type != RowKeySegment::Type::Fill) {
             if (seg.col_index >= static_cast<int>(fields.size()))
                 return Status::InvalidArg("rowKeyRule references missing field index " +
                                           std::to_string(seg.col_index));
-            val = std::string(fields[static_cast<size_t>(seg.col_index)]);
+            value = fields[static_cast<size_t>(seg.col_index)];
         }
 
         if (seg.type == RowKeySegment::Type::EncodedColumn) {
-            HFILE_RETURN_IF_ERROR(encode_long_or_short(seg, val, &val));
+            encoded_value.clear();
+            HFILE_RETURN_IF_ERROR(encode_long_or_short(seg, value, &encoded_value));
+            value = encoded_value;
         }
 
-        *out += apply_segment(seg, std::move(val));
+        append_segment_value(out, seg, value);
     }
     return Status::OK();
 }

@@ -224,6 +224,10 @@ public:
         : Compressor(Compression::GZip)
         , level_(level <= 0 ? Z_DEFAULT_COMPRESSION : level) {}
 
+    ~GZipCompressor() override {
+        shutdown();
+    }
+
     size_t max_compressed_size(size_t n) const noexcept override {
         // Match JDK GZIPOutputStream layout:
         // fixed 10-byte header + raw deflate payload + 8-byte trailer.
@@ -239,47 +243,42 @@ public:
         };
         if (capacity < sizeof(kGzipHeader) + 8) return 0;
 
+        if (!ensure_initialized()) return 0;
+        if (deflateReset(&strm_) != Z_OK) {
+            shutdown();
+            if (!ensure_initialized()) return 0;
+            if (deflateReset(&strm_) != Z_OK) return 0;
+        }
+
         std::memcpy(output, kGzipHeader, sizeof(kGzipHeader));
 
-        z_stream strm{};
-        strm.next_in   = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.data()));
-        strm.avail_in  = static_cast<uInt>(input.size());
-        strm.next_out  = reinterpret_cast<Bytef*>(output + sizeof(kGzipHeader));
-        strm.avail_out = static_cast<uInt>(capacity - sizeof(kGzipHeader) - 8);
+        strm_.next_in   = const_cast<Bytef*>(reinterpret_cast<const Bytef*>(input.data()));
+        strm_.avail_in  = static_cast<uInt>(input.size());
+        strm_.next_out  = reinterpret_cast<Bytef*>(output + sizeof(kGzipHeader));
+        strm_.avail_out = static_cast<uInt>(capacity - sizeof(kGzipHeader) - 8);
 
-        // Match JDK GZIPOutputStream / HBase ReusableStreamGzipCodec:
-        // fixed gzip header + raw deflate payload + little-endian trailer.
-        int ret = deflateInit2(&strm, level_, Z_DEFLATED,
-                               -MAX_WBITS, /*memLevel=*/8,
-                               Z_DEFAULT_STRATEGY);
-        if (ret != Z_OK) return 0;
-
-        while (strm.avail_in > 0) {
-            ret = deflate(&strm, Z_NO_FLUSH);
+        int ret = Z_OK;
+        while (strm_.avail_in > 0) {
+            ret = deflate(&strm_, Z_NO_FLUSH);
             if (ret != Z_OK) {
-                deflateEnd(&strm);
                 return 0;
             }
-            if (strm.avail_out == 0) {
-                deflateEnd(&strm);
+            if (strm_.avail_out == 0) {
                 return 0;
             }
         }
 
         do {
-            ret = deflate(&strm, Z_FINISH);
+            ret = deflate(&strm_, Z_FINISH);
             if (ret != Z_OK && ret != Z_STREAM_END) {
-                deflateEnd(&strm);
                 return 0;
             }
-            if (ret != Z_STREAM_END && strm.avail_out == 0) {
-                deflateEnd(&strm);
+            if (ret != Z_STREAM_END && strm_.avail_out == 0) {
                 return 0;
             }
         } while (ret != Z_STREAM_END);
 
-        size_t deflated_size = strm.total_out;
-        deflateEnd(&strm);
+        size_t deflated_size = strm_.total_out;
 
         const uint32_t crc = static_cast<uint32_t>(
             ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
@@ -346,6 +345,25 @@ public:
 
 private:
     int level_;
+    bool ensure_initialized() const noexcept {
+        if (initialized_) return true;
+        std::memset(&strm_, 0, sizeof(strm_));
+        const int ret = deflateInit2(&strm_, level_, Z_DEFLATED,
+                                     -MAX_WBITS, /*memLevel=*/8,
+                                     Z_DEFAULT_STRATEGY);
+        initialized_ = (ret == Z_OK);
+        return initialized_;
+    }
+
+    void shutdown() const noexcept {
+        if (!initialized_) return;
+        deflateEnd(&strm_);
+        initialized_ = false;
+        std::memset(&strm_, 0, sizeof(strm_));
+    }
+
+    mutable z_stream strm_{};
+    mutable bool initialized_{false};
 };
 
 // ─── Factory ──────────────────────────────────────────────────────────────────
