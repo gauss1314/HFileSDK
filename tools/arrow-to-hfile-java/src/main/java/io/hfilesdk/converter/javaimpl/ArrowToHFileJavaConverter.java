@@ -60,10 +60,13 @@ public final class ArrowToHFileJavaConverter {
     private static final int RANDOM_SEED_RANGE = 9;
     public JavaConvertResult convert(JavaConvertOptions options) {
         long start = System.nanoTime();
+        long sortStart = System.nanoTime();
         java.nio.file.Path arrowPath = Paths.get(options.arrowPath()).toAbsolutePath().normalize();
         java.nio.file.Path hfilePath = Paths.get(options.hfilePath()).toAbsolutePath().normalize();
         long rowsRead = 0L;
         long kvWritten = 0L;
+        long sortMs = 0L;
+        long writeMs = 0L;
         List<VectorSchemaRoot> storedBatches = new ArrayList<>();
 
         try {
@@ -75,7 +78,9 @@ public final class ArrowToHFileJavaConverter {
                     hfilePath.toString(),
                     0L,
                     0L,
-                    elapsedMillis(start)
+                    elapsedMillis(start),
+                    sortMs,
+                    writeMs
                 );
             }
             if (hfilePath.getParent() != null) {
@@ -135,7 +140,9 @@ public final class ArrowToHFileJavaConverter {
                     }
 
                     sortIndex.sort((left, right) -> Bytes.compareTo(left.rowKey(), right.rowKey()));
+                    sortMs = elapsedMillis(sortStart);
 
+                    long writeStart = System.nanoTime();
                     StoreFileWriter writer = createStoreFileWriter(
                         configuration,
                         fileSystem,
@@ -156,6 +163,7 @@ public final class ArrowToHFileJavaConverter {
                     } finally {
                         writer.close();
                     }
+                    writeMs = elapsedMillis(writeStart);
                 } finally {
                     closeBatches(storedBatches);
                 }
@@ -168,7 +176,9 @@ public final class ArrowToHFileJavaConverter {
                 rowsRead,
                 kvWritten,
                 sizeBytes,
-                elapsedMillis(start)
+                elapsedMillis(start),
+                sortMs,
+                writeMs
             );
         } catch (JavaConvertException e) {
             deleteQuietly(hfilePath);
@@ -179,7 +189,9 @@ public final class ArrowToHFileJavaConverter {
                 hfilePath.toString(),
                 rowsRead,
                 kvWritten,
-                elapsedMillis(start)
+                elapsedMillis(start),
+                sortMs,
+                writeMs
             );
         } catch (IllegalArgumentException e) {
             deleteQuietly(hfilePath);
@@ -190,7 +202,9 @@ public final class ArrowToHFileJavaConverter {
                 hfilePath.toString(),
                 rowsRead,
                 kvWritten,
-                elapsedMillis(start)
+                elapsedMillis(start),
+                sortMs,
+                writeMs
             );
         } catch (IOException e) {
             deleteQuietly(hfilePath);
@@ -201,7 +215,9 @@ public final class ArrowToHFileJavaConverter {
                 hfilePath.toString(),
                 rowsRead,
                 kvWritten,
-                elapsedMillis(start)
+                elapsedMillis(start),
+                sortMs,
+                writeMs
             );
         } catch (Exception e) {
             deleteQuietly(hfilePath);
@@ -212,7 +228,9 @@ public final class ArrowToHFileJavaConverter {
                 hfilePath.toString(),
                 rowsRead,
                 kvWritten,
-                elapsedMillis(start)
+                elapsedMillis(start),
+                sortMs,
+                writeMs
             );
         }
     }
@@ -651,6 +669,8 @@ public final class ArrowToHFileJavaConverter {
                     "",
                     0L,
                     0L,
+                    0L,
+                    0L,
                     0L
                 ));
             }
@@ -858,6 +878,8 @@ public final class ArrowToHFileJavaConverter {
                 message,
                 "",
                 "",
+                0L,
+                0L,
                 0L,
                 0L,
                 0L

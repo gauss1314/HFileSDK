@@ -78,6 +78,9 @@ Throughput: 612.4 MB/s
 | `--bloom TYPE` | | `row` | Bloom Filter：`none`/`row`/`rowcol` |
 | `--block-size BYTES` | | `65536` | 数据块大小（字节） |
 | `--max-memory-mb MB` | | `0` | C++ SDK 内部软内存预算，单位 MiB；`0` 表示不限制 |
+| `--compression-threads N` | | `0` | C++ SDK 数据块压缩后台线程数；`0` 表示关闭压缩流水线 |
+| `--compression-queue-depth N` | | `0` | C++ SDK 压缩流水线最大 in-flight block 数；`0` 表示自动 |
+| `--numeric-sort-fast-path MODE` | | `auto` | 数值 rowkey 排序快路径：`auto`/`on`/`off` |
 | `--fsync-policy` | | `safe` | Fsync 策略：`safe`/`fast`/`paranoid` |
 | `--error-policy` | | `skip_row` | 行错误策略：`strict`/`skip_row`/`skip_batch` |
 
@@ -86,10 +89,21 @@ Throughput: 612.4 MB/s
 ### 内存控制与观测
 
 - `--max-memory-mb` 会通过 JNI `configure()` 下发为 `max_memory_bytes`，控制 SDK 内部 `MemoryBudget`
+- `--compression-threads` / `--compression-queue-depth` 会通过 JNI `configure()` 下发为 `compression_threads` / `compression_queue_depth`
+- `--numeric-sort-fast-path` 会通过 JNI `configure()` 下发为 `numeric_sort_fast_path`
+- `numeric_sort_fast_path` 是按 rowkey 规则形态启用的通用优化，不绑定任何具体表名
+- 只有在 rowkey 的首段满足“直接数值/时间戳列、左侧 `0` 补齐、非 reverse/right-pad”时才可能命中
+- 命中后会按“数值前缀 + 剩余后缀”的方式排序，因此复合 rowkey 也可以受益
+- 若某条数据的数值位数超出配置的 `padLen`，为保证最终字典序与 HBase 期望一致，`auto` 会自动回退，`on` 会直接报错
+- `auto`：满足条件时启用，不满足时自动回退为通用字符串排序路径
+- `on`：要求规则和数据都满足条件；否则直接返回 `INVALID_ARGUMENT`
+- `off`：始终关闭该快路径
 - 这是 SDK 内部的 soft budget，只统计 SDK 显式追踪的可归因内存，不等于整个 JNI 进程 RSS
 - `getLastResult()` / `ConvertResult` 现在额外返回：
   - `memory_budget_bytes`
   - `tracked_memory_peak_bytes`
+  - `numeric_sort_fast_path_mode`
+  - `numeric_sort_fast_path_used`
 
 ---
 

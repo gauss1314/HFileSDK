@@ -218,6 +218,33 @@ TEST(CompressorStandalone, GZipMatchesReferenceOneShotZlib) {
     EXPECT_EQ(expected, actual);
 }
 
+TEST(CompressorStandalone, GZipPrecomputedCrcMatchesDirectCompression) {
+    auto c = Compressor::create(Compression::GZip, 1);
+    ASSERT_NE(c, nullptr);
+
+    std::vector<uint8_t> input(96 * 1024);
+    for (size_t i = 0; i < input.size(); ++i) {
+        input[i] = static_cast<uint8_t>('A' + (i % 13));
+    }
+
+    const uint32_t crc = static_cast<uint32_t>(
+        ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
+                static_cast<uInt>(input.size())));
+
+    std::vector<uint8_t> direct(c->max_compressed_size(input.size()));
+    std::vector<uint8_t> precomputed(c->max_compressed_size(input.size()));
+
+    size_t direct_len = c->compress(input, direct.data(), direct.size());
+    size_t precomputed_len = c->compress_with_crc32(
+        input, precomputed.data(), precomputed.size(), crc);
+
+    ASSERT_GT(direct_len, 0u);
+    ASSERT_GT(precomputed_len, 0u);
+    direct.resize(direct_len);
+    precomputed.resize(precomputed_len);
+    EXPECT_EQ(direct, precomputed);
+}
+
 INSTANTIATE_TEST_SUITE_P(
     AllCodecs, CompressorTest,
     ::testing::Values(

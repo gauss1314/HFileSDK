@@ -148,6 +148,15 @@ public class HFileSDK {
      *   <li>{@code error_policy}               — {@code "strict" | "skip_row" | "skip_batch"}
      *   <li>{@code bloom_type}                 — {@code "none" | "row" | "rowcol"}
      *   <li>{@code max_memory_bytes}           — soft SDK memory budget in bytes, 0 = unlimited
+     *   <li>{@code compression_threads}        — background data-block compression workers, 0 = disabled
+     *   <li>{@code compression_queue_depth}    — max in-flight compressed blocks, 0 = auto when threads > 0
+     *   <li>{@code numeric_sort_fast_path}     — {@code "auto" | "on" | "off"}.
+     *                                            Controls the C++ numeric row-key sorting fast path
+     *                                            when the first row-key segment is a zero-left-padded
+     *                                            direct numeric/timestamp column. {@code auto} enables
+     *                                            it only when safe, {@code on} requires the rule/data to
+     *                                            be eligible and to fit the configured padLen,
+     *                                            {@code off} always uses the generic string sort path.
      *   <li>{@code default_timestamp_ms}       — fixed timestamp written into generated cells, 0 = use current time
      *   <li>{@code excluded_columns}           — JSON string array of column names to exclude
      *                                            from HBase KV output (exact match, case-sensitive).
@@ -200,6 +209,9 @@ public class HFileSDK {
         private String columnFamily       = "cf";
         private String dataBlockEncoding  = "FAST_DIFF";
         private long   maxMemoryBytes     = 0;
+        private int    compressionThreads = 0;
+        private int    compressionQueueDepth = 0;
+        private String numericSortFastPath = "auto";
         private long   defaultTimestampMs = 0;
 
         public Builder compression(String c)       { compression = c;       return this; }
@@ -208,6 +220,9 @@ public class HFileSDK {
         public Builder columnFamily(String cf)     { columnFamily = cf;     return this; }
         public Builder dataBlockEncoding(String e) { dataBlockEncoding = e; return this; }
         public Builder maxMemoryBytes(long v)      { maxMemoryBytes = v;    return this; }
+        public Builder compressionThreads(int v)   { compressionThreads = v; return this; }
+        public Builder compressionQueueDepth(int v){ compressionQueueDepth = v; return this; }
+        public Builder numericSortFastPath(String v){ numericSortFastPath = v; return this; }
         public Builder defaultTimestampMs(long v)  { defaultTimestampMs = v; return this; }
 
         /**
@@ -218,9 +233,12 @@ public class HFileSDK {
             String cfg = String.format(
                 "{\"compression\":\"%s\",\"compression_level\":%d,\"block_size\":%d," +
                 "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\",\"max_memory_bytes\":%d," +
+                "\"compression_threads\":%d,\"compression_queue_depth\":%d," +
+                "\"numeric_sort_fast_path\":\"%s\"," +
                 "\"default_timestamp_ms\":%d}",
                 compression, compressionLevel, blockSize, columnFamily, dataBlockEncoding,
-                maxMemoryBytes, defaultTimestampMs);
+                maxMemoryBytes, compressionThreads, compressionQueueDepth,
+                numericSortFastPath, defaultTimestampMs);
             int rc = sdk.configure(cfg);
             if (rc != OK) {
                 throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());

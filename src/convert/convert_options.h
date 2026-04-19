@@ -10,6 +10,22 @@
 
 namespace hfile {
 
+enum class NumericSortFastPathMode {
+    Auto,
+    On,
+    Off
+};
+
+inline constexpr const char* numeric_sort_fast_path_mode_name(
+        NumericSortFastPathMode mode) noexcept {
+    switch (mode) {
+    case NumericSortFastPathMode::Auto: return "auto";
+    case NumericSortFastPathMode::On:   return "on";
+    case NumericSortFastPathMode::Off:  return "off";
+    }
+    return "auto";
+}
+
 /// Options for a single Arrow IPC file → HFile conversion.
 struct ConvertOptions {
     // ── Input/Output ──────────────────────────────────────────────────────
@@ -47,6 +63,9 @@ struct ConvertOptions {
     // ── HFile write options ───────────────────────────────────────────────
     WriterOptions writer_opts;
 
+    // ── Converter fast paths ──────────────────────────────────────────────
+    NumericSortFastPathMode numeric_sort_fast_path = NumericSortFastPathMode::Auto;
+
     // ── Observability ─────────────────────────────────────────────────────
     std::function<void(int64_t rows_done, int64_t total_rows)> progress_cb;
 };
@@ -69,10 +88,23 @@ struct ConvertResult {
     int64_t     duplicate_key_count = 0;
     int64_t     memory_budget_bytes = 0;
     int64_t     tracked_memory_peak_bytes = 0;
+    NumericSortFastPathMode numeric_sort_fast_path_mode = NumericSortFastPathMode::Auto;
+    bool        numeric_sort_fast_path_used = false;
 
     std::chrono::milliseconds elapsed_ms{0};
     std::chrono::milliseconds sort_ms{0};
     std::chrono::milliseconds write_ms{0};
+    std::chrono::milliseconds data_block_encode_ms{0};
+    std::chrono::milliseconds data_block_compress_ms{0};
+    std::chrono::milliseconds data_block_write_ms{0};
+    std::chrono::milliseconds leaf_index_write_ms{0};
+    std::chrono::milliseconds bloom_chunk_write_ms{0};
+    std::chrono::milliseconds load_on_open_write_ms{0};
+
+    uint32_t    data_block_count = 0;
+    uint32_t    leaf_index_block_count = 0;
+    uint32_t    bloom_chunk_flush_count = 0;
+    uint32_t    load_on_open_block_count = 0;
 };
 
 /// Error codes (also used as JNI return values).

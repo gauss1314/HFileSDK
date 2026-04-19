@@ -55,6 +55,22 @@ static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
     return blocks;
 }
 
+static size_t block_index_for_offset(const std::vector<uint8_t>& data, size_t offset) {
+    const size_t limit = data.size() - kTrailerFixedSize;
+    size_t cursor = 0;
+    size_t block_index = 0;
+    while (cursor + kBlockHeaderSize <= limit) {
+        const auto on_disk_size_without_header = read_be32(data.data() + cursor + 8);
+        const size_t block_size = kBlockHeaderSize + on_disk_size_without_header;
+        if (offset < cursor + block_size) {
+            return block_index;
+        }
+        cursor += block_size;
+        ++block_index;
+    }
+    return block_index;
+}
+
 static hfile::pb::FileTrailerProto parse_trailer_proto(
         const std::vector<uint8_t>& data) {
     EXPECT_GE(data.size(), kTrailerFixedSize);
@@ -228,6 +244,192 @@ TEST(HFileWriter, SingleKV) {
     EXPECT_TRUE(fs::exists(path));
     EXPECT_GT(fs::file_size(path), 100u);  // header + data block + index + trailer
     fs::remove(path);
+}
+
+TEST(HFileWriter, SingleKVTrusted) {
+    auto path = tmp_path("single_kv_trusted");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+        .build();
+    ASSERT_TRUE(s.ok());
+
+    std::vector<uint8_t> rk, fam, q, v;
+    auto kv = make_kv(rk, fam, q, v, "row001", "col1", 1000000LL, "hello");
+    EXPECT_TRUE(w->append_trusted(kv).ok());
+    EXPECT_EQ(w->entry_count(), 1u);
+    EXPECT_TRUE(w->finish().ok());
+
+    EXPECT_TRUE(fs::exists(path));
+    EXPECT_GT(fs::file_size(path), 100u);
+    fs::remove(path);
+}
+
+TEST(HFileWriter, ExposesWritePathStats) {
+    auto path = tmp_path("writer_stats");
+    auto [w, s] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::GZip)
+        .set_compression_level(1)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::Row)
+        .set_block_size(256)
+        .build();
+    ASSERT_TRUE(s.ok()) << s.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int i = 0; i < 64; ++i) {
+        auto kv = make_kv(
+            rk, fam, q, v,
+            std::string("row") + std::to_string(i / 4),
+            std::string("col") + std::to_string(i),
+            1000000LL - i,
+            std::string(128, static_cast<char>('a' + (i % 26))));
+        ASSERT_TRUE(w->append(kv).ok());
+    }
+    ASSERT_TRUE(w->finish().ok());
+
+    WriterStats stats = w->stats();
+    EXPECT_GT(stats.data_block_count, 0u);
+    EXPECT_GE(stats.load_on_open_block_count, 3u);
+    EXPECT_GE(stats.bloom_chunk_flush_count, 1u);
+    EXPECT_GE(stats.data_block_encode_ns.count(), 0);
+    EXPECT_GE(stats.data_block_compress_ns.count(), 0);
+    EXPECT_GE(stats.data_block_write_ns.count(), 0);
+
+    fs::remove(path);
+}
+
+TEST(HFileWriter, CompressionPipelineMatchesSynchronousOutput) {
+    auto sync_path = tmp_path("pipeline_sync");
+    auto async_path = tmp_path("pipeline_async");
+
+    auto make_writer = [](const fs::path& path, uint32_t compression_threads) {
+        return HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::Row)
+            .set_block_size(512)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_compression_threads(compression_threads)
+            .set_compression_queue_depth(compression_threads == 0 ? 0 : 4)
+            .build();
+    };
+
+    auto [sync_writer, sync_status] = make_writer(sync_path, 0);
+    auto [async_writer, async_status] = make_writer(async_path, 2);
+    ASSERT_TRUE(sync_status.ok()) << sync_status.message();
+    ASSERT_TRUE(async_status.ok()) << async_status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int row = 0; row < 256; ++row) {
+        for (int col = 0; col < 4; ++col) {
+            char row_buf[32];
+            char qualifier_buf[32];
+            std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+            std::snprintf(qualifier_buf, sizeof(qualifier_buf), "col%02d", col);
+            std::string value(192, static_cast<char>('a' + ((row + col) % 26)));
+            auto kv = make_kv(
+                rk, fam, q, v,
+                row_buf,
+                qualifier_buf,
+                1'715'678'900'123LL,
+                value);
+            ASSERT_TRUE(sync_writer->append_trusted(kv).ok());
+            ASSERT_TRUE(async_writer->append_trusted(kv).ok());
+        }
+    }
+
+    ASSERT_TRUE(sync_writer->finish().ok());
+    ASSERT_TRUE(async_writer->finish().ok());
+
+    const auto sync_bytes = read_file(sync_path);
+    const auto async_bytes = read_file(async_path);
+    if (sync_bytes != async_bytes) {
+        const auto mismatch = std::mismatch(
+            sync_bytes.begin(), sync_bytes.end(), async_bytes.begin(), async_bytes.end());
+        const size_t mismatch_offset = static_cast<size_t>(
+            std::distance(sync_bytes.begin(), mismatch.first));
+        FAIL()
+            << "first mismatch at byte offset " << mismatch_offset
+            << " sync_block_index=" << block_index_for_offset(sync_bytes, mismatch_offset)
+            << " async_block_index=" << block_index_for_offset(async_bytes, mismatch_offset);
+    }
+
+    fs::remove(sync_path);
+    fs::remove(async_path);
+}
+
+TEST(HFileWriter, CompressionPipelineMatchesSynchronousOutputAcrossMultipleBloomFlushes) {
+    auto sync_path = tmp_path("pipeline_sync_multi_bloom");
+    auto async_path = tmp_path("pipeline_async_multi_bloom");
+
+    auto make_writer = [](const fs::path& path, uint32_t compression_threads) {
+        return HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::Row)
+            .set_block_size(1024)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_compression_threads(compression_threads)
+            .set_compression_queue_depth(compression_threads == 0 ? 0 : 8)
+            .build();
+    };
+
+    auto [sync_writer, sync_status] = make_writer(sync_path, 0);
+    auto [async_writer, async_status] = make_writer(async_path, 2);
+    ASSERT_TRUE(sync_status.ok()) << sync_status.message();
+    ASSERT_TRUE(async_status.ok()) << async_status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int row = 0; row < 240000; ++row) {
+        char row_buf[32];
+        std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+        auto kv = make_kv(
+            rk, fam, q, v,
+            row_buf,
+            "q",
+            1'715'678'900'123LL,
+            "v");
+        ASSERT_TRUE(sync_writer->append_trusted(kv).ok());
+        ASSERT_TRUE(async_writer->append_trusted(kv).ok());
+    }
+
+    ASSERT_TRUE(sync_writer->finish().ok());
+    ASSERT_TRUE(async_writer->finish().ok());
+
+    WriterStats sync_stats = sync_writer->stats();
+    WriterStats async_stats = async_writer->stats();
+    EXPECT_GE(sync_stats.bloom_chunk_flush_count, 2u);
+    EXPECT_EQ(sync_stats.bloom_chunk_flush_count, async_stats.bloom_chunk_flush_count);
+    const auto sync_bytes = read_file(sync_path);
+    const auto async_bytes = read_file(async_path);
+    if (sync_bytes != async_bytes) {
+        const auto mismatch = std::mismatch(
+            sync_bytes.begin(), sync_bytes.end(), async_bytes.begin(), async_bytes.end());
+        const size_t mismatch_offset = static_cast<size_t>(
+            std::distance(sync_bytes.begin(), mismatch.first));
+        FAIL()
+            << "first mismatch at byte offset " << mismatch_offset
+            << " sync_block_index=" << block_index_for_offset(sync_bytes, mismatch_offset)
+            << " async_block_index=" << block_index_for_offset(async_bytes, mismatch_offset)
+            << " sync_bloom_flushes=" << sync_stats.bloom_chunk_flush_count
+            << " async_bloom_flushes=" << async_stats.bloom_chunk_flush_count;
+    }
+
+    fs::remove(sync_path);
+    fs::remove(async_path);
 }
 
 TEST(HFileWriter, TrailerTotalUncompressedBytesCountsEmptyMetaRootBlock) {
@@ -624,7 +826,8 @@ TEST(HFileWriter, DiskThresholdRejectsWrite) {
     ASSERT_TRUE(s.ok());
 
     std::vector<uint8_t> rk, fam, q, v;
-    auto st = w->append(make_kv(rk, fam, q, v, "row1", "col", 100, "value"));
+    std::string large_value(70 * 1024, 'x');
+    auto st = w->append(make_kv(rk, fam, q, v, "row1", "col", 100, large_value));
     EXPECT_FALSE(st.ok());
     EXPECT_EQ(st.code(), Status::Code::IoError);
     EXPECT_NE(st.message().find("DISK_SPACE_EXHAUSTED"), std::string::npos);

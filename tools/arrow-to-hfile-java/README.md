@@ -46,6 +46,12 @@ JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
 );
 ```
 
+`JavaConvertResult` 现在会同时回传：
+
+- `elapsed_ms`
+- `sort_ms`
+- `write_ms`
+
 ## 失败语义
 
 - Arrow 文件不存在：返回 `ARROW_FILE_ERROR`

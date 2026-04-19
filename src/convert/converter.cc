@@ -22,7 +22,9 @@
 #include <string>
 #include <string_view>
 #include <cstring>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <cstdio>
 
@@ -35,7 +37,20 @@ static void warn (const std::string& m){ fprintf(stderr,"[WARN]  convert: %s\n",
 static void err  (const std::string& m){ fprintf(stderr,"[ERROR] convert: %s\n",m.c_str()); }
 }
 
+static bool hotpath_profiling_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
+        if (env == nullptr || env[0] == '\0') return false;
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0;
+    }();
+    return enabled;
+}
+
 static int map_status_to_error_code(const Status& s) {
+    if (s.message().find("INVALID_ARGUMENT:") == 0)
+        return ErrorCode::INVALID_ARGUMENT;
     if (s.message().find("MemoryBudget:") == 0)
         return ErrorCode::MEMORY_EXHAUSTED;
     if (s.message().find("SCHEMA_MISMATCH:") == 0)
@@ -49,6 +64,8 @@ static int map_status_to_error_code(const Status& s) {
 }
 
 static int map_pass1_status_to_error_code(const Status& s) {
+    if (s.message().find("INVALID_ARGUMENT:") == 0)
+        return ErrorCode::INVALID_ARGUMENT;
     if (s.message().find("MemoryBudget:") == 0)
         return ErrorCode::MEMORY_EXHAUSTED;
     if (s.message().find("SCHEMA_MISMATCH:") == 0)
@@ -149,6 +166,8 @@ static arrow::Result<std::shared_ptr<arrow::Schema>> apply_schema_removal(
 
 struct SortEntry {
     std::string_view row_key; // view into Arrow string data or owned_row_keys
+    uint64_t    numeric_sort_key{0};
+    bool        has_numeric_sort_key{false};
     int32_t     batch_idx;   // which RecordBatch (0-based)
     int32_t     row_idx;     // row within that batch
 };
@@ -162,6 +181,18 @@ struct PendingCell {
 struct BatchColumnRef {
     std::string_view     qualifier;
     const arrow::Array*  column;
+};
+
+struct ValueScratch {
+    std::array<uint8_t, 16> inline_bytes{};
+    std::vector<uint8_t> heap_bytes;
+};
+
+struct Pass2Profile {
+    std::chrono::nanoseconds materialize_ns{0};
+    std::chrono::nanoseconds append_ns{0};
+    uint64_t materialized_cells{0};
+    uint64_t appended_cells{0};
 };
 
 static std::span<const uint8_t> as_bytes(const std::string& s) {
@@ -178,8 +209,12 @@ static Status scalar_to_bytes(const arrow::Array& arr,
 
 static Status scalar_to_bytes_view(const arrow::Array& arr,
                                    int64_t row,
-                                   std::vector<uint8_t>* scratch,
+                                   ValueScratch* scratch,
                                    std::span<const uint8_t>* out);
+
+static bool try_extract_nonnegative_numeric_sort_key(const arrow::Array& arr,
+                                                     int64_t row,
+                                                     uint64_t* out);
 
 // ─── Arrow scalar → UTF-8 string (for rowValue building) ──────────────────────
 
@@ -214,6 +249,176 @@ static bool is_supported_rowkey_type(const std::shared_ptr<arrow::DataType>& typ
     default:
         return false;
     }
+}
+
+static bool is_simple_numeric_rowkey_fast_path_type(arrow::Type::type type_id) noexcept {
+    using T = arrow::Type;
+    switch (type_id) {
+    case T::BOOL:
+    case T::INT8:
+    case T::INT16:
+    case T::INT32:
+    case T::INT64:
+    case T::UINT8:
+    case T::UINT16:
+    case T::UINT32:
+    case T::UINT64:
+    case T::TIMESTAMP:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static int decimal_digit_count(uint64_t value) noexcept {
+    int digits = 1;
+    while (value >= 10) {
+        value /= 10;
+        ++digits;
+    }
+    return digits;
+}
+
+static bool fits_zero_left_padded_lex_order(uint64_t value, int pad_len) noexcept {
+    return pad_len > 0 && decimal_digit_count(value) <= pad_len;
+}
+
+template <typename IntT>
+static Status append_zero_left_padded_decimal(IntT value,
+                                              int pad_len,
+                                              std::string* out) {
+    char buf[32];
+    auto [ptr, ec] = std::to_chars(buf, buf + sizeof(buf), value);
+    if (ec != std::errc{}) {
+        return Status::InvalidArg("cannot format integer row key segment");
+    }
+    const size_t len = static_cast<size_t>(ptr - buf);
+    out->clear();
+    if (pad_len > static_cast<int>(len)) {
+        out->append(static_cast<size_t>(pad_len) - len, '0');
+    }
+    out->append(buf, len);
+    return Status::OK();
+}
+
+static Status build_simple_rowkey_fast(const arrow::Array& arr,
+                                       int64_t row,
+                                       int pad_len,
+                                       std::string* out) {
+    out->clear();
+    if (arr.IsNull(row)) return Status::OK();
+
+    using T = arrow::Type;
+    switch (arr.type_id()) {
+    case T::BOOL: {
+        const char bit = static_cast<const arrow::BooleanArray&>(arr).Value(row) ? '1' : '0';
+        if (pad_len > 1) out->append(static_cast<size_t>(pad_len - 1), '0');
+        out->push_back(bit);
+        return Status::OK();
+    }
+    case T::INT8:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::Int8Array&>(arr).Value(row), pad_len, out);
+    case T::INT16:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::Int16Array&>(arr).Value(row), pad_len, out);
+    case T::INT32:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::Int32Array&>(arr).Value(row), pad_len, out);
+    case T::INT64:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::Int64Array&>(arr).Value(row), pad_len, out);
+    case T::UINT8:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::UInt8Array&>(arr).Value(row), pad_len, out);
+    case T::UINT16:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::UInt16Array&>(arr).Value(row), pad_len, out);
+    case T::UINT32:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::UInt32Array&>(arr).Value(row), pad_len, out);
+    case T::UINT64:
+        return append_zero_left_padded_decimal(
+            static_cast<const arrow::UInt64Array&>(arr).Value(row), pad_len, out);
+    case T::TIMESTAMP: {
+        auto& ta = static_cast<const arrow::TimestampArray&>(arr);
+        auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
+        return append_zero_left_padded_decimal(
+            normalize_timestamp_to_millis(ta.Value(row), unit), pad_len, out);
+    }
+    default:
+        return Status::InvalidArg("unsupported simple fast-path row key type");
+    }
+}
+
+static bool try_extract_nonnegative_numeric_sort_key(const arrow::Array& arr,
+                                                     int64_t row,
+                                                     uint64_t* out) {
+    if (arr.IsNull(row)) return false;
+
+    using T = arrow::Type;
+    switch (arr.type_id()) {
+    case T::BOOL:
+        *out = static_cast<const arrow::BooleanArray&>(arr).Value(row) ? 1u : 0u;
+        return true;
+    case T::INT8: {
+        int8_t value = static_cast<const arrow::Int8Array&>(arr).Value(row);
+        if (value < 0) return false;
+        *out = static_cast<uint64_t>(value);
+        return true;
+    }
+    case T::INT16: {
+        int16_t value = static_cast<const arrow::Int16Array&>(arr).Value(row);
+        if (value < 0) return false;
+        *out = static_cast<uint64_t>(value);
+        return true;
+    }
+    case T::INT32: {
+        int32_t value = static_cast<const arrow::Int32Array&>(arr).Value(row);
+        if (value < 0) return false;
+        *out = static_cast<uint64_t>(value);
+        return true;
+    }
+    case T::INT64: {
+        int64_t value = static_cast<const arrow::Int64Array&>(arr).Value(row);
+        if (value < 0) return false;
+        *out = static_cast<uint64_t>(value);
+        return true;
+    }
+    case T::UINT8:
+        *out = static_cast<const arrow::UInt8Array&>(arr).Value(row);
+        return true;
+    case T::UINT16:
+        *out = static_cast<const arrow::UInt16Array&>(arr).Value(row);
+        return true;
+    case T::UINT32:
+        *out = static_cast<const arrow::UInt32Array&>(arr).Value(row);
+        return true;
+    case T::UINT64:
+        *out = static_cast<const arrow::UInt64Array&>(arr).Value(row);
+        return true;
+    case T::TIMESTAMP: {
+        auto& ta = static_cast<const arrow::TimestampArray&>(arr);
+        auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
+        int64_t value = normalize_timestamp_to_millis(ta.Value(row), unit);
+        if (value < 0) return false;
+        *out = static_cast<uint64_t>(value);
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+static Status validate_numeric_sort_fast_path_rule(
+        NumericSortFastPathMode mode,
+        bool eligible) {
+    if (mode != NumericSortFastPathMode::On || eligible) {
+        return Status::OK();
+    }
+    return Status::InvalidArg(
+        "INVALID_ARGUMENT: numeric_sort_fast_path=on requires the first row key "
+        "segment to be a direct non-reversed numeric/timestamp column with zero-left-padding");
 }
 
 static Status scalar_to_string(const arrow::Array& arr, int64_t row, std::string* out) {
@@ -386,9 +591,8 @@ static Status scalar_to_bytes(const arrow::Array& arr, int64_t row, std::vector<
 
 static Status scalar_to_bytes_view(const arrow::Array& arr,
                                    int64_t row,
-                                   std::vector<uint8_t>* scratch,
+                                   ValueScratch* scratch,
                                    std::span<const uint8_t>* out) {
-    scratch->clear();
     *out = {};
     if (arr.IsNull(row)) return Status::OK();
 
@@ -432,9 +636,88 @@ static Status scalar_to_bytes_view(const arrow::Array& arr,
         };
         return Status::OK();
     }
+    case T::BOOL:
+        scratch->inline_bytes[0] =
+            static_cast<uint8_t>(static_cast<const arrow::BooleanArray&>(arr).Value(row) ? 1 : 0);
+        *out = {scratch->inline_bytes.data(), 1};
+        return Status::OK();
+    case T::INT8:
+        scratch->inline_bytes[0] = static_cast<uint8_t>(
+            static_cast<const arrow::Int8Array&>(arr).Value(row));
+        *out = {scratch->inline_bytes.data(), 1};
+        return Status::OK();
+    case T::UINT8:
+        scratch->inline_bytes[0] =
+            static_cast<const arrow::UInt8Array&>(arr).Value(row);
+        *out = {scratch->inline_bytes.data(), 1};
+        return Status::OK();
+    case T::INT16: {
+        uint16_t value = static_cast<uint16_t>(
+            static_cast<const arrow::Int16Array&>(arr).Value(row));
+        write_be16(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 2};
+        return Status::OK();
+    }
+    case T::UINT16: {
+        uint16_t value = static_cast<const arrow::UInt16Array&>(arr).Value(row);
+        write_be16(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 2};
+        return Status::OK();
+    }
+    case T::INT32: {
+        uint32_t value = static_cast<uint32_t>(
+            static_cast<const arrow::Int32Array&>(arr).Value(row));
+        write_be32(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 4};
+        return Status::OK();
+    }
+    case T::UINT32: {
+        uint32_t value = static_cast<const arrow::UInt32Array&>(arr).Value(row);
+        write_be32(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 4};
+        return Status::OK();
+    }
+    case T::FLOAT: {
+        float value = static_cast<const arrow::FloatArray&>(arr).Value(row);
+        uint32_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        write_be32(scratch->inline_bytes.data(), bits);
+        *out = {scratch->inline_bytes.data(), 4};
+        return Status::OK();
+    }
+    case T::INT64: {
+        uint64_t value = static_cast<uint64_t>(
+            static_cast<const arrow::Int64Array&>(arr).Value(row));
+        write_be64(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 8};
+        return Status::OK();
+    }
+    case T::UINT64: {
+        uint64_t value = static_cast<const arrow::UInt64Array&>(arr).Value(row);
+        write_be64(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 8};
+        return Status::OK();
+    }
+    case T::DOUBLE: {
+        double value = static_cast<const arrow::DoubleArray&>(arr).Value(row);
+        uint64_t bits;
+        std::memcpy(&bits, &value, sizeof(bits));
+        write_be64(scratch->inline_bytes.data(), bits);
+        *out = {scratch->inline_bytes.data(), 8};
+        return Status::OK();
+    }
+    case T::TIMESTAMP: {
+        auto& ta = static_cast<const arrow::TimestampArray&>(arr);
+        auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
+        uint64_t value = static_cast<uint64_t>(
+            normalize_timestamp_to_millis(ta.Value(row), unit));
+        write_be64(scratch->inline_bytes.data(), value);
+        *out = {scratch->inline_bytes.data(), 8};
+        return Status::OK();
+    }
     default:
-        HFILE_RETURN_IF_ERROR(scalar_to_bytes(arr, row, scratch));
-        *out = {scratch->data(), scratch->size()};
+        HFILE_RETURN_IF_ERROR(scalar_to_bytes(arr, row, &scratch->heap_bytes));
+        *out = {scratch->heap_bytes.data(), scratch->heap_bytes.size()};
         return Status::OK();
     }
 }
@@ -458,7 +741,10 @@ static Status build_sort_index(
         std::deque<std::string>&            owned_row_keys_out,
         std::vector<std::shared_ptr<arrow::RecordBatch>>& batches_out,
         memory::MemoryBudget*               budget,
-        ConvertResult&                      result) {
+        ConvertResult&                      result,
+        bool*                              used_numeric_sort_path_out,
+        int*                               numeric_sort_pad_len_out,
+        NumericSortFastPathMode            numeric_sort_fast_path_mode) {
 
     auto reader_res = open_arrow_stream(arrow_path);
     if (!reader_res.ok())
@@ -512,6 +798,24 @@ static Status build_sort_index(
                 filtered_schema->field(c)->type()->ToString());
         }
     }
+    std::vector<int> suffix_referenced_col_indices;
+    if (rkb.segments().size() > 1) {
+        std::vector<uint8_t> suffix_referenced_cols(
+            static_cast<size_t>(std::max(0, num_filtered_cols)), 0);
+        for (size_t index = 1; index < rkb.segments().size(); ++index) {
+            const auto& seg = rkb.segments()[index];
+            if (seg.type != arrow_convert::RowKeySegment::Type::ColumnRef &&
+                seg.type != arrow_convert::RowKeySegment::Type::EncodedColumn) {
+                continue;
+            }
+            suffix_referenced_cols[static_cast<size_t>(seg.col_index)] = true;
+        }
+        suffix_referenced_col_indices.reserve(rkb.segments().size() - 1);
+        for (int c = 0; c < num_filtered_cols; ++c) {
+            if (suffix_referenced_cols[static_cast<size_t>(c)] == 0) continue;
+            suffix_referenced_col_indices.push_back(c);
+        }
+    }
 
     std::shared_ptr<arrow::RecordBatch> raw_batch;
     int32_t batch_idx = 0;
@@ -524,6 +828,47 @@ static Status build_sort_index(
         direct_col_idx >= 0 &&
         (filtered_schema->field(direct_col_idx)->type()->id() == arrow::Type::STRING ||
          filtered_schema->field(direct_col_idx)->type()->id() == arrow::Type::LARGE_STRING);
+    const arrow_convert::RowKeySegment* first_fast_segment =
+        rkb.segments().empty() ? nullptr : &rkb.segments().front();
+    const bool numeric_prefix_fast_path =
+        first_fast_segment != nullptr &&
+        first_fast_segment->type == arrow_convert::RowKeySegment::Type::ColumnRef &&
+        !first_fast_segment->reverse &&
+        !first_fast_segment->pad_right &&
+        first_fast_segment->pad_char == '0' &&
+        first_fast_segment->pad_len > 0 &&
+        is_simple_numeric_rowkey_fast_path_type(
+            filtered_schema->field(first_fast_segment->col_index)->type()->id());
+    const bool single_numeric_fast_path =
+        numeric_prefix_fast_path && rkb.segments().size() == 1;
+    HFILE_RETURN_IF_ERROR(validate_numeric_sort_fast_path_rule(
+        numeric_sort_fast_path_mode, numeric_prefix_fast_path));
+    bool numeric_sort_path_active =
+        numeric_sort_fast_path_mode != NumericSortFastPathMode::Off &&
+        numeric_prefix_fast_path;
+
+    auto materialize_numeric_sort_entries = [&]() -> Status {
+        if (first_fast_segment == nullptr) {
+            return Status::InvalidArg("INVALID_ROW_KEY_RULE: numeric row key segment missing");
+        }
+        for (auto& entry : index_out) {
+            if (!entry.has_numeric_sort_key) continue;
+            std::string rk;
+            auto build_status = append_zero_left_padded_decimal(
+                entry.numeric_sort_key, first_fast_segment->pad_len, &rk);
+            if (!build_status.ok()) {
+                return Status::InvalidArg("INVALID_ROW_KEY_RULE: " + build_status.message());
+            }
+            if (!entry.row_key.empty()) {
+                rk.append(entry.row_key.data(), entry.row_key.size());
+            }
+            owned_row_keys_out.push_back(std::move(rk));
+            entry.row_key = owned_row_keys_out.back();
+            entry.has_numeric_sort_key = false;
+            entry.numeric_sort_key = 0;
+        }
+        return Status::OK();
+    };
 
     while (true) {
         auto s = reader->ReadNext(&raw_batch);
@@ -575,7 +920,101 @@ static Status build_sort_index(
                     auto reserve_status = budget->reserve(sizeof(SortEntry) + rk_view.size());
                     if (!reserve_status.ok()) return reserve_status;
                 }
-                index_out.push_back({rk_view, batch_idx, static_cast<int32_t>(r)});
+                index_out.push_back({rk_view, 0, false, batch_idx, static_cast<int32_t>(r)});
+                continue;
+            }
+
+            if (numeric_sort_path_active) {
+                const auto& numeric_column = *batch->column(first_fast_segment->col_index);
+                if (numeric_column.IsNull(r)) {
+                    result.kv_skipped_count++;
+                    continue;
+                }
+                uint64_t numeric_sort_key = 0;
+                if (!try_extract_nonnegative_numeric_sort_key(
+                        numeric_column, r, &numeric_sort_key)) {
+                    if (numeric_sort_fast_path_mode == NumericSortFastPathMode::On) {
+                        return Status::InvalidArg(
+                            "INVALID_ARGUMENT: numeric_sort_fast_path=on requires all row key "
+                            "values to be non-negative");
+                    }
+                    HFILE_RETURN_IF_ERROR(materialize_numeric_sort_entries());
+                    numeric_sort_path_active = false;
+                } else {
+                    if (!fits_zero_left_padded_lex_order(
+                            numeric_sort_key, first_fast_segment->pad_len)) {
+                        if (numeric_sort_fast_path_mode == NumericSortFastPathMode::On) {
+                            return Status::InvalidArg(
+                                "INVALID_ARGUMENT: numeric_sort_fast_path=on requires all row key "
+                                "values to fit the configured padLen");
+                        }
+                        HFILE_RETURN_IF_ERROR(materialize_numeric_sort_entries());
+                        numeric_sort_path_active = false;
+                    }
+                }
+                if (numeric_sort_path_active) {
+                    std::string rk_suffix;
+                    if (rkb.segments().size() > 1) {
+                        std::fill(fields.begin(), fields.end(), std::string_view{});
+                        for (int c : suffix_referenced_col_indices) {
+                            auto field_status = scalar_to_string(
+                                *batch->column(c), r,
+                                &owned_fields[static_cast<size_t>(c)]);
+                            if (!field_status.ok()) return field_status;
+                            fields[static_cast<size_t>(c)] =
+                                owned_fields[static_cast<size_t>(c)];
+                        }
+                        auto build_status = rkb.build_checked_from_segment(1, fields, &rk_suffix);
+                        if (!build_status.ok()) {
+                            return Status::InvalidArg(
+                                "INVALID_ROW_KEY_RULE: " + build_status.message());
+                        }
+                    }
+                    if (budget) {
+                        auto reserve_status =
+                            budget->reserve(sizeof(SortEntry) + rk_suffix.size());
+                        if (!reserve_status.ok()) return reserve_status;
+                    }
+                    SortEntry entry;
+                    entry.numeric_sort_key = numeric_sort_key;
+                    entry.has_numeric_sort_key = true;
+                    if (!rk_suffix.empty()) {
+                        owned_row_keys_out.push_back(std::move(rk_suffix));
+                        entry.row_key = owned_row_keys_out.back();
+                    }
+                    entry.batch_idx = batch_idx;
+                    entry.row_idx = static_cast<int32_t>(r);
+                    index_out.push_back(entry);
+                    continue;
+                }
+            }
+
+            if (single_numeric_fast_path && !numeric_sort_path_active) {
+                std::string rk;
+                auto build_status = build_simple_rowkey_fast(
+                    *batch->column(first_fast_segment->col_index),
+                    r,
+                    first_fast_segment->pad_len,
+                    &rk);
+                if (!build_status.ok()) {
+                    return Status::InvalidArg("INVALID_ROW_KEY_RULE: " + build_status.message());
+                }
+                if (rk.empty()) {
+                    result.kv_skipped_count++;
+                    continue;
+                }
+                if (budget) {
+                    auto reserve_status = budget->reserve(sizeof(SortEntry) + rk.size());
+                    if (!reserve_status.ok()) return reserve_status;
+                }
+                owned_row_keys_out.push_back(std::move(rk));
+                index_out.push_back({
+                    owned_row_keys_out.back(),
+                    0,
+                    false,
+                    batch_idx,
+                    static_cast<int32_t>(r)
+                });
                 continue;
             }
 
@@ -602,29 +1041,58 @@ static Status build_sort_index(
             }
 
             owned_row_keys_out.push_back(std::move(rk));
-            index_out.push_back({owned_row_keys_out.back(), batch_idx, static_cast<int32_t>(r)});
+            index_out.push_back({
+                owned_row_keys_out.back(),
+                0,
+                false,
+                batch_idx,
+                static_cast<int32_t>(r)
+            });
         }
 
         result.arrow_batches_read++;
         result.arrow_rows_read += n_rows;
         batch_idx++;
     }
+    if (used_numeric_sort_path_out) {
+        *used_numeric_sort_path_out = numeric_sort_path_active && numeric_prefix_fast_path;
+    }
+    if (numeric_sort_pad_len_out) {
+        *numeric_sort_pad_len_out = first_fast_segment != nullptr
+            ? first_fast_segment->pad_len
+            : 0;
+    }
     return Status::OK();
 }
 
 static std::vector<BatchColumnRef> build_sorted_columns(
-        const std::shared_ptr<arrow::RecordBatch>& batch) {
+        const std::shared_ptr<arrow::RecordBatch>& batch,
+        std::span<const int> sorted_column_order) {
     std::vector<BatchColumnRef> refs;
-    refs.reserve(static_cast<size_t>(batch->num_columns()));
+    refs.reserve(static_cast<size_t>(sorted_column_order.size()));
     auto schema = batch->schema();
-    for (int c = 0; c < batch->num_columns(); ++c) {
-        refs.push_back({schema->field(c)->name(), batch->column(c).get()});
+    for (int col_idx : sorted_column_order) {
+        refs.push_back({schema->field(col_idx)->name(), batch->column(col_idx).get()});
     }
-    std::sort(refs.begin(), refs.end(),
-              [](const BatchColumnRef& a, const BatchColumnRef& b) {
-                  return a.qualifier < b.qualifier;
-              });
     return refs;
+}
+
+static std::vector<int> build_sorted_column_order(
+        const std::shared_ptr<arrow::Schema>& schema) {
+    std::vector<int> order(static_cast<size_t>(schema->num_fields()));
+    for (int c = 0; c < schema->num_fields(); ++c) {
+        order[static_cast<size_t>(c)] = c;
+    }
+    std::sort(order.begin(), order.end(),
+              [schema](int a, int b) {
+                  return schema->field(a)->name() < schema->field(b)->name();
+              });
+    return order;
+}
+
+static std::vector<BatchColumnRef> build_sorted_columns(
+        const std::shared_ptr<arrow::RecordBatch>& batch) {
+    return build_sorted_columns(batch, build_sorted_column_order(batch->schema()));
 }
 
 static Status append_single_row_cells(
@@ -635,21 +1103,34 @@ static Status append_single_row_cells(
         const std::string&                  cf,
         int64_t                             default_ts,
         int64_t*                            kv_written,
-        int64_t*                            kv_skipped) {
+        int64_t*                            kv_skipped,
+        Pass2Profile*                       profile = nullptr) {
     int64_t ts = default_ts > 0 ? default_ts
                 : std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
 
     auto row_bytes = as_bytes(row_key);
     auto cf_bytes = as_bytes(cf);
-    std::vector<uint8_t> value_scratch;
+    ValueScratch value_scratch;
     std::span<const uint8_t> value_bytes;
+    KeyValue kv;
+    kv.row = row_bytes;
+    kv.family = cf_bytes;
+    kv.timestamp = ts;
+    kv.key_type = KeyType::Put;
+    bool appended_in_row = false;
 
     for (const auto& column_ref : columns) {
         if (column_ref.column->IsNull(row_idx)) continue;
 
+        const auto materialize_start = profile != nullptr
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         auto value_status = scalar_to_bytes_view(
             *column_ref.column, row_idx, &value_scratch, &value_bytes);
+        if (profile) {
+            profile->materialize_ns += std::chrono::steady_clock::now() - materialize_start;
+        }
         if (!value_status.ok()) {
             clog::warn("Cell skipped (" + std::string(row_key) + "/" +
                        std::string(column_ref.qualifier) + "): " +
@@ -658,17 +1139,23 @@ static Status append_single_row_cells(
             continue;
         }
         if (value_bytes.empty()) continue;
+        if (profile) ++profile->materialized_cells;
 
-        auto before_entry_count = writer.entry_count();
-        auto s = writer.append(row_bytes, cf_bytes, as_bytes(column_ref.qualifier),
-                               ts, value_bytes);
-        if (!s.ok()) return s;
-        auto after_entry_count = writer.entry_count();
-        if (after_entry_count > before_entry_count) {
-            if (kv_written) ++(*kv_written);
-        } else if (kv_skipped) {
-            ++(*kv_skipped);
+        kv.qualifier = as_bytes(column_ref.qualifier);
+        kv.value = value_bytes;
+        const auto append_start = profile != nullptr
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        auto s = appended_in_row
+            ? writer.append_trusted_same_row(kv)
+            : writer.append_trusted_new_row(kv);
+        if (profile) {
+            profile->append_ns += std::chrono::steady_clock::now() - append_start;
+            ++profile->appended_cells;
         }
+        if (!s.ok()) return s;
+        appended_in_row = true;
+        if (kv_written) ++(*kv_written);
     }
     return Status::OK();
 }
@@ -683,7 +1170,8 @@ static Status append_grouped_row_cells(
         int64_t                             default_ts,
         size_t                              source_row_count,   // how many Arrow rows mapped here
         int64_t*                            kv_written,
-        int64_t*                            kv_skipped) {
+        int64_t*                            kv_skipped,
+        Pass2Profile*                       profile = nullptr) {
     std::sort(cells.begin(), cells.end(),
               [](const PendingCell& a, const PendingCell& b) {
                   return a.qualifier < b.qualifier;
@@ -696,10 +1184,16 @@ static Status append_grouped_row_cells(
 
     auto row_bytes = as_bytes(row_key);
     auto cf_bytes = as_bytes(cf);
-    std::vector<uint8_t> value_scratch;
+    ValueScratch value_scratch;
     std::span<const uint8_t> value_bytes;
     std::string_view committed_qualifier;
     bool has_committed_qualifier = false;
+    KeyValue kv;
+    kv.row = row_bytes;
+    kv.family = cf_bytes;
+    kv.timestamp = ts;
+    kv.key_type = KeyType::Put;
+    bool appended_in_row = false;
 
     for (const auto& cell : cells) {
         if (has_committed_qualifier && committed_qualifier == cell.qualifier) {
@@ -707,8 +1201,14 @@ static Status append_grouped_row_cells(
             continue;
         }
 
+        const auto materialize_start = profile != nullptr
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         auto value_status = scalar_to_bytes_view(
             *cell.column, cell.row_idx, &value_scratch, &value_bytes);
+        if (profile) {
+            profile->materialize_ns += std::chrono::steady_clock::now() - materialize_start;
+        }
         if (!value_status.ok()) {
             clog::warn("Cell skipped (" + std::string(row_key) + "/" + std::string(cell.qualifier) +
                        "): " + value_status.message());
@@ -716,17 +1216,23 @@ static Status append_grouped_row_cells(
             continue;
         }
         if (value_bytes.empty()) continue;
+        if (profile) ++profile->materialized_cells;
 
-        auto before_entry_count = writer.entry_count();
-        auto s = writer.append(row_bytes, cf_bytes, as_bytes(cell.qualifier),
-                               ts, value_bytes);
-        if (!s.ok()) return s;
-        auto after_entry_count = writer.entry_count();
-        if (after_entry_count > before_entry_count) {
-            if (kv_written) ++(*kv_written);
-        } else if (kv_skipped) {
-            ++(*kv_skipped);
+        kv.qualifier = as_bytes(cell.qualifier);
+        kv.value = value_bytes;
+        const auto append_start = profile != nullptr
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        auto s = appended_in_row
+            ? writer.append_trusted_same_row(kv)
+            : writer.append_trusted_new_row(kv);
+        if (profile) {
+            profile->append_ns += std::chrono::steady_clock::now() - append_start;
+            ++profile->appended_cells;
         }
+        if (!s.ok()) return s;
+        appended_in_row = true;
+        if (kv_written) ++(*kv_written);
         committed_qualifier = cell.qualifier;
         has_committed_qualifier = true;
     }
@@ -739,6 +1245,7 @@ ConvertResult convert(const ConvertOptions& opts) {
     ConvertResult result;
     auto t_start = std::chrono::steady_clock::now();
     result.memory_budget_bytes = static_cast<int64_t>(opts.writer_opts.max_memory_bytes);
+    result.numeric_sort_fast_path_mode = opts.numeric_sort_fast_path;
 
     clog::info("Convert started: arrow=" + opts.arrow_path +
                " hfile=" + opts.hfile_path +
@@ -806,6 +1313,8 @@ ConvertResult convert(const ConvertOptions& opts) {
     std::vector<SortEntry> sort_index;
     std::deque<std::string> owned_row_keys;
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    bool used_numeric_sort_path = false;
+    int numeric_sort_pad_len = 0;
     std::unique_ptr<memory::MemoryBudget> budget;
     if (opts.writer_opts.max_memory_bytes > 0)
         budget = std::make_unique<memory::MemoryBudget>(opts.writer_opts.max_memory_bytes);
@@ -818,7 +1327,9 @@ ConvertResult convert(const ConvertOptions& opts) {
     {
         Status s = build_sort_index(opts.arrow_path, rkb, max_col_idx,
                                     removal_indices,
-                                    sort_index, owned_row_keys, batches, budget.get(), result);
+                                    sort_index, owned_row_keys, batches, budget.get(), result,
+                                    &used_numeric_sort_path, &numeric_sort_pad_len,
+                                    opts.numeric_sort_fast_path);
         if (!s.ok()) {
             update_memory_metrics();
             result.error_code = map_pass1_status_to_error_code(s);
@@ -828,17 +1339,29 @@ ConvertResult convert(const ConvertOptions& opts) {
         }
     }
 
-    // Sort by row key (lexicographic = HBase Row ordering)
-    std::stable_sort(sort_index.begin(), sort_index.end(),
-                     [](const SortEntry& a, const SortEntry& b){
-                         return a.row_key < b.row_key;
-                     });
+    // Sort by row key (lexicographic = HBase row ordering).  Use the original
+    // scan order as an explicit tie-breaker so duplicate keys keep the same
+    // relative ordering as the previous stable_sort() path.
+    std::sort(sort_index.begin(), sort_index.end(),
+              [](const SortEntry& a, const SortEntry& b) {
+                  if (a.has_numeric_sort_key && b.has_numeric_sort_key &&
+                      a.numeric_sort_key != b.numeric_sort_key) {
+                      return a.numeric_sort_key < b.numeric_sort_key;
+                  }
+                  if (a.row_key != b.row_key) return a.row_key < b.row_key;
+                  if (a.batch_idx != b.batch_idx) return a.batch_idx < b.batch_idx;
+                  return a.row_idx < b.row_idx;
+              });
 
     result.sort_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t_sort_start);
+    result.numeric_sort_fast_path_used = used_numeric_sort_path;
 
     clog::info("Pass 1 done: rows=" + std::to_string(sort_index.size()) +
-               " sort=" + std::to_string(result.sort_ms.count()) + "ms");
+               " sort=" + std::to_string(result.sort_ms.count()) + "ms" +
+               " numeric_sort_fast_path=" +
+               std::string(numeric_sort_fast_path_mode_name(result.numeric_sort_fast_path_mode)) +
+               " used=" + (result.numeric_sort_fast_path_used ? "true" : "false"));
 
     if (sort_index.empty()) {
         clog::warn("No valid rows after sort index build — writing empty HFile");
@@ -872,6 +1395,8 @@ ConvertResult convert(const ConvertOptions& opts) {
         .set_max_row_key_bytes(wo.max_row_key_bytes)
         .set_max_value_bytes(wo.max_value_bytes)
         .set_max_memory(wo.max_memory_bytes)
+        .set_compression_threads(wo.compression_threads)
+        .set_compression_queue_depth(wo.compression_queue_depth)
         .set_min_free_disk(wo.min_free_disk_bytes)
         .set_disk_check_interval(wo.disk_check_interval_bytes)
         .set_max_open_files(wo.max_open_files)
@@ -885,6 +1410,26 @@ ConvertResult convert(const ConvertOptions& opts) {
         return result;
     }
 
+    auto copy_writer_stats = [&]() {
+        WriterStats stats = writer->stats();
+        result.data_block_encode_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stats.data_block_encode_ns);
+        result.data_block_compress_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stats.data_block_compress_ns);
+        result.data_block_write_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stats.data_block_write_ns);
+        result.leaf_index_write_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stats.leaf_index_write_ns);
+        result.bloom_chunk_write_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stats.bloom_chunk_write_ns);
+        result.load_on_open_write_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(stats.load_on_open_write_ns);
+        result.data_block_count = stats.data_block_count;
+        result.leaf_index_block_count = stats.leaf_index_block_count;
+        result.bloom_chunk_flush_count = stats.bloom_chunk_flush_count;
+        result.load_on_open_block_count = stats.load_on_open_block_count;
+    };
+
     // ── 5. Second pass: write in sorted order ────────────────────────────
     clog::info("Pass 2: writing HFile in sorted order...");
     auto t_write_start = std::chrono::steady_clock::now();
@@ -892,18 +1437,53 @@ ConvertResult convert(const ConvertOptions& opts) {
     int64_t progress_step = std::max(int64_t(1),
         static_cast<int64_t>(sort_index.size()) / 20);
     int64_t rows_done = 0;
+    Pass2Profile pass2_profile;
+    Pass2Profile* pass2_profile_ptr =
+        hotpath_profiling_enabled() ? &pass2_profile : nullptr;
+    std::string numeric_row_key_storage;
     std::vector<PendingCell> cells;
     std::vector<std::vector<BatchColumnRef>> sorted_batch_columns;
     sorted_batch_columns.reserve(batches.size());
+    std::vector<int> sorted_column_order;
+    if (!batches.empty()) {
+        sorted_column_order = build_sorted_column_order(batches.front()->schema());
+    }
     for (const auto& batch : batches)
-        sorted_batch_columns.push_back(build_sorted_columns(batch));
+        sorted_batch_columns.push_back(build_sorted_columns(batch, sorted_column_order));
 
     for (size_t i = 0; i < sort_index.size();) {
-        const std::string_view row_key = sort_index[i].row_key;
+        std::string_view row_key;
+        uint64_t numeric_sort_key = 0;
+        if (used_numeric_sort_path && sort_index[i].has_numeric_sort_key) {
+            numeric_sort_key = sort_index[i].numeric_sort_key;
+            auto row_key_status = append_zero_left_padded_decimal(
+                numeric_sort_key, numeric_sort_pad_len, &numeric_row_key_storage);
+            if (!row_key_status.ok()) {
+                update_memory_metrics();
+                result.error_code = ErrorCode::INVALID_ROW_KEY_RULE;
+                result.error_message = row_key_status.message();
+                return result;
+            }
+            if (!sort_index[i].row_key.empty()) {
+                numeric_row_key_storage.append(
+                    sort_index[i].row_key.data(), sort_index[i].row_key.size());
+            }
+            row_key = numeric_row_key_storage;
+        } else {
+            row_key = sort_index[i].row_key;
+        }
         cells.clear();
 
         size_t j = i;
-        for (; j < sort_index.size() && sort_index[j].row_key == row_key; ++j) {}
+        if (used_numeric_sort_path && sort_index[i].has_numeric_sort_key) {
+            auto suffix = sort_index[i].row_key;
+            for (; j < sort_index.size() &&
+                   sort_index[j].has_numeric_sort_key &&
+                   sort_index[j].numeric_sort_key == numeric_sort_key &&
+                   sort_index[j].row_key == suffix; ++j) {}
+        } else {
+            for (; j < sort_index.size() && sort_index[j].row_key == row_key; ++j) {}
+        }
 
         int64_t kv_written = 0;
         int64_t kv_skipped = 0;
@@ -936,19 +1516,19 @@ ConvertResult convert(const ConvertOptions& opts) {
                 opts.column_family,
                 opts.default_timestamp,
                 &kv_written,
-                &kv_skipped);
+                &kv_skipped,
+                pass2_profile_ptr);
         } else {
             for (size_t k = i; k < j; ++k) {
                 const auto& entry = sort_index[k];
-                const auto& batch = batches[static_cast<size_t>(entry.batch_idx)];
-                auto schema = batch->schema();
-                int num_cols = batch->num_columns();
-                if (cells.capacity() < cells.size() + static_cast<size_t>(num_cols))
-                    cells.reserve(cells.size() + static_cast<size_t>(num_cols));
-                for (int c = 0; c < num_cols; ++c) {
-                    const auto* column = batch->column(c).get();
+                const auto& batch_columns =
+                    sorted_batch_columns[static_cast<size_t>(entry.batch_idx)];
+                if (cells.capacity() < cells.size() + batch_columns.size())
+                    cells.reserve(cells.size() + batch_columns.size());
+                for (const auto& column_ref : batch_columns) {
+                    const auto* column = column_ref.column;
                     if (column->IsNull(entry.row_idx)) continue;
-                    cells.push_back({schema->field(c)->name(), column, entry.row_idx});
+                    cells.push_back({column_ref.qualifier, column, entry.row_idx});
                 }
             }
             s = append_grouped_row_cells(*writer, cells, row_key,
@@ -956,7 +1536,8 @@ ConvertResult convert(const ConvertOptions& opts) {
                                          opts.default_timestamp,
                                          source_rows,
                                          &kv_written,
-                                         &kv_skipped);
+                                         &kv_skipped,
+                                         pass2_profile_ptr);
         }
         if (!s.ok()) {
             // Only SORT_ORDER_VIOLATION is fatal — it indicates a logic bug
@@ -989,12 +1570,14 @@ ConvertResult convert(const ConvertOptions& opts) {
     // ── 6. Finish HFile ───────────────────────────────────────────────────
     auto fs = writer->finish();
     if (!fs.ok()) {
+        copy_writer_stats();
         update_memory_metrics();
         result.error_code = map_status_to_error_code(fs);
         result.error_message = fs.message();
         clog::err("HFile finish failed: " + fs.message());
         return result;
     }
+    copy_writer_stats();
 
     result.write_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t_write_start);
@@ -1012,6 +1595,23 @@ ConvertResult convert(const ConvertOptions& opts) {
                " skipped=" + std::to_string(result.kv_skipped_count) +
                " hfile=" + std::to_string(result.hfile_size_bytes / 1024) + "KB" +
                " elapsed=" + std::to_string(result.elapsed_ms.count()) + "ms");
+    clog::info("Write breakdown: data_blocks=" + std::to_string(result.data_block_count) +
+               " encode=" + std::to_string(result.data_block_encode_ms.count()) + "ms" +
+               " compress=" + std::to_string(result.data_block_compress_ms.count()) + "ms" +
+               " data_write=" + std::to_string(result.data_block_write_ms.count()) + "ms" +
+               " leaf_index=" + std::to_string(result.leaf_index_write_ms.count()) + "ms" +
+               " bloom_chunk=" + std::to_string(result.bloom_chunk_write_ms.count()) + "ms" +
+               " load_on_open=" + std::to_string(result.load_on_open_write_ms.count()) + "ms");
+    if (pass2_profile_ptr != nullptr) {
+        clog::info("Pass2 breakdown: materialize=" +
+                   std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       pass2_profile.materialize_ns).count()) + "ms" +
+                   " append=" +
+                   std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                       pass2_profile.append_ns).count()) + "ms" +
+                   " materialized_cells=" + std::to_string(pass2_profile.materialized_cells) +
+                   " appended_cells=" + std::to_string(pass2_profile.appended_cells));
+    }
 
     return result;
 }

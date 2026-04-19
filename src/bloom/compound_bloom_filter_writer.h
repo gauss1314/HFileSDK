@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cmath>
+#include <limits>
 
 namespace hfile {
 namespace bloom {
@@ -136,19 +137,22 @@ public:
                                  int64_t current_file_offset,
                                  int64_t prev_block_offset,
                                  BloomWriteResult* result,
-                                 codec::Compressor* compressor = nullptr) {
+                                 codec::Compressor* compressor = nullptr,
+                                 size_t max_chunks = std::numeric_limits<size_t>::max()) {
         if (type_ == BloomType::None || chunks_.empty()) return false;
+        const size_t flush_count = std::min(max_chunks, chunks_.size());
+        if (flush_count == 0) return false;
 
         if (result && result->bloom_data_offset < 0) {
             result->bloom_data_offset = current_file_offset;
         }
 
-        chunk_offsets_.reserve(chunk_offsets_.size() + chunks_.size());
-        chunk_on_disk_sizes_.reserve(chunk_on_disk_sizes_.size() + chunks_.size());
-        chunk_byte_sizes_.reserve(chunk_byte_sizes_.size() + chunks_.size());
+        chunk_offsets_.reserve(chunk_offsets_.size() + flush_count);
+        chunk_on_disk_sizes_.reserve(chunk_on_disk_sizes_.size() + flush_count);
+        chunk_byte_sizes_.reserve(chunk_byte_sizes_.size() + flush_count);
 
         int64_t current_prev_block_offset = prev_block_offset;
-        for (size_t i = 0; i < chunks_.size(); ++i) {
+        for (size_t i = 0; i < flush_count; ++i) {
             int64_t block_offset = current_file_offset + static_cast<int64_t>(blocks_out.size());
             chunk_offsets_.push_back(block_offset);
             chunk_byte_sizes_.push_back(static_cast<uint32_t>(chunks_[i].size()));
@@ -164,7 +168,7 @@ public:
             }
         }
 
-        chunks_.clear();
+        chunks_.erase(chunks_.begin(), chunks_.begin() + static_cast<std::ptrdiff_t>(flush_count));
         return true;
     }
 
@@ -195,6 +199,7 @@ public:
         return !chunks_.empty() || !chunk_offsets_.empty() || cur_keys_ > 0;
     }
     bool      has_ready_chunks() const noexcept { return !chunks_.empty(); }
+    size_t    ready_chunk_count() const noexcept { return chunks_.size(); }
     uint32_t  total_keys()     const noexcept { return total_keys_; }
     BloomType bloom_type()     const noexcept { return type_; }
 

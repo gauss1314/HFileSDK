@@ -43,11 +43,24 @@ public final class ConvertResult {
     public final long duplicateKeyCount;
     public final long memoryBudgetBytes;
     public final long trackedMemoryPeakBytes;
+    public final String numericSortFastPathMode;
+    public final boolean numericSortFastPathUsed;
 
     // ── Timing (milliseconds) ──────────────────────────────────────────────────
     public final long elapsedMs;
     public final long sortMs;
     public final long writeMs;
+    public final long dataBlockEncodeMs;
+    public final long dataBlockCompressMs;
+    public final long dataBlockWriteMs;
+    public final long leafIndexWriteMs;
+    public final long bloomChunkWriteMs;
+    public final long loadOnOpenWriteMs;
+
+    public final long dataBlockCount;
+    public final long leafIndexBlockCount;
+    public final long bloomChunkFlushCount;
+    public final long loadOnOpenBlockCount;
 
     // ── Error code constants (mirror HFileSDK) ─────────────────────────────────
     public static final int OK                   = 0;
@@ -67,8 +80,15 @@ public final class ConvertResult {
                           long duplicateKeyCount,
                           long memoryBudgetBytes,
                           long trackedMemoryPeakBytes,
+                          String numericSortFastPathMode,
+                          boolean numericSortFastPathUsed,
                           long hfileSizeBytes,
-                          long elapsedMs, long sortMs, long writeMs) {
+                          long elapsedMs, long sortMs, long writeMs,
+                          long dataBlockEncodeMs, long dataBlockCompressMs,
+                          long dataBlockWriteMs, long leafIndexWriteMs,
+                          long bloomChunkWriteMs, long loadOnOpenWriteMs,
+                          long dataBlockCount, long leafIndexBlockCount,
+                          long bloomChunkFlushCount, long loadOnOpenBlockCount) {
         this.errorCode        = errorCode;
         this.errorMessage     = errorMessage;
         this.arrowBatchesRead = arrowBatchesRead;
@@ -78,10 +98,22 @@ public final class ConvertResult {
         this.duplicateKeyCount = duplicateKeyCount;
         this.memoryBudgetBytes = memoryBudgetBytes;
         this.trackedMemoryPeakBytes = trackedMemoryPeakBytes;
+        this.numericSortFastPathMode = numericSortFastPathMode;
+        this.numericSortFastPathUsed = numericSortFastPathUsed;
         this.hfileSizeBytes   = hfileSizeBytes;
         this.elapsedMs        = elapsedMs;
         this.sortMs           = sortMs;
         this.writeMs          = writeMs;
+        this.dataBlockEncodeMs = dataBlockEncodeMs;
+        this.dataBlockCompressMs = dataBlockCompressMs;
+        this.dataBlockWriteMs = dataBlockWriteMs;
+        this.leafIndexWriteMs = leafIndexWriteMs;
+        this.bloomChunkWriteMs = bloomChunkWriteMs;
+        this.loadOnOpenWriteMs = loadOnOpenWriteMs;
+        this.dataBlockCount = dataBlockCount;
+        this.leafIndexBlockCount = leafIndexBlockCount;
+        this.bloomChunkFlushCount = bloomChunkFlushCount;
+        this.loadOnOpenBlockCount = loadOnOpenBlockCount;
     }
 
     /** Returns {@code true} if the conversion completed without error. */
@@ -140,7 +172,9 @@ public final class ConvertResult {
      */
     static ConvertResult fromJson(String json, int sdkRc) {
         if (json == null || json.isBlank() || json.equals("{}")) {
-            return new ConvertResult(sdkRc, "", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+            return new ConvertResult(
+                sdkRc, "", 0, 0, 0, 0, 0, 0, 0, "auto", false, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
         }
         return new ConvertResult(
             (int) parseLong(json, "error_code",          sdkRc),
@@ -152,16 +186,30 @@ public final class ConvertResult {
             parseLong(json, "duplicate_key_count",        0),
             parseLong(json, "memory_budget_bytes",        0),
             parseLong(json, "tracked_memory_peak_bytes",  0),
+            parseString(json, "numeric_sort_fast_path_mode", "auto"),
+            parseBoolean(json, "numeric_sort_fast_path_used", false),
             parseLong(json, "hfile_size_bytes",           0),
             parseLong(json, "elapsed_ms",                 0),
             parseLong(json, "sort_ms",                    0),
-            parseLong(json, "write_ms",                   0)
+            parseLong(json, "write_ms",                   0),
+            parseLong(json, "data_block_encode_ms",       0),
+            parseLong(json, "data_block_compress_ms",     0),
+            parseLong(json, "data_block_write_ms",        0),
+            parseLong(json, "leaf_index_write_ms",        0),
+            parseLong(json, "bloom_chunk_write_ms",       0),
+            parseLong(json, "load_on_open_write_ms",      0),
+            parseLong(json, "data_block_count",           0),
+            parseLong(json, "leaf_index_block_count",     0),
+            parseLong(json, "bloom_chunk_flush_count",    0),
+            parseLong(json, "load_on_open_block_count",   0)
         );
     }
 
     /** Construct a result representing a pre-convert failure (bad args, etc.). */
     static ConvertResult ofError(int code, String message) {
-        return new ConvertResult(code, message, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        return new ConvertResult(
+            code, message, 0, 0, 0, 0, 0, 0, 0, "auto", false, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
     }
 
     // ── Internal JSON helpers ──────────────────────────────────────────────────
@@ -216,6 +264,17 @@ public final class ConvertResult {
             }
         }
         return sb.toString();
+    }
+
+    private static boolean parseBoolean(String json, String key, boolean defaultValue) {
+        String tag = "\"" + key + "\":";
+        int idx = json.indexOf(tag);
+        if (idx < 0) return defaultValue;
+        int start = idx + tag.length();
+        while (start < json.length() && json.charAt(start) == ' ') start++;
+        if (json.startsWith("true", start)) return true;
+        if (json.startsWith("false", start)) return false;
+        return defaultValue;
     }
 
     private static String humanBytes(long bytes) {

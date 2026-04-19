@@ -80,6 +80,61 @@ public class HFileSDKIntegrationTest {
     }
 
     @Test
+    void configureRejectsNegativeCompressionPipelineSettings() {
+        HFileSDK sdk = new HFileSDK();
+
+        int threadRc = sdk.configure("{\"compression_threads\":-1}");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, threadRc);
+        assertTrue(sdk.getLastResult().contains("compression_threads"));
+
+        int queueRc = sdk.configure("{\"compression_queue_depth\":-1}");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, queueRc);
+        assertTrue(sdk.getLastResult().contains("compression_queue_depth"));
+    }
+
+    @Test
+    void configureAcceptsCompressionPipelineSettings() {
+        HFileSDK sdk = new HFileSDK();
+        int rc = sdk.configure("""
+            {
+              "compression":"GZ",
+              "compression_threads":2,
+              "compression_queue_depth":4,
+              "numeric_sort_fast_path":"on"
+            }
+            """);
+        assertEquals(HFileSDK.OK, rc);
+    }
+
+    @Test
+    void configureRejectsInvalidNumericSortFastPathMode() {
+        HFileSDK sdk = new HFileSDK();
+        int rc = sdk.configure("{\"numeric_sort_fast_path\":\"maybe\"}");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, rc);
+        assertTrue(sdk.getLastResult().contains("numeric_sort_fast_path"));
+    }
+
+    @Test
+    void configureFailureDoesNotPartiallyApplyNumericSortFastPath(@TempDir java.nio.file.Path tempDir) throws Exception {
+        java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");
+        writeArrowStream(arrowPath, List.of("row2", "row1"), List.of("value2", "value1"));
+
+        HFileSDK sdk = new HFileSDK();
+        assertEquals(HFileSDK.OK, sdk.configure("{\"numeric_sort_fast_path\":\"off\"}"));
+
+        int rc = sdk.configure("{\"numeric_sort_fast_path\":\"on\",\"default_timestamp_ms\":-1}");
+        assertEquals(HFileSDK.INVALID_ARGUMENT, rc);
+        assertTrue(sdk.getLastResult().contains("default_timestamp_ms"));
+
+        assertEquals(HFileSDK.OK, sdk.convert(
+            arrowPath.toString(),
+            hfilePath.toString(),
+            "test_table",
+            "ID,0,false,0"));
+    }
+
+    @Test
     void configureAcceptsFixedDefaultTimestamp(@TempDir java.nio.file.Path tempDir) throws Exception {
         java.nio.file.Path arrowPath = tempDir.resolve("input.arrow");
         java.nio.file.Path hfilePath = tempDir.resolve("output.hfile");

@@ -14,6 +14,7 @@ import java.util.List;
 
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.memory.RootAllocator;
+import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorSchemaRoot;
 import org.apache.arrow.vector.ipc.ArrowStreamWriter;
@@ -75,6 +76,9 @@ final class BulkLoadPerfRunnerTest {
         assertTrue(json.contains("\"process_user_cpu_ms\":"));
         assertTrue(json.contains("\"process_exit_code\":0"));
         assertTrue(json.contains("\"process_control_mode\":"));
+        assertTrue(json.contains("\"jni_sdk_compression_threads\": 0"));
+        assertTrue(json.contains("\"jni_sdk_compression_queue_depth\": 0"));
+        assertTrue(json.contains("\"jni_sdk_numeric_sort_fast_path\": \"auto\""));
         assertFalse(Files.exists(tempDir.resolve("single-001mb")));
     }
 
@@ -126,9 +130,9 @@ final class BulkLoadPerfRunnerTest {
         Path outputDir = tempDir.resolve("output");
         Path resultJson = tempDir.resolve("worker-result.json");
         Files.createDirectories(inputDir);
-        writeArrowStream(inputDir.resolve("part-000.arrow"), 4096, 1024);
-        writeArrowStream(inputDir.resolve("part-001.arrow"), 4096, 1024);
-        writeArrowStream(inputDir.resolve("part-002.arrow"), 4096, 1024);
+        writeNumericArrowStream(inputDir.resolve("part-000.arrow"), 4096, 1024, "REFID");
+        writeNumericArrowStream(inputDir.resolve("part-001.arrow"), 4096, 1024, "REFID");
+        writeNumericArrowStream(inputDir.resolve("part-002.arrow"), 4096, 1024, "REFID");
         assertTrue(Files.size(inputDir.resolve("part-000.arrow")) > 1024 * 1024);
         assertTrue(Files.size(inputDir.resolve("part-001.arrow")) > 1024 * 1024);
         assertTrue(Files.size(inputDir.resolve("part-002.arrow")) > 1024 * 1024);
@@ -161,8 +165,14 @@ final class BulkLoadPerfRunnerTest {
         command.add("1");
         command.add("--jni-sdk-max-memory-mb");
         command.add("64");
+        command.add("--jni-sdk-compression-threads");
+        command.add("2");
+        command.add("--jni-sdk-compression-queue-depth");
+        command.add("4");
+        command.add("--jni-sdk-numeric-sort-fast-path");
+        command.add("on");
         command.add("--rule");
-        command.add("USER_ID,0,false,0");
+        command.add("REFID,0,false,15");
         command.add("--cf");
         command.add("cf");
         command.add("--compression");
@@ -185,6 +195,9 @@ final class BulkLoadPerfRunnerTest {
         assertTrue(json.contains("\"success\":true"), json);
         assertTrue(json.contains("\"strategy\":\"PARALLEL-CONVERT\""), json);
         assertTrue(json.contains("\"worker_parallelism\":3"), json);
+        assertTrue(json.contains("\"sdk_numeric_sort_fast_path_mode\":\"on\""), json);
+        assertTrue(json.contains("\"sdk_numeric_sort_fast_path_used\":true"), json);
+        assertTrue(Files.exists(outputDir.resolve("cf")), "worker should still produce directory outputs");
     }
 
     private static void writeArrowStream(Path path,
@@ -221,6 +234,33 @@ final class BulkLoadPerfRunnerTest {
             values.add(payload + i);
         }
         writeArrowStream(path, ids, values);
+    }
+
+    private static void writeNumericArrowStream(Path path,
+                                                int rowCount,
+                                                int payloadBytes,
+                                                String idColumnName) throws Exception {
+        try (BufferAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             BigIntVector idVector = new BigIntVector(idColumnName, allocator);
+             VarCharVector valueVector = new VarCharVector("VALUE", allocator)) {
+            idVector.allocateNew(rowCount);
+            valueVector.allocateNew(rowCount * (payloadBytes + 16L), rowCount);
+            String payload = "x".repeat(payloadBytes);
+            for (int i = 0; i < rowCount; i++) {
+                idVector.setSafe(i, i);
+                valueVector.setSafe(i, (payload + i).getBytes(StandardCharsets.UTF_8));
+            }
+            idVector.setValueCount(rowCount);
+            valueVector.setValueCount(rowCount);
+            try (VectorSchemaRoot root = new VectorSchemaRoot(List.of(idVector, valueVector));
+                 ArrowStreamWriter writer = new ArrowStreamWriter(
+                     root, null, Channels.newChannel(Files.newOutputStream(path)))) {
+                root.setRowCount(rowCount);
+                writer.start();
+                writer.writeBatch();
+                writer.end();
+            }
+        }
     }
 
     private static Path findNativeLib() {

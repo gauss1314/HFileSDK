@@ -52,6 +52,9 @@ public final class ConvertOptions {
     private final String errorPolicy;
     private final int    blockSize;
     private final long   maxMemoryBytes;
+    private final int    compressionThreads;
+    private final int    compressionQueueDepth;
+    private final String numericSortFastPath;
     private final long   defaultTimestampMs;
 
     // ── Column exclusion ──────────────────────────────────────────────────────
@@ -75,6 +78,9 @@ public final class ConvertOptions {
         this.errorPolicy            = b.errorPolicy;
         this.blockSize              = b.blockSize;
         this.maxMemoryBytes         = requireNonNegative(b.maxMemoryBytes, "maxMemoryBytes");
+        this.compressionThreads     = (int) requireNonNegative(b.compressionThreads, "compressionThreads");
+        this.compressionQueueDepth  = (int) requireNonNegative(b.compressionQueueDepth, "compressionQueueDepth");
+        this.numericSortFastPath    = normalizeNumericSortFastPath(b.numericSortFastPath);
         this.defaultTimestampMs     = requireNonNegative(b.defaultTimestampMs, "defaultTimestampMs");
         this.excludedColumns        = Collections.unmodifiableList(new ArrayList<>(b.excludedColumns));
         this.excludedColumnPrefixes = Collections.unmodifiableList(new ArrayList<>(b.excludedColumnPrefixes));
@@ -92,6 +98,15 @@ public final class ConvertOptions {
         return v;
     }
 
+    private static String normalizeNumericSortFastPath(String value) {
+        String normalized = value == null ? "auto" : value.trim().toLowerCase();
+        if (normalized.isEmpty()) normalized = "auto";
+        if (!normalized.equals("auto") && !normalized.equals("on") && !normalized.equals("off")) {
+            throw new IllegalArgumentException("numericSortFastPath must be one of: auto|on|off");
+        }
+        return normalized;
+    }
+
     // ── Accessors ─────────────────────────────────────────────────────────────
 
     public String       arrowPath()                { return arrowPath; }
@@ -107,6 +122,9 @@ public final class ConvertOptions {
     public String       errorPolicy()              { return errorPolicy; }
     public int          blockSize()                { return blockSize; }
     public long         maxMemoryBytes()           { return maxMemoryBytes; }
+    public int          compressionThreads()       { return compressionThreads; }
+    public int          compressionQueueDepth()    { return compressionQueueDepth; }
+    public String       numericSortFastPath()      { return numericSortFastPath; }
     public long         defaultTimestampMs()       { return defaultTimestampMs; }
     public List<String> excludedColumns()          { return excludedColumns; }
     public List<String> excludedColumnPrefixes()   { return excludedColumnPrefixes; }
@@ -134,6 +152,18 @@ public final class ConvertOptions {
         if (maxMemoryBytes > 0) {
             if (sb.length() > 1) sb.append(',');
             sb.append("\"max_memory_bytes\":").append(maxMemoryBytes);
+        }
+        if (compressionThreads > 0) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"compression_threads\":").append(compressionThreads);
+        }
+        if (compressionQueueDepth > 0) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"compression_queue_depth\":").append(compressionQueueDepth);
+        }
+        if (!numericSortFastPath.equals("auto")) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"numeric_sort_fast_path\":\"").append(numericSortFastPath).append('"');
         }
         if (defaultTimestampMs > 0) {
             if (sb.length() > 1) sb.append(',');
@@ -183,6 +213,9 @@ public final class ConvertOptions {
         private String errorPolicy       = "skip_row";
         private int    blockSize         = 65536;
         private long   maxMemoryBytes;
+        private int    compressionThreads;
+        private int    compressionQueueDepth;
+        private String numericSortFastPath = "auto";
         private long   defaultTimestampMs;
         private final ArrayList<String> excludedColumns        = new ArrayList<>();
         private final ArrayList<String> excludedColumnPrefixes = new ArrayList<>();
@@ -222,6 +255,9 @@ public final class ConvertOptions {
         public Builder errorPolicy(String v)       { errorPolicy = v;       return this; }
         public Builder blockSize(int v)            { blockSize = v;         return this; }
         public Builder maxMemoryBytes(long v)      { maxMemoryBytes = v;    return this; }
+        public Builder compressionThreads(int v)   { compressionThreads = v; return this; }
+        public Builder compressionQueueDepth(int v){ compressionQueueDepth = v; return this; }
+        public Builder numericSortFastPath(String v){ numericSortFastPath = v; return this; }
         public Builder defaultTimestampMs(long v)  { defaultTimestampMs = v; return this; }
 
         /**
@@ -272,6 +308,7 @@ public final class ConvertOptions {
                ", hfile=" + hfilePath +
                ", cf=" + columnFamily +
                ", compression=" + compression +
+               ", numericSortFastPath=" + numericSortFastPath +
                (excludedColumnPrefixes.isEmpty() ? "" : ", excludePfx=" + excludedColumnPrefixes) +
                (excludedColumns.isEmpty()        ? "" : ", excludeCols=" + excludedColumns) + "}";
     }

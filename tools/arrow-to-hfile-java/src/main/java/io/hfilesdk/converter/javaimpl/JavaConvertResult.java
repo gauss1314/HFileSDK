@@ -21,6 +21,8 @@ public final class JavaConvertResult {
     public final long kvWrittenCount;
     public final long hfileSizeBytes;
     public final long elapsedMs;
+    public final long sortMs;
+    public final long writeMs;
 
     private JavaConvertResult(
         int errorCode,
@@ -30,7 +32,9 @@ public final class JavaConvertResult {
         long rowsRead,
         long kvWrittenCount,
         long hfileSizeBytes,
-        long elapsedMs
+        long elapsedMs,
+        long sortMs,
+        long writeMs
     ) {
         this.errorCode = errorCode;
         this.errorMessage = errorMessage == null ? "" : errorMessage;
@@ -40,14 +44,33 @@ public final class JavaConvertResult {
         this.kvWrittenCount = kvWrittenCount;
         this.hfileSizeBytes = hfileSizeBytes;
         this.elapsedMs = elapsedMs;
+        this.sortMs = sortMs;
+        this.writeMs = writeMs;
     }
 
-    public static JavaConvertResult success(String arrowPath, String hfilePath, long rowsRead, long kvWrittenCount, long hfileSizeBytes, long elapsedMs) {
-        return new JavaConvertResult(OK, "", arrowPath, hfilePath, rowsRead, kvWrittenCount, hfileSizeBytes, elapsedMs);
+    public static JavaConvertResult success(String arrowPath,
+                                            String hfilePath,
+                                            long rowsRead,
+                                            long kvWrittenCount,
+                                            long hfileSizeBytes,
+                                            long elapsedMs,
+                                            long sortMs,
+                                            long writeMs) {
+        return new JavaConvertResult(
+            OK, "", arrowPath, hfilePath, rowsRead, kvWrittenCount, hfileSizeBytes, elapsedMs, sortMs, writeMs);
     }
 
-    public static JavaConvertResult error(int errorCode, String errorMessage, String arrowPath, String hfilePath, long rowsRead, long kvWrittenCount, long elapsedMs) {
-        return new JavaConvertResult(errorCode, errorMessage, arrowPath, hfilePath, rowsRead, kvWrittenCount, 0L, elapsedMs);
+    public static JavaConvertResult error(int errorCode,
+                                          String errorMessage,
+                                          String arrowPath,
+                                          String hfilePath,
+                                          long rowsRead,
+                                          long kvWrittenCount,
+                                          long elapsedMs,
+                                          long sortMs,
+                                          long writeMs) {
+        return new JavaConvertResult(
+            errorCode, errorMessage, arrowPath, hfilePath, rowsRead, kvWrittenCount, 0L, elapsedMs, sortMs, writeMs);
     }
 
     public boolean isSuccess() {
@@ -70,7 +93,7 @@ public final class JavaConvertResult {
                 kvWrittenCount,
                 hfileSizeBytes / 1024.0 / 1024.0,
                 elapsedMs
-            );
+            ) + String.format(Locale.ROOT, " sort=%dms write=%dms", sortMs, writeMs);
         }
         return "errorCode=" + errorCode + ", errorMessage=" + errorMessage;
     }
@@ -84,7 +107,9 @@ public final class JavaConvertResult {
             + "\"rows_read\":" + rowsRead + ","
             + "\"kv_written_count\":" + kvWrittenCount + ","
             + "\"hfile_size_bytes\":" + hfileSizeBytes + ","
-            + "\"elapsed_ms\":" + elapsedMs
+            + "\"elapsed_ms\":" + elapsedMs + ","
+            + "\"sort_ms\":" + sortMs + ","
+            + "\"write_ms\":" + writeMs
             + "}";
     }
 

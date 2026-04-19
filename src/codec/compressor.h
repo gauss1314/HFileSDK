@@ -26,6 +26,19 @@ public:
         uint8_t*                 output,
         size_t                   output_capacity) const noexcept = 0;
 
+    /// Compress `input` into `output` using a caller-provided CRC32 for the
+    /// uncompressed payload when the codec can use it (currently GZip trailer).
+    /// The default implementation ignores `precomputed_crc32` and falls back to
+    /// `compress()`.
+    virtual size_t compress_with_crc32(
+        std::span<const uint8_t> input,
+        uint8_t*                 output,
+        size_t                   output_capacity,
+        uint32_t                 precomputed_crc32) const noexcept {
+        (void)precomputed_crc32;
+        return compress(input, output, output_capacity);
+    }
+
     /// Decompress (for validation / testing).
     virtual Status decompress(
         std::span<const uint8_t> compressed,

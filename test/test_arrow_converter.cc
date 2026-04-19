@@ -824,6 +824,347 @@ TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
     fs::remove_all(dir);
 }
 
+TEST(ArrowConverter, ConvertSupportsZeroLeftPaddedNumericRowKey) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(12));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+
+    std::shared_ptr<arrow::Array> id_arr, city_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {id_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,5";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_EQ(result.numeric_sort_fast_path_mode, NumericSortFastPathMode::On);
+    EXPECT_TRUE(result.numeric_sort_fast_path_used);
+    ASSERT_TRUE(fs::exists(hfile_path));
+
+    auto file_bytes = read_file(hfile_path);
+    auto blocks = scan_blocks(file_bytes);
+
+    std::string data_blocks;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*") continue;
+        data_blocks.append(
+            reinterpret_cast<const char*>(block.payload.data()),
+            block.payload.size());
+    }
+
+    auto row2_pos = data_blocks.find("00002");
+    auto row12_pos = data_blocks.find("00012");
+    ASSERT_NE(row2_pos, std::string::npos);
+    ASSERT_NE(row12_pos, std::string::npos);
+    EXPECT_LT(row2_pos, row12_pos);
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(12));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+    ARROW_EXPECT_OK(city_builder.Append("aa"));
+
+    std::shared_ptr<arrow::Array> id_arr, city_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 3, {id_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,5#CITY,1,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_EQ(result.numeric_sort_fast_path_mode, NumericSortFastPathMode::On);
+    EXPECT_TRUE(result.numeric_sort_fast_path_used);
+    ASSERT_TRUE(fs::exists(hfile_path));
+
+    auto file_bytes = read_file(hfile_path);
+    auto blocks = scan_blocks(file_bytes);
+
+    std::string data_blocks;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*") continue;
+        data_blocks.append(
+            reinterpret_cast<const char*>(block.payload.data()),
+            block.payload.size());
+    }
+
+    auto row2aa_pos = data_blocks.find("00002aa");
+    auto row2sh_pos = data_blocks.find("00002sh");
+    auto row12hz_pos = data_blocks.find("00012hz");
+    ASSERT_NE(row2aa_pos, std::string::npos);
+    ASSERT_NE(row2sh_pos, std::string::npos);
+    ASSERT_NE(row12hz_pos, std::string::npos);
+    EXPECT_LT(row2aa_pos, row2sh_pos);
+    EXPECT_LT(row2sh_pos, row12hz_pos);
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertFallsBackForNegativeNumericRowKeyValues) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(-2));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(id_builder.Append(-10));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+    ARROW_EXPECT_OK(city_builder.Append("bj"));
+
+    std::shared_ptr<arrow::Array> id_arr, city_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 3, {id_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,5";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_EQ(result.numeric_sort_fast_path_mode, NumericSortFastPathMode::Auto);
+    EXPECT_FALSE(result.numeric_sort_fast_path_used);
+    ASSERT_TRUE(fs::exists(hfile_path));
+
+    auto file_bytes = read_file(hfile_path);
+    auto blocks = scan_blocks(file_bytes);
+
+    std::string data_blocks;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*") continue;
+        data_blocks.append(
+            reinterpret_cast<const char*>(block.payload.data()),
+            block.payload.size());
+    }
+
+    auto row_neg10_pos = data_blocks.find("00-10");
+    auto row_neg2_pos = data_blocks.find("000-2");
+    auto row_pos2_pos = data_blocks.find("00002");
+    ASSERT_NE(row_neg10_pos, std::string::npos);
+    ASSERT_NE(row_neg2_pos, std::string::npos);
+    ASSERT_NE(row_pos2_pos, std::string::npos);
+    EXPECT_LT(row_neg10_pos, row_neg2_pos);
+    EXPECT_LT(row_neg2_pos, row_pos2_pos);
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertFallsBackWhenNumericValueExceedsPadLength) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(999));
+    ARROW_EXPECT_OK(id_builder.Append(1000));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+    ARROW_EXPECT_OK(city_builder.Append("bj"));
+
+    std::shared_ptr<arrow::Array> id_arr, city_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 3, {id_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,3";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_EQ(result.numeric_sort_fast_path_mode, NumericSortFastPathMode::Auto);
+    EXPECT_FALSE(result.numeric_sort_fast_path_used);
+    ASSERT_TRUE(fs::exists(hfile_path));
+
+    auto file_bytes = read_file(hfile_path);
+    auto blocks = scan_blocks(file_bytes);
+
+    std::string data_blocks;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*") continue;
+        data_blocks.append(
+            reinterpret_cast<const char*>(block.payload.data()),
+            block.payload.size());
+    }
+
+    auto row2_pos = data_blocks.find("002");
+    auto row1000_pos = data_blocks.find("1000");
+    auto row999_pos = data_blocks.find("999");
+    ASSERT_NE(row2_pos, std::string::npos);
+    ASSERT_NE(row1000_pos, std::string::npos);
+    ASSERT_NE(row999_pos, std::string::npos);
+    EXPECT_LT(row2_pos, row1000_pos);
+    EXPECT_LT(row1000_pos, row999_pos);
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValuesAreNegative) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(-2));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+
+    std::shared_ptr<arrow::Array> id_arr, city_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {id_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,5";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::INVALID_ARGUMENT);
+    EXPECT_NE(result.error_message.find("numeric_sort_fast_path=on"), std::string::npos);
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValueExceedsPadLength) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder city_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(999));
+    ARROW_EXPECT_OK(id_builder.Append(1000));
+    ARROW_EXPECT_OK(city_builder.Append("hz"));
+    ARROW_EXPECT_OK(city_builder.Append("sh"));
+
+    std::shared_ptr<arrow::Array> id_arr, city_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(city_builder.Finish(&city_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("city", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 2, {id_arr, city_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,3";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::INVALID_ARGUMENT);
+    EXPECT_NE(result.error_message.find("fit the configured padLen"), std::string::npos);
+
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, WideTableRejectsUnsupportedValueType) {
     arrow::StringBuilder rk_builder;
     arrow::ListBuilder list_builder(arrow::default_memory_pool(),

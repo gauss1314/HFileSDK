@@ -148,6 +148,9 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("jni-xmx-mb").hasArg().argName("MB").desc("JNI worker JVM -Xmx").build());
         options.addOption(Option.builder().longOpt("jni-direct-memory-mb").hasArg().argName("MB").desc("JNI worker JVM MaxDirectMemorySize").build());
         options.addOption(Option.builder().longOpt("jni-sdk-max-memory-mb").hasArg().argName("MB").desc("JNI/C++ SDK 内部 soft budget").build());
+        options.addOption(Option.builder().longOpt("jni-sdk-compression-threads").hasArg().argName("N").desc("JNI/C++ SDK 数据块压缩后台线程数；0 表示关闭流水线").build());
+        options.addOption(Option.builder().longOpt("jni-sdk-compression-queue-depth").hasArg().argName("N").desc("JNI/C++ SDK 压缩流水线最大 in-flight block 数；0 表示自动").build());
+        options.addOption(Option.builder().longOpt("jni-sdk-numeric-sort-fast-path").hasArg().argName("MODE").desc("JNI/C++ SDK 数值 row key 排序快路径：auto|on|off").build());
         options.addOption(Option.builder().longOpt("java-xmx-mb").hasArg().argName("MB").desc("纯 Java worker JVM -Xmx").build());
         options.addOption(Option.builder().longOpt("java-direct-memory-mb").hasArg().argName("MB").desc("纯 Java worker JVM MaxDirectMemorySize").build());
         options.addOption(Option.builder().longOpt("keep-generated-files").desc("保留中间产物").build());
@@ -210,9 +213,23 @@ public final class BulkLoadPerfRunner {
             parseNonNegativeLong(commandLine.getOptionValue("jni-xmx-mb", "0"), "jni-xmx-mb"),
             parseNonNegativeLong(commandLine.getOptionValue("jni-direct-memory-mb", "0"), "jni-direct-memory-mb"),
             parseNonNegativeLong(commandLine.getOptionValue("jni-sdk-max-memory-mb", "0"), "jni-sdk-max-memory-mb"),
+            parseNonNegativeLong(commandLine.getOptionValue("jni-sdk-compression-threads", "0"), "jni-sdk-compression-threads"),
+            parseNonNegativeLong(commandLine.getOptionValue("jni-sdk-compression-queue-depth", "0"), "jni-sdk-compression-queue-depth"),
+            normalizeNumericSortFastPathMode(commandLine.getOptionValue("jni-sdk-numeric-sort-fast-path", "auto")),
             parseNonNegativeLong(commandLine.getOptionValue("java-xmx-mb", "0"), "java-xmx-mb"),
             parseNonNegativeLong(commandLine.getOptionValue("java-direct-memory-mb", "0"), "java-direct-memory-mb")
         );
+    }
+
+    private static String normalizeNumericSortFastPathMode(String raw) {
+        String normalized = raw == null ? "auto" : raw.trim().toLowerCase(Locale.ROOT);
+        if (normalized.isEmpty()) {
+            normalized = "auto";
+        }
+        if (!normalized.equals("auto") && !normalized.equals("on") && !normalized.equals("off")) {
+            throw new IllegalArgumentException("jni-sdk-numeric-sort-fast-path must be one of: auto|on|off");
+        }
+        return normalized;
     }
 
     private static String resolveDefaultRowKeyRule(String tableName, boolean workerMode, String rawRule) {
@@ -371,6 +388,8 @@ public final class BulkLoadPerfRunner {
                 implementation.equals(IMPL_JNI) ? config.parallelism() : 1,
                 0L,
                 0L,
+                implementation.equals(IMPL_JNI) ? config.jniSdkNumericSortFastPath() : "off",
+                false,
                 "{}"
             );
         }
@@ -392,6 +411,8 @@ public final class BulkLoadPerfRunner {
             workerResult.workerParallelism(),
             workerResult.sdkMemoryBudgetBytes(),
             workerResult.sdkTrackedMemoryPeakBytes(),
+            workerResult.sdkNumericSortFastPathMode(),
+            workerResult.sdkNumericSortFastPathUsed(),
             launch.controlMode(),
             launch.controlNote(),
             workerResult.detailJson()
@@ -432,6 +453,8 @@ public final class BulkLoadPerfRunner {
                 implementation.equals(IMPL_JNI) ? config.parallelism() : 1,
                 0L,
                 0L,
+                implementation.equals(IMPL_JNI) ? config.jniSdkNumericSortFastPath() : "off",
+                false,
                 "{}"
             );
         }
@@ -476,6 +499,9 @@ public final class BulkLoadPerfRunner {
             .blockSize(config.blockSize())
             .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
             .maxMemoryBytes(sdkMaxMemoryBytes)
+            .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
+            .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
+            .numericSortFastPath(config.jniSdkNumericSortFastPath())
             // Preserve JNI directory-conversion semantics: a worker may still
             // convert multiple Arrow files according to the configured parallelism.
             .parallelism(config.parallelism())
@@ -492,9 +518,11 @@ public final class BulkLoadPerfRunner {
 
         long sdkBudgetBytes = 0L;
         long sdkPeakBytes = 0L;
+        boolean sdkNumericSortFastPathUsed = false;
         for (ConvertResult result : batchResult.results.values()) {
             sdkBudgetBytes = Math.max(sdkBudgetBytes, result.memoryBudgetBytes);
             sdkPeakBytes = Math.max(sdkPeakBytes, result.trackedMemoryPeakBytes);
+            sdkNumericSortFastPathUsed = sdkNumericSortFastPathUsed || result.numericSortFastPathUsed;
         }
 
         return new WorkerResult(
@@ -510,6 +538,8 @@ public final class BulkLoadPerfRunner {
             config.parallelism(),
             sdkBudgetBytes,
             sdkPeakBytes,
+            config.jniSdkNumericSortFastPath(),
+            sdkNumericSortFastPathUsed,
             batchConvertResultToJson(strategy, batchResult)
         );
     }
@@ -537,6 +567,9 @@ public final class BulkLoadPerfRunner {
                 .blockSize(config.blockSize())
                 .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
                 .maxMemoryBytes(sdkMaxMemoryBytes)
+                .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
+                .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
+                .numericSortFastPath(config.jniSdkNumericSortFastPath())
                 .nativeLibPath(config.nativeLib())
                 .build()
         );
@@ -548,6 +581,8 @@ public final class BulkLoadPerfRunner {
             + "\"kv_written_count\":" + result.kvWrittenCount + ","
             + "\"memory_budget_bytes\":" + result.memoryBudgetBytes + ","
             + "\"tracked_memory_peak_bytes\":" + result.trackedMemoryPeakBytes + ","
+            + "\"numeric_sort_fast_path_mode\":\"" + jsonEscape(result.numericSortFastPathMode) + "\","
+            + "\"numeric_sort_fast_path_used\":" + result.numericSortFastPathUsed + ","
             + "\"hfile_size_bytes\":" + result.hfileSizeBytes + ","
             + "\"elapsed_ms\":" + result.elapsedMs
             + "}";
@@ -564,6 +599,8 @@ public final class BulkLoadPerfRunner {
             config.parallelism(),
             result.memoryBudgetBytes,
             result.trackedMemoryPeakBytes,
+            result.numericSortFastPathMode,
+            result.numericSortFastPathUsed,
             detailJson
         );
     }
@@ -612,6 +649,8 @@ public final class BulkLoadPerfRunner {
                     1,
                     0L,
                     0L,
+                    "off",
+                    false,
                     "[" + String.join(",", resultJsons) + "]"
                 );
             }
@@ -632,6 +671,8 @@ public final class BulkLoadPerfRunner {
             1,
             0L,
             0L,
+            "off",
+            false,
             "[" + String.join(",", resultJsons) + "]"
         );
     }
@@ -701,6 +742,18 @@ public final class BulkLoadPerfRunner {
         if (config.jniSdkMaxMemoryMb() > 0) {
             command.add("--jni-sdk-max-memory-mb");
             command.add(Long.toString(config.jniSdkMaxMemoryMb()));
+        }
+        if (config.jniSdkCompressionThreads() > 0) {
+            command.add("--jni-sdk-compression-threads");
+            command.add(Long.toString(config.jniSdkCompressionThreads()));
+        }
+        if (config.jniSdkCompressionQueueDepth() > 0) {
+            command.add("--jni-sdk-compression-queue-depth");
+            command.add(Long.toString(config.jniSdkCompressionQueueDepth()));
+        }
+        if (!config.jniSdkNumericSortFastPath().equals("auto")) {
+            command.add("--jni-sdk-numeric-sort-fast-path");
+            command.add(config.jniSdkNumericSortFastPath());
         }
         return command;
     }
@@ -1035,6 +1088,8 @@ public final class BulkLoadPerfRunner {
             builder.append("\"kv_written_count\":").append(result.kvWrittenCount).append(",");
             builder.append("\"memory_budget_bytes\":").append(result.memoryBudgetBytes).append(",");
             builder.append("\"tracked_memory_peak_bytes\":").append(result.trackedMemoryPeakBytes).append(",");
+            builder.append("\"numeric_sort_fast_path_mode\":\"").append(jsonEscape(result.numericSortFastPathMode)).append("\",");
+            builder.append("\"numeric_sort_fast_path_used\":").append(result.numericSortFastPathUsed).append(",");
             builder.append("\"hfile_size_bytes\":").append(result.hfileSizeBytes).append(",");
             builder.append("\"elapsed_ms\":").append(result.elapsedMs);
             builder.append("}");
@@ -1274,6 +1329,9 @@ public final class BulkLoadPerfRunner {
         long jniXmxMb,
         long jniDirectMemoryMb,
         long jniSdkMaxMemoryMb,
+        long jniSdkCompressionThreads,
+        long jniSdkCompressionQueueDepth,
+        String jniSdkNumericSortFastPath,
         long javaXmxMb,
         long javaDirectMemoryMb
     ) {}
@@ -1309,6 +1367,8 @@ public final class BulkLoadPerfRunner {
         int workerParallelism,
         long sdkMemoryBudgetBytes,
         long sdkTrackedMemoryPeakBytes,
+        String sdkNumericSortFastPathMode,
+        boolean sdkNumericSortFastPathUsed,
         String detailJson
     ) {
         private static WorkerResult failure(String implementation,
@@ -1322,6 +1382,8 @@ public final class BulkLoadPerfRunner {
                                             int workerParallelism,
                                             long sdkMemoryBudgetBytes,
                                             long sdkTrackedMemoryPeakBytes,
+                                            String sdkNumericSortFastPathMode,
+                                            boolean sdkNumericSortFastPathUsed,
                                             String detailJson) {
             return new WorkerResult(
                 iterationIndex,
@@ -1336,6 +1398,8 @@ public final class BulkLoadPerfRunner {
                 workerParallelism,
                 sdkMemoryBudgetBytes,
                 sdkTrackedMemoryPeakBytes,
+                sdkNumericSortFastPathMode,
+                sdkNumericSortFastPathUsed,
                 detailJson
             );
         }
@@ -1354,6 +1418,8 @@ public final class BulkLoadPerfRunner {
                 + "\"worker_parallelism\":" + workerParallelism + ","
                 + "\"sdk_memory_budget_bytes\":" + sdkMemoryBudgetBytes + ","
                 + "\"sdk_tracked_memory_peak_bytes\":" + sdkTrackedMemoryPeakBytes + ","
+                + "\"sdk_numeric_sort_fast_path_mode\":\"" + jsonEscape(sdkNumericSortFastPathMode) + "\","
+                + "\"sdk_numeric_sort_fast_path_used\":" + sdkNumericSortFastPathUsed + ","
                 + "\"detail\":" + detailJson
                 + "}";
         }
@@ -1372,6 +1438,8 @@ public final class BulkLoadPerfRunner {
                 (int) parseLongField(json, "worker_parallelism", 1),
                 parseLongField(json, "sdk_memory_budget_bytes", 0),
                 parseLongField(json, "sdk_tracked_memory_peak_bytes", 0),
+                parseStringField(json, "sdk_numeric_sort_fast_path_mode", "auto"),
+                parseBooleanField(json, "sdk_numeric_sort_fast_path_used", false),
                 parseTrailingJsonValue(json, "detail", "{}")
             );
         }
@@ -1394,6 +1462,8 @@ public final class BulkLoadPerfRunner {
         int workerParallelism,
         long sdkMemoryBudgetBytes,
         long sdkTrackedMemoryPeakBytes,
+        String sdkNumericSortFastPathMode,
+        boolean sdkNumericSortFastPathUsed,
         String processControlMode,
         String processControlNote,
         String detailJson
@@ -1416,6 +1486,8 @@ public final class BulkLoadPerfRunner {
                 + "\"worker_parallelism\":" + workerParallelism + ","
                 + "\"sdk_memory_budget_bytes\":" + sdkMemoryBudgetBytes + ","
                 + "\"sdk_tracked_memory_peak_bytes\":" + sdkTrackedMemoryPeakBytes + ","
+                + "\"sdk_numeric_sort_fast_path_mode\":\"" + jsonEscape(sdkNumericSortFastPathMode) + "\","
+                + "\"sdk_numeric_sort_fast_path_used\":" + sdkNumericSortFastPathUsed + ","
                 + "\"process_control_mode\":\"" + jsonEscape(processControlMode) + "\","
                 + "\"process_control_note\":\"" + jsonEscape(processControlNote) + "\","
                 + "\"detail\":" + detailJson
@@ -1500,6 +1572,9 @@ public final class BulkLoadPerfRunner {
             builder.append("  \"jni_xmx_mb\": ").append(config.jniXmxMb()).append(",\n");
             builder.append("  \"jni_direct_memory_mb\": ").append(config.jniDirectMemoryMb()).append(",\n");
             builder.append("  \"jni_sdk_max_memory_mb\": ").append(config.jniSdkMaxMemoryMb()).append(",\n");
+            builder.append("  \"jni_sdk_compression_threads\": ").append(config.jniSdkCompressionThreads()).append(",\n");
+            builder.append("  \"jni_sdk_compression_queue_depth\": ").append(config.jniSdkCompressionQueueDepth()).append(",\n");
+            builder.append("  \"jni_sdk_numeric_sort_fast_path\": \"").append(jsonEscape(config.jniSdkNumericSortFastPath())).append("\",\n");
             builder.append("  \"java_xmx_mb\": ").append(config.javaXmxMb()).append(",\n");
             builder.append("  \"java_direct_memory_mb\": ").append(config.javaDirectMemoryMb()).append(",\n");
             builder.append("  \"total_ms\": ").append(nanosToMillis(totalNanos)).append(",\n");

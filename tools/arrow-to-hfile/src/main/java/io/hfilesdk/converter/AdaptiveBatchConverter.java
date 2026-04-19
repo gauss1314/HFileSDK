@@ -259,6 +259,9 @@ public class AdaptiveBatchConverter {
                         .errorPolicy(opts.errorPolicy)
                         .blockSize(opts.blockSize)
                         .maxMemoryBytes(opts.maxMemoryBytes)
+                        .compressionThreads(opts.compressionThreads)
+                        .compressionQueueDepth(opts.compressionQueueDepth)
+                        .numericSortFastPath(opts.numericSortFastPath)
                         .excludedColumnPrefixes(opts.excludedColumnPrefixes)
                         .excludedColumns(opts.excludedColumns)
                         .build());

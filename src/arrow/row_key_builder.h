@@ -66,6 +66,9 @@ public:
     /// If any col_index is out of range, that segment is treated as empty string.
     std::string build(const std::vector<std::string_view>& fields);
     Status build_checked(const std::vector<std::string_view>& fields, std::string* out);
+    Status build_checked_from_segment(size_t start_segment_index,
+                                      const std::vector<std::string_view>& fields,
+                                      std::string* out);
 
     /// Maximum column index referenced by any segment (+1 = minimum field count).
     int max_col_index() const noexcept { return max_col_index_; }

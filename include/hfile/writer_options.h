@@ -117,6 +117,12 @@ struct WriterOptions {
     // ── Resource governance [Production] ──────────────────────────────────
     /// Maximum memory the writer may consume across buffers / AutoSort staging (0 = unlimited).
     size_t       max_memory_bytes  = 0;
+    /// Number of background threads used to compress data blocks.
+    /// 0 = disabled (fully synchronous current behavior).
+    uint32_t     compression_threads = 0;
+    /// Maximum number of compressed/unwritten data blocks allowed in flight.
+    /// 0 = auto (currently max(2, compression_threads * 2) when threads > 0).
+    uint32_t     compression_queue_depth = 0;
     /// Minimum free disk space required; writing stops if below this (0 = disabled).
     size_t       min_free_disk_bytes = 512ULL * 1024 * 1024;  // 512 MB
     /// Check disk space every N bytes written (0 = disable periodic check).

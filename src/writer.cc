@@ -18,11 +18,17 @@
 #include <cassert>
 #include <cstring>
 #include <algorithm>
+#include <condition_variable>
+#include <deque>
 #include <stdexcept>
 #include <filesystem>
 #include <chrono>
+#include <cstdlib>
 #include <cstdio>   // stderr logging (no external dep)
 #include <limits>
+#include <map>
+#include <mutex>
+#include <thread>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #  include <sys/statvfs.h>
@@ -31,6 +37,50 @@
 namespace hfile {
 
 namespace {
+
+bool hotpath_profiling_enabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
+        if (env == nullptr || env[0] == '\0') return false;
+        return std::strcmp(env, "0") != 0 &&
+               std::strcmp(env, "false") != 0 &&
+               std::strcmp(env, "FALSE") != 0;
+    }();
+    return enabled;
+}
+
+uint32_t effective_compression_queue_depth(const WriterOptions& opts) noexcept {
+    if (opts.compression_threads == 0) {
+        return 0;
+    }
+    if (opts.compression_queue_depth > 0) {
+        return opts.compression_queue_depth;
+    }
+    return std::max<uint32_t>(2u, opts.compression_threads * 2u);
+}
+
+struct QueuedCompressedBlock {
+    uint64_t sequence{0};
+    size_t uncompressed_size{0};
+    std::vector<uint8_t> raw_payload;
+    std::vector<uint8_t> index_key;
+    size_t ready_bloom_chunk_count{0};
+    uint32_t raw_crc32{0};
+    bool has_raw_crc32{false};
+    size_t budget_bytes{0};
+};
+
+struct ReadyCompressedBlock {
+    uint64_t sequence{0};
+    size_t uncompressed_size{0};
+    std::vector<uint8_t> compressed_payload;
+    std::vector<uint8_t> index_key;
+    size_t ready_bloom_chunk_count{0};
+    size_t budget_bytes{0};
+    std::chrono::nanoseconds compress_ns{0};
+    bool success{true};
+    std::string error_message;
+};
 
 }  // namespace
 
@@ -106,6 +156,31 @@ static void copy_key_only(const KeyValue& kv, OwnedKeyValue* out) {
     out->tags.clear();
     out->memstore_ts = 0;
     out->has_memstore_ts = false;
+}
+
+static void copy_key_only_same_family(const KeyValue& kv, OwnedKeyValue* out) {
+    out->row.assign(kv.row.begin(), kv.row.end());
+    out->qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+    out->timestamp = kv.timestamp;
+    out->key_type = kv.key_type;
+    out->value.clear();
+    out->tags.clear();
+    out->memstore_ts = 0;
+    out->has_memstore_ts = false;
+}
+
+static bool bytes_equal(std::span<const uint8_t> src,
+                        const std::vector<uint8_t>& dst) noexcept {
+    return src.size() == dst.size() &&
+           (src.empty() || std::memcmp(src.data(), dst.data(), src.size()) == 0);
+}
+
+static void assign_if_different(std::span<const uint8_t> src,
+                                std::vector<uint8_t>* dst) {
+    if (bytes_equal(src, *dst)) {
+        return;
+    }
+    dst->assign(src.begin(), src.end());
 }
 
 static bool midpoint_bytes(std::span<const uint8_t> left,
@@ -204,6 +279,7 @@ static uint16_t hbase_data_block_encoding_id(Encoding e) noexcept {
 }
 
 constexpr size_t kHBaseInlineLeafIndexTargetBytes = 128 * 1024;
+constexpr size_t kDiskCheckBatchBytes = 64 * 1024;
 
 size_t inline_leaf_entry_payload_delta(std::span<const uint8_t> first_key) noexcept {
     return 16 + first_key.size();
@@ -259,11 +335,17 @@ public:
         : path_{std::move(path)}, opts_{std::move(opts)} {
         if (opts_.max_memory_bytes > 0)
             budget_ = std::make_unique<memory::MemoryBudget>(opts_.max_memory_bytes);
+        disk_check_enabled_ =
+            opts_.disk_check_interval_bytes > 0 &&
+            opts_.min_free_disk_bytes > 0;
+        hotpath_profile_enabled_ = hotpath_profiling_enabled();
+        compression_queue_depth_ = effective_compression_queue_depth(opts_);
     }
 
     /// Destructor: if the writer was opened but finish() never succeeded,
     /// close and delete the partial file so it can't be picked up by BulkLoad.
     ~HFileWriterImpl() {
+        shutdown_compression_workers();
         if (opened_ && !finished_) {
             if (atomic_writer_) {
                 atomic_writer_->abort();   // close + delete temp file
@@ -312,6 +394,11 @@ public:
                                                       opts_.block_size);
         compressor_ = codec::Compressor::create(opts_.compression,
                                                  opts_.compression_level);
+        if (opts_.compression != Compression::None &&
+            opts_.compression_threads > 0) {
+            compression_threads_ = opts_.compression_threads;
+            start_compression_workers();
+        }
         const std::string bloom_comparator =
             opts_.bloom_type == BloomType::RowCol
                 ? std::string(kCellComparatorImpl)
@@ -319,17 +406,31 @@ public:
         bloom_      = std::make_unique<bloom::CompoundBloomFilterWriter>(
                           opts_.bloom_type, opts_.bloom_error_rate, 1'000'000,
                           bloom_comparator);
+        std::span<const uint8_t> cf_bytes{
+            reinterpret_cast<const uint8_t*>(opts_.column_family.data()),
+            opts_.column_family.size()
+        };
+        last_kv_.family.assign(cf_bytes.begin(), cf_bytes.end());
+        first_kv_in_block_.family.assign(cf_bytes.begin(), cf_bytes.end());
+        prev_block_last_kv_.family.assign(cf_bytes.begin(), cf_bytes.end());
 
-        compress_buf_.resize(compressor_->max_compressed_size(opts_.block_size + 65536));
-        if (budget_) {
-            fixed_budget_bytes_ = compress_buf_.size();
-            auto s = budget_->reserve(fixed_budget_bytes_);
-            if (!s.ok()) return s;
+        if (!compression_pipeline_enabled()) {
+            compress_buf_.resize(compressor_->max_compressed_size(opts_.block_size + 65536));
+            if (budget_) {
+                fixed_budget_bytes_ = compress_buf_.size();
+                auto s = budget_->reserve(fixed_budget_bytes_);
+                if (!s.ok()) return s;
+            }
         }
         start_time_ = std::chrono::steady_clock::now();
         opened_     = true;
 
         log::info("HFile started: path=" + path_ + " cf=" + opts_.column_family);
+        if (compression_pipeline_enabled()) {
+            log::info("Compression pipeline enabled: threads=" +
+                      std::to_string(compression_threads_) +
+                      " queue_depth=" + std::to_string(compression_queue_depth_));
+        }
         return Status::OK();
     }
 
@@ -381,7 +482,70 @@ public:
         }
         return append_materialized_kv(
             effective, true, true,
-            opts_.sort_mode == WriterOptions::SortMode::PreSortedVerified);
+            opts_.sort_mode == WriterOptions::SortMode::PreSortedVerified,
+            false,
+            false,
+            false);
+    }
+
+    Status append_trusted(const KeyValue& kv) {
+        if (finished_)
+            return Status::InvalidArg("append() called after finish()");
+
+        if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
+            auto owned = sanitize_owned_kv(kv, opts_);
+            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
+            return Status::OK();
+        }
+
+        KeyValue effective = kv;
+        if (!opts_.include_tags)
+            effective.tags = {};
+        if (!opts_.include_mvcc) {
+            effective.memstore_ts = 0;
+            effective.has_memstore_ts = false;
+        }
+        return append_materialized_kv(effective, true, true, false, false, false, false);
+    }
+
+    Status append_trusted_new_row(const KeyValue& kv) {
+        if (finished_)
+            return Status::InvalidArg("append() called after finish()");
+
+        if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
+            auto owned = sanitize_owned_kv(kv, opts_);
+            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
+            return Status::OK();
+        }
+
+        KeyValue effective = kv;
+        if (!opts_.include_tags)
+            effective.tags = {};
+        if (!opts_.include_mvcc) {
+            effective.memstore_ts = 0;
+            effective.has_memstore_ts = false;
+        }
+        return append_materialized_kv(effective, true, true, false, false, false, true);
+    }
+
+    Status append_trusted_same_row(const KeyValue& kv) {
+        if (finished_)
+            return Status::InvalidArg("append() called after finish()");
+
+        if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
+            auto owned = sanitize_owned_kv(kv, opts_);
+            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
+            return Status::OK();
+        }
+
+        KeyValue effective = kv;
+        if (!opts_.include_tags)
+            effective.tags = {};
+        if (!opts_.include_mvcc) {
+            effective.memstore_ts = 0;
+            effective.has_memstore_ts = false;
+        }
+        return append_materialized_kv(effective, true, true, false, true, true, false);
     }
 
     Status finish() {
@@ -401,7 +565,7 @@ public:
                                  return compare_keys(a.as_view(), b.as_view()) < 0;
                              });
             for (const auto& kv : auto_sorted_kvs_) {
-                auto s = append_materialized_kv(kv.as_view(), false, false, true);
+                auto s = append_materialized_kv(kv.as_view(), false, false, true, false, false, false);
                 if (!s.ok()) return s;
             }
             if (budget_ && auto_sort_reserved_bytes_ > 0) {
@@ -410,9 +574,15 @@ public:
             }
             auto_sorted_kvs_.clear();
         }
+        if (pending_disk_check_bytes_ > 0) {
+            HFILE_RETURN_IF_ERROR(maybe_check_disk_space(pending_disk_check_bytes_));
+            pending_disk_check_bytes_ = 0;
+        }
         if (!encoder_->empty()) {
             HFILE_RETURN_IF_ERROR(flush_data_block());
         }
+        HFILE_RETURN_IF_ERROR(drain_all_compressed_blocks());
+        shutdown_compression_workers();
         if (!root_index_entries_.empty() && !pending_leaf_index_entries_.empty()) {
             HFILE_RETURN_IF_ERROR(flush_pending_leaf_index_block());
         }
@@ -443,6 +613,7 @@ public:
         //
         // The Trailer's load_on_open_offset must point at the start of step 1/2.
         int64_t load_on_open_offset = writer_->position();
+        const auto load_on_open_start = std::chrono::steady_clock::now();
 
         std::vector<uint8_t> root_buf;
         auto idx_result = build_data_block_index(&root_buf);
@@ -495,6 +666,9 @@ public:
             load_on_open_offset,
             idx_result,
             bloom_result));
+        stats_.load_on_open_write_ns +=
+            std::chrono::steady_clock::now() - load_on_open_start;
+        load_on_open_block_count_ = 3 + (bloom_result.enabled ? 1u : 0u);
 
         // ── Commit: fsync + rename (Safe mode) or plain close ─────────────
         if (atomic_writer_) {
@@ -511,17 +685,250 @@ public:
         log::info("HFile completed: path=" + path_ +
                   " kvs=" + std::to_string(entry_count_) +
                   " elapsed=" + std::to_string(elapsed.count()) + "ms");
+        if (hotpath_profile_enabled_) {
+            log::info("Append breakdown: disk_check=" +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          append_disk_check_ns_).count()) + "ms" +
+                      " encoder=" +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          append_encoder_ns_).count()) + "ms" +
+                      " bloom=" +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          append_bloom_ns_).count()) + "ms" +
+                      " bookkeeping=" +
+                      std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(
+                          append_bookkeeping_ns_).count()) + "ms");
+        }
         return Status::OK();
     }
 
     int64_t  position()    const noexcept { return writer_ ? writer_->position() : 0; }
     uint64_t entry_count() const noexcept { return entry_count_; }
     uint64_t skipped_rows() const noexcept { return skipped_rows_; }
+    WriterStats stats() const noexcept {
+        WriterStats stats = stats_;
+        stats.data_block_count = data_block_count_;
+        stats.leaf_index_block_count = leaf_index_block_count_;
+        stats.bloom_chunk_flush_count = bloom_chunk_flush_count_;
+        stats.load_on_open_block_count = load_on_open_block_count_;
+        return stats;
+    }
 
 private:
+    bool compression_pipeline_enabled() const noexcept {
+        return compression_threads_ > 0;
+    }
+
+    Status reserve_pipeline_budget(size_t bytes) {
+        if (!budget_ || bytes == 0) {
+            return Status::OK();
+        }
+        while (true) {
+            auto reserve_status = budget_->reserve(bytes);
+            if (reserve_status.ok()) {
+                return Status::OK();
+            }
+            if (!compression_pipeline_enabled() || compression_inflight_blocks_ == 0) {
+                return reserve_status;
+            }
+            HFILE_RETURN_IF_ERROR(drain_one_compressed_block(true));
+        }
+    }
+
+    Status compress_payload(codec::Compressor& compressor,
+                            std::span<const uint8_t> raw,
+                            uint32_t raw_crc32,
+                            bool has_raw_crc32,
+                            uint8_t* output,
+                            size_t output_capacity,
+                            size_t* output_size) {
+        if (opts_.compression == Compression::None) {
+            *output_size = raw.size();
+            return Status::OK();
+        }
+        const size_t compressed_size = has_raw_crc32
+            ? compressor.compress_with_crc32(raw, output, output_capacity, raw_crc32)
+            : compressor.compress(raw, output, output_capacity);
+        if (compressed_size == 0) {
+            return Status::Internal("Compression failed");
+        }
+        *output_size = compressed_size;
+        return Status::OK();
+    }
+
+    void compression_worker_loop() {
+        auto local_compressor = codec::Compressor::create(
+            opts_.compression, opts_.compression_level);
+        for (;;) {
+            QueuedCompressedBlock queued;
+            {
+                std::unique_lock<std::mutex> lock(compression_mu_);
+                compression_cv_.wait(lock, [&] {
+                    return compression_stop_requested_ || !compression_pending_blocks_.empty();
+                });
+                if (compression_stop_requested_ && compression_pending_blocks_.empty()) {
+                    return;
+                }
+                queued = std::move(compression_pending_blocks_.front());
+                compression_pending_blocks_.pop_front();
+            }
+
+            ReadyCompressedBlock ready;
+            ready.sequence = queued.sequence;
+            ready.uncompressed_size = queued.uncompressed_size;
+            ready.index_key = std::move(queued.index_key);
+            ready.ready_bloom_chunk_count = queued.ready_bloom_chunk_count;
+            ready.budget_bytes = queued.budget_bytes;
+            ready.success = true;
+
+            if (opts_.compression == Compression::None) {
+                ready.compressed_payload = std::move(queued.raw_payload);
+            } else {
+                const auto compress_start = std::chrono::steady_clock::now();
+                ready.compressed_payload.resize(
+                    local_compressor->max_compressed_size(queued.raw_payload.size()));
+                size_t compressed_size = 0;
+                auto compress_status = compress_payload(
+                    *local_compressor,
+                    {queued.raw_payload.data(), queued.raw_payload.size()},
+                    queued.raw_crc32,
+                    queued.has_raw_crc32,
+                    ready.compressed_payload.data(),
+                    ready.compressed_payload.size(),
+                    &compressed_size);
+                ready.compress_ns = std::chrono::steady_clock::now() - compress_start;
+                if (!compress_status.ok()) {
+                    ready.success = false;
+                    ready.error_message = compress_status.message();
+                    ready.compressed_payload.clear();
+                } else {
+                    ready.compressed_payload.resize(compressed_size);
+                }
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(compression_mu_);
+                compression_ready_blocks_.emplace(ready.sequence, std::move(ready));
+            }
+            compression_ready_cv_.notify_all();
+        }
+    }
+
+    void start_compression_workers() {
+        if (!compression_pipeline_enabled()) {
+            return;
+        }
+        compression_stop_requested_ = false;
+        compression_workers_.reserve(compression_threads_);
+        for (uint32_t idx = 0; idx < compression_threads_; ++idx) {
+            compression_workers_.emplace_back([this]() {
+                compression_worker_loop();
+            });
+        }
+    }
+
+    void shutdown_compression_workers() noexcept {
+        if (compression_workers_.empty()) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(compression_mu_);
+            compression_stop_requested_ = true;
+        }
+        compression_cv_.notify_all();
+        compression_ready_cv_.notify_all();
+        for (auto& worker : compression_workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+        compression_workers_.clear();
+    }
+
+    Status write_ready_data_block(ReadyCompressedBlock ready) {
+        if (!ready.success) {
+            if (budget_ && ready.budget_bytes > 0) {
+                budget_->release(ready.budget_bytes);
+            }
+            return Status::Internal(ready.error_message.empty()
+                ? "Compression worker failed"
+                : ready.error_message);
+        }
+        stats_.data_block_compress_ns += ready.compress_ns;
+
+        const int64_t block_offset = writer_->position();
+        const auto block_write_start = std::chrono::steady_clock::now();
+        HFILE_RETURN_IF_ERROR(write_data_block(
+            ready.uncompressed_size,
+            ready.index_key,
+            {ready.compressed_payload.data(), ready.compressed_payload.size()},
+            block_offset));
+        stats_.data_block_write_ns += std::chrono::steady_clock::now() - block_write_start;
+        if (should_flush_pending_leaf_index()) {
+            HFILE_RETURN_IF_ERROR(flush_pending_leaf_index_block());
+        }
+        HFILE_RETURN_IF_ERROR(
+            flush_ready_bloom_chunk_blocks(ready.ready_bloom_chunk_count));
+        if (ready.ready_bloom_chunk_count > 0) {
+            reserved_ready_bloom_chunks_ -= ready.ready_bloom_chunk_count;
+        }
+
+        total_uncompressed_bytes_ +=
+            static_cast<uint64_t>(kBlockHeaderSize + ready.uncompressed_size);
+        ++data_block_count_;
+        if (opts_.fsync_policy == FsyncPolicy::Paranoid &&
+            opts_.fsync_block_interval > 0 &&
+            (data_block_count_ % opts_.fsync_block_interval) == 0) {
+            HFILE_RETURN_IF_ERROR(writer_->flush());
+        }
+        if (budget_ && ready.budget_bytes > 0) {
+            budget_->release(ready.budget_bytes);
+        }
+        if (compression_inflight_blocks_ > 0) {
+            --compression_inflight_blocks_;
+        }
+        return Status::OK();
+    }
+
+    Status drain_one_compressed_block(bool wait) {
+        if (!compression_pipeline_enabled()) {
+            return Status::OK();
+        }
+
+        ReadyCompressedBlock ready;
+        {
+            std::unique_lock<std::mutex> lock(compression_mu_);
+            auto next_ready = [&]() {
+                return compression_ready_blocks_.find(next_write_block_sequence_) !=
+                       compression_ready_blocks_.end();
+            };
+            if (wait) {
+                compression_ready_cv_.wait(lock, next_ready);
+            } else if (!next_ready()) {
+                return Status::OK();
+            }
+            auto it = compression_ready_blocks_.find(next_write_block_sequence_);
+            ready = std::move(it->second);
+            compression_ready_blocks_.erase(it);
+        }
+
+        HFILE_RETURN_IF_ERROR(write_ready_data_block(std::move(ready)));
+        ++next_write_block_sequence_;
+        return Status::OK();
+    }
+
+    Status drain_all_compressed_blocks() {
+        while (compression_inflight_blocks_ > 0) {
+            HFILE_RETURN_IF_ERROR(drain_one_compressed_block(true));
+        }
+        return Status::OK();
+    }
+
     // ── Flush a completed data block ──────────────────────────────────────────
     Status flush_data_block() {
+        const auto encode_start = std::chrono::steady_clock::now();
         auto raw = encoder_->finish_block();
+        stats_.data_block_encode_ns += std::chrono::steady_clock::now() - encode_start;
         if (raw.empty()) { encoder_->reset(); return Status::OK(); }
 
         std::vector<uint8_t> encoded_block_with_id;
@@ -541,34 +948,94 @@ private:
             prev_block_last_key = &prev_block_last_key_view;
         }
         auto index_key = compute_midpoint_key(prev_block_last_key, first_kv_in_block_.as_view());
-
-        // Compress
-        size_t comp_len = compressor_->compress(raw, compress_buf_.data(),
-                                                  compress_buf_.size());
-        if (comp_len == 0 && opts_.compression != Compression::None)
-            return Status::Internal("Compression failed");
-
-        std::span<const uint8_t> compressed{compress_buf_.data(), comp_len};
-        if (opts_.compression == Compression::None) compressed = raw;
-
-        HFILE_RETURN_IF_ERROR(
-            write_data_block(raw.size(), index_key, compressed, block_offset));
-        if (should_flush_pending_leaf_index()) {
-            HFILE_RETURN_IF_ERROR(flush_pending_leaf_index_block());
+        const bool has_raw_crc32 =
+            opts_.data_block_encoding == Encoding::None &&
+            encoder_->supports_block_crc32();
+        const uint32_t raw_crc32 = has_raw_crc32 ? encoder_->current_block_crc32() : 0;
+        size_t ready_bloom_chunk_count = 0;
+        if (compression_pipeline_enabled()) {
+            const size_t total_ready_bloom_chunks = bloom_->ready_chunk_count();
+            if (total_ready_bloom_chunks > reserved_ready_bloom_chunks_) {
+                ready_bloom_chunk_count =
+                    total_ready_bloom_chunks - reserved_ready_bloom_chunks_;
+            }
         }
-        HFILE_RETURN_IF_ERROR(flush_ready_bloom_chunk_blocks());
 
-        total_uncompressed_bytes_ += static_cast<uint64_t>(kBlockHeaderSize + raw.size());
-        ++data_block_count_;
-        copy_key_only(last_kv_.as_view(), &prev_block_last_kv_);
+        if (!compression_pipeline_enabled()) {
+            // Compress
+            size_t comp_len = raw.size();
+            std::span<const uint8_t> compressed = raw;
+            if (opts_.compression != Compression::None) {
+                const auto compress_start = std::chrono::steady_clock::now();
+                HFILE_RETURN_IF_ERROR(compress_payload(
+                    *compressor_,
+                    raw,
+                    raw_crc32,
+                    has_raw_crc32,
+                    compress_buf_.data(),
+                    compress_buf_.size(),
+                    &comp_len));
+                stats_.data_block_compress_ns += std::chrono::steady_clock::now() - compress_start;
+                compressed = {compress_buf_.data(), comp_len};
+            }
+
+            const auto block_write_start = std::chrono::steady_clock::now();
+            HFILE_RETURN_IF_ERROR(
+                write_data_block(raw.size(), index_key, compressed, block_offset));
+            stats_.data_block_write_ns += std::chrono::steady_clock::now() - block_write_start;
+            if (should_flush_pending_leaf_index()) {
+                HFILE_RETURN_IF_ERROR(flush_pending_leaf_index_block());
+            }
+            HFILE_RETURN_IF_ERROR(flush_ready_bloom_chunk_blocks());
+
+            total_uncompressed_bytes_ += static_cast<uint64_t>(kBlockHeaderSize + raw.size());
+            ++data_block_count_;
+            copy_key_only_same_family(last_kv_.as_view(), &prev_block_last_kv_);
+            has_prev_block_last_kv_ = true;
+            has_first_kv_in_block_ = false;
+            if (opts_.fsync_policy == FsyncPolicy::Paranoid &&
+                opts_.fsync_block_interval > 0 &&
+                (data_block_count_ % opts_.fsync_block_interval) == 0) {
+                HFILE_RETURN_IF_ERROR(writer_->flush());
+            }
+            encoder_->reset();
+            return Status::OK();
+        }
+
+        const size_t estimated_budget_bytes =
+            raw.size() +
+            compressor_->max_compressed_size(raw.size()) +
+            index_key.size() +
+            sizeof(QueuedCompressedBlock) +
+            sizeof(ReadyCompressedBlock);
+        HFILE_RETURN_IF_ERROR(reserve_pipeline_budget(estimated_budget_bytes));
+
+        QueuedCompressedBlock queued;
+        queued.sequence = next_queue_block_sequence_++;
+        queued.uncompressed_size = raw.size();
+        queued.raw_payload.assign(raw.begin(), raw.end());
+        queued.index_key = std::move(index_key);
+        queued.ready_bloom_chunk_count = ready_bloom_chunk_count;
+        queued.raw_crc32 = raw_crc32;
+        queued.has_raw_crc32 = has_raw_crc32;
+        queued.budget_bytes = estimated_budget_bytes;
+        reserved_ready_bloom_chunks_ += ready_bloom_chunk_count;
+
+        copy_key_only_same_family(last_kv_.as_view(), &prev_block_last_kv_);
         has_prev_block_last_kv_ = true;
         has_first_kv_in_block_ = false;
-        if (opts_.fsync_policy == FsyncPolicy::Paranoid &&
-            opts_.fsync_block_interval > 0 &&
-            (data_block_count_ % opts_.fsync_block_interval) == 0) {
-            HFILE_RETURN_IF_ERROR(writer_->flush());
-        }
         encoder_->reset();
+
+        {
+            std::lock_guard<std::mutex> lock(compression_mu_);
+            compression_pending_blocks_.push_back(std::move(queued));
+            ++compression_inflight_blocks_;
+        }
+        compression_cv_.notify_one();
+
+        while (compression_inflight_blocks_ >= compression_queue_depth_) {
+            HFILE_RETURN_IF_ERROR(drain_one_compressed_block(true));
+        }
         return Status::OK();
     }
 
@@ -761,6 +1228,7 @@ private:
         if (pending_leaf_index_entries_.empty()) {
             return Status::OK();
         }
+        const auto leaf_index_start = std::chrono::steady_clock::now();
 
         std::vector<uint8_t> payload;
         build_leaf_index_payload(pending_leaf_index_entries_, &payload);
@@ -787,13 +1255,18 @@ private:
             static_cast<uint64_t>(payload.size());
         pending_leaf_index_entries_.clear();
         pending_leaf_payload_bytes_ = 8;
+        stats_.leaf_index_write_ns +=
+            std::chrono::steady_clock::now() - leaf_index_start;
+        ++leaf_index_block_count_;
         return Status::OK();
     }
 
-    Status flush_ready_bloom_chunk_blocks() {
-        if (!bloom_->has_ready_chunks()) {
+    Status flush_ready_bloom_chunk_blocks(
+            size_t max_chunks = std::numeric_limits<size_t>::max()) {
+        if (!bloom_->has_ready_chunks() || max_chunks == 0) {
             return Status::OK();
         }
+        const auto bloom_chunk_start = std::chrono::steady_clock::now();
 
         std::vector<uint8_t> bloom_chunk_buf;
         bloom::BloomWriteResult partial_result;
@@ -803,7 +1276,8 @@ private:
                 writer_->position(),
                 prev_bloom_chunk_block_offset_,
                 &partial_result,
-                compressor_.get())) {
+                compressor_.get(),
+                max_chunks)) {
             return Status::OK();
         }
 
@@ -817,6 +1291,9 @@ private:
             partial_result.bloom_chunk_uncompressed_bytes_with_headers;
         HFILE_RETURN_IF_ERROR(
             writer_->write({bloom_chunk_buf.data(), bloom_chunk_buf.size()}));
+        stats_.bloom_chunk_write_ns +=
+            std::chrono::steady_clock::now() - bloom_chunk_start;
+        ++bloom_chunk_flush_count_;
         return Status::OK();
     }
 
@@ -869,7 +1346,37 @@ private:
 
     // ── Helpers for tracking last/first key ────────────────────────────────────
     void remember_last_key(const KeyValue& kv) {
-        copy_key_only(kv, &last_kv_);
+        assign_if_different(kv.row, &last_kv_.row);
+        assign_if_different(kv.qualifier, &last_kv_.qualifier);
+        last_kv_.timestamp = kv.timestamp;
+        last_kv_.key_type = kv.key_type;
+        last_kv_.value.clear();
+        last_kv_.tags.clear();
+        last_kv_.memstore_ts = 0;
+        last_kv_.has_memstore_ts = false;
+        last_key_dirty_ = true;
+    }
+
+    void remember_last_key_same_row(const KeyValue& kv) {
+        last_kv_.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+        last_kv_.timestamp = kv.timestamp;
+        last_kv_.key_type = kv.key_type;
+        last_kv_.value.clear();
+        last_kv_.tags.clear();
+        last_kv_.memstore_ts = 0;
+        last_kv_.has_memstore_ts = false;
+        last_key_dirty_ = true;
+    }
+
+    void remember_last_key_new_row(const KeyValue& kv) {
+        last_kv_.row.assign(kv.row.begin(), kv.row.end());
+        last_kv_.qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
+        last_kv_.timestamp = kv.timestamp;
+        last_kv_.key_type = kv.key_type;
+        last_kv_.value.clear();
+        last_kv_.tags.clear();
+        last_kv_.memstore_ts = 0;
+        last_kv_.has_memstore_ts = false;
         last_key_dirty_ = true;
     }
 
@@ -881,14 +1388,31 @@ private:
         last_key_dirty_ = false;
     }
 
-    void save_first_key(const KeyValue& kv) {
-        first_key_.resize(kv.key_length());
+    void save_first_key(const KeyValue& kv, uint32_t key_len) {
+        first_key_.resize(key_len);
         block::serialize_key(kv, first_key_.data());
     }
 
-    void record_cell_stats(const KeyValue& kv) {
-        uint32_t kl = kv.key_length();
+    void record_cell_stats_default(const KeyValue& kv,
+                                   uint32_t kl,
+                                   uint32_t vl) {
+        total_key_bytes_ += kl;
+        total_value_bytes_ += vl;
+        size_t cell_size = static_cast<size_t>(12) + kl + vl;
+        if (cell_size > max_cell_size_) {
+            max_cell_size_ = cell_size;
+            key_of_biggest_cell_.resize(kl);
+            block::serialize_key(kv, key_of_biggest_cell_.data());
+        }
+    }
+
+    void record_cell_stats(const KeyValue& kv, uint32_t kl) {
         uint32_t vl = static_cast<uint32_t>(kv.value.size());
+        if (kv.tags.empty() && !kv.has_memstore_ts) {
+            record_cell_stats_default(kv, kl, vl);
+            return;
+        }
+
         total_key_bytes_ += kl;
         total_value_bytes_ += vl;
         max_tags_len_ = std::max(max_tags_len_,
@@ -907,7 +1431,7 @@ private:
         }
         if (cell_size > max_cell_size_) {
             max_cell_size_ = cell_size;
-            key_of_biggest_cell_.resize(kv.key_length());
+            key_of_biggest_cell_.resize(kl);
             block::serialize_key(kv, key_of_biggest_cell_.data());
         }
     }
@@ -932,7 +1456,10 @@ private:
             const KeyValue& kv,
             bool increment_entry_count,
             bool record_stats,
-            bool verify_sort) {
+            bool verify_sort,
+            bool skip_bloom_update,
+            bool same_row_hint,
+            bool new_row_hint) {
         int cmp = 1;
         if (verify_sort && written_entry_count_ > 0) {
             cmp = compare_keys(kv, last_kv_.as_view());
@@ -942,7 +1469,21 @@ private:
                 return Status::InvalidArg("SORT_ORDER_VIOLATION: KV out of order");
         }
 
-        HFILE_RETURN_IF_ERROR(maybe_check_disk_space(kv.encoded_size()));
+        const size_t encoded_size = kv.encoded_size();
+        const uint32_t key_len = block::key_length_from_encoded_size(kv, encoded_size);
+        if (disk_check_enabled_) {
+            pending_disk_check_bytes_ += encoded_size;
+            if (pending_disk_check_bytes_ >= kDiskCheckBatchBytes) {
+                const auto disk_check_start = hotpath_profile_enabled_
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                HFILE_RETURN_IF_ERROR(maybe_check_disk_space(pending_disk_check_bytes_));
+                if (hotpath_profile_enabled_) {
+                    append_disk_check_ns_ += std::chrono::steady_clock::now() - disk_check_start;
+                }
+                pending_disk_check_bytes_ = 0;
+            }
+        }
 
         if (!encoder_->empty() &&
             encoder_->current_size() >= opts_.block_size &&
@@ -951,27 +1492,48 @@ private:
         }
 
         if (encoder_->empty()) {
-            copy_key_only(kv, &first_kv_in_block_);
+            copy_key_only_same_family(kv, &first_kv_in_block_);
             has_first_kv_in_block_ = true;
         }
 
-        if (!encoder_->append(kv)) {
+        const auto encoder_append_start = hotpath_profile_enabled_
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        if (!encoder_->append_sized(kv, encoded_size)) {
+            if (hotpath_profile_enabled_) {
+                append_encoder_ns_ += std::chrono::steady_clock::now() - encoder_append_start;
+            }
             HFILE_RETURN_IF_ERROR(flush_data_block());
             if (encoder_->empty()) {
-                copy_key_only(kv, &first_kv_in_block_);
+                copy_key_only_same_family(kv, &first_kv_in_block_);
                 has_first_kv_in_block_ = true;
             }
-            if (!encoder_->append(kv))
+            const auto retry_append_start = hotpath_profile_enabled_
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            if (!encoder_->append_sized(kv, encoded_size))
                 return Status::Internal("Failed to append KV even after flush");
+            if (hotpath_profile_enabled_) {
+                append_encoder_ns_ += std::chrono::steady_clock::now() - retry_append_start;
+            }
+        } else if (hotpath_profile_enabled_) {
+            append_encoder_ns_ += std::chrono::steady_clock::now() - encoder_append_start;
         }
 
+        const auto bloom_start = hotpath_profile_enabled_
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
         if (opts_.bloom_type == BloomType::Row) {
-            bool row_changed = last_bloom_key_.empty() ||
-                               last_bloom_key_.size() != kv.row.size() ||
-                               std::memcmp(last_bloom_key_.data(), kv.row.data(), kv.row.size()) != 0;
-            if (row_changed) {
+            if (new_row_hint) {
                 bloom_->add(kv.row);
-                last_bloom_key_.assign(kv.row.begin(), kv.row.end());
+                assign_if_different(kv.row, &last_bloom_key_);
+            } else if (!skip_bloom_update) {
+                bool row_changed = written_entry_count_ == 0 ||
+                                   !bytes_equal(kv.row, last_kv_.row);
+                if (row_changed) {
+                    bloom_->add(kv.row);
+                    assign_if_different(kv.row, &last_bloom_key_);
+                }
             }
         } else if (opts_.bloom_type == BloomType::RowCol) {
             bloom_->add_row_col(kv.row, kv.qualifier);
@@ -982,10 +1544,25 @@ private:
         } else {
             last_bloom_key_.clear();
         }
+        if (hotpath_profile_enabled_) {
+            append_bloom_ns_ += std::chrono::steady_clock::now() - bloom_start;
+        }
 
-        if (record_stats) record_cell_stats(kv);
-        if (written_entry_count_ == 0) save_first_key(kv);
-        remember_last_key(kv);
+        const auto bookkeeping_start = hotpath_profile_enabled_
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        if (record_stats) record_cell_stats(kv, key_len);
+        if (written_entry_count_ == 0) save_first_key(kv, key_len);
+        if (same_row_hint && written_entry_count_ > 0) {
+            remember_last_key_same_row(kv);
+        } else if (new_row_hint && written_entry_count_ > 0) {
+            remember_last_key_new_row(kv);
+        } else {
+            remember_last_key(kv);
+        }
+        if (hotpath_profile_enabled_) {
+            append_bookkeeping_ns_ += std::chrono::steady_clock::now() - bookkeeping_start;
+        }
 
         ++written_entry_count_;
         if (increment_entry_count) ++entry_count_;
@@ -1008,7 +1585,7 @@ private:
             HFILE_RETURN_IF_ERROR(budget_->reserve(reserve_bytes));
         }
         auto_sort_reserved_bytes_ += reserve_bytes;
-        record_cell_stats(kv.as_view());
+        record_cell_stats(kv.as_view(), kv.as_view().key_length());
         ++entry_count_;
         auto_sorted_kvs_.push_back(std::move(kv));
         return Status::OK();
@@ -1047,6 +1624,19 @@ private:
     size_t   fixed_budget_bytes_{0};
     size_t   auto_sort_reserved_bytes_{0};
     size_t   bytes_since_disk_check_{0};
+    uint32_t compression_threads_{0};
+    uint32_t compression_queue_depth_{0};
+    uint64_t next_queue_block_sequence_{0};
+    uint64_t next_write_block_sequence_{0};
+    uint64_t compression_inflight_blocks_{0};
+    size_t reserved_ready_bloom_chunks_{0};
+    std::mutex compression_mu_;
+    std::condition_variable compression_cv_;
+    std::condition_variable compression_ready_cv_;
+    std::deque<QueuedCompressedBlock> compression_pending_blocks_;
+    std::map<uint64_t, ReadyCompressedBlock> compression_ready_blocks_;
+    std::vector<std::thread> compression_workers_;
+    bool compression_stop_requested_{false};
 
     // ── Statistics ────────────────────────────────────────────────────────────
     uint64_t entry_count_            = 0;
@@ -1060,6 +1650,9 @@ private:
     uint64_t bloom_chunk_uncompressed_bytes_with_headers_ = 0;
     uint64_t total_index_sub_entries_ = 0;
     uint32_t data_block_count_       = 0;
+    uint32_t leaf_index_block_count_ = 0;
+    uint32_t bloom_chunk_flush_count_ = 0;
+    uint32_t load_on_open_block_count_ = 0;
     uint32_t max_tags_len_           = 0;
     uint64_t max_memstore_ts_        = 0;
     bool     has_mvcc_cells_         = false;
@@ -1073,11 +1666,19 @@ private:
     int64_t  first_bloom_chunk_block_offset_ = -1;
     int64_t  prev_bloom_chunk_block_offset_ = -1;
     size_t   pending_leaf_payload_bytes_ = 8;
+    size_t   pending_disk_check_bytes_ = 0;
 
+    std::chrono::nanoseconds append_disk_check_ns_{0};
+    std::chrono::nanoseconds append_encoder_ns_{0};
+    std::chrono::nanoseconds append_bloom_ns_{0};
+    std::chrono::nanoseconds append_bookkeeping_ns_{0};
+    WriterStats stats_;
     std::chrono::steady_clock::time_point start_time_;
     bool     opened_   = false;
     bool     finished_ = false;
     bool     last_key_dirty_ = false;
+    bool     disk_check_enabled_ = false;
+    bool     hotpath_profile_enabled_ = false;
 };
 
 // ─── HFileWriter public API ───────────────────────────────────────────────────
@@ -1091,6 +1692,18 @@ HFileWriter& HFileWriter::operator=(HFileWriter&&) noexcept = default;
 
 Status HFileWriter::append(const KeyValue& kv) {
     return impl_->append(kv);
+}
+
+Status HFileWriter::append_trusted(const KeyValue& kv) {
+    return impl_->append_trusted(kv);
+}
+
+Status HFileWriter::append_trusted_new_row(const KeyValue& kv) {
+    return impl_->append_trusted_new_row(kv);
+}
+
+Status HFileWriter::append_trusted_same_row(const KeyValue& kv) {
+    return impl_->append_trusted_same_row(kv);
 }
 
 Status HFileWriter::append(std::span<const uint8_t> row,
@@ -1113,12 +1726,73 @@ Status HFileWriter::append(std::span<const uint8_t> row,
     return impl_->append(kv);
 }
 
+Status HFileWriter::append_trusted(std::span<const uint8_t> row,
+                                    std::span<const uint8_t> family,
+                                    std::span<const uint8_t> qualifier,
+                                    int64_t                  timestamp,
+                                    std::span<const uint8_t> value,
+                                    KeyType                  key_type,
+                                    std::span<const uint8_t> tags,
+                                    uint64_t                 memstore_ts) {
+    KeyValue kv;
+    kv.row        = row;
+    kv.family     = family;
+    kv.qualifier  = qualifier;
+    kv.timestamp  = timestamp;
+    kv.key_type   = key_type;
+    kv.value      = value;
+    kv.tags       = tags;
+    kv.memstore_ts = memstore_ts;
+    return impl_->append_trusted(kv);
+}
+
+Status HFileWriter::append_trusted_new_row(std::span<const uint8_t> row,
+                                           std::span<const uint8_t> family,
+                                           std::span<const uint8_t> qualifier,
+                                           int64_t                  timestamp,
+                                           std::span<const uint8_t> value,
+                                           KeyType                  key_type,
+                                           std::span<const uint8_t> tags,
+                                           uint64_t                 memstore_ts) {
+    KeyValue kv;
+    kv.row        = row;
+    kv.family     = family;
+    kv.qualifier  = qualifier;
+    kv.timestamp  = timestamp;
+    kv.key_type   = key_type;
+    kv.value      = value;
+    kv.tags       = tags;
+    kv.memstore_ts = memstore_ts;
+    return impl_->append_trusted_new_row(kv);
+}
+
+Status HFileWriter::append_trusted_same_row(std::span<const uint8_t> row,
+                                             std::span<const uint8_t> family,
+                                             std::span<const uint8_t> qualifier,
+                                             int64_t                  timestamp,
+                                             std::span<const uint8_t> value,
+                                             KeyType                  key_type,
+                                             std::span<const uint8_t> tags,
+                                             uint64_t                 memstore_ts) {
+    KeyValue kv;
+    kv.row        = row;
+    kv.family     = family;
+    kv.qualifier  = qualifier;
+    kv.timestamp  = timestamp;
+    kv.key_type   = key_type;
+    kv.value      = value;
+    kv.tags       = tags;
+    kv.memstore_ts = memstore_ts;
+    return impl_->append_trusted_same_row(kv);
+}
+
 Status HFileWriter::finish() {
     return impl_->finish();
 }
 
 int64_t  HFileWriter::position()    const noexcept { return impl_->position(); }
 uint64_t HFileWriter::entry_count() const noexcept { return impl_->entry_count(); }
+WriterStats HFileWriter::stats() const noexcept { return impl_->stats(); }
 
 // ─── Builder ─────────────────────────────────────────────────────────────────
 
@@ -1182,6 +1856,12 @@ HFileWriter::Builder& HFileWriter::Builder::set_max_value_bytes(size_t n) {
 }
 HFileWriter::Builder& HFileWriter::Builder::set_max_memory(size_t bytes) {
     opts_.max_memory_bytes = bytes; return *this;
+}
+HFileWriter::Builder& HFileWriter::Builder::set_compression_threads(uint32_t n) {
+    opts_.compression_threads = n; return *this;
+}
+HFileWriter::Builder& HFileWriter::Builder::set_compression_queue_depth(uint32_t n) {
+    opts_.compression_queue_depth = n; return *this;
 }
 HFileWriter::Builder& HFileWriter::Builder::set_min_free_disk(size_t bytes) {
     opts_.min_free_disk_bytes = bytes; return *this;

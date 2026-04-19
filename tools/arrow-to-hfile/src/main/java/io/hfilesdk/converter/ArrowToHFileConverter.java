@@ -229,6 +229,9 @@ public class ArrowToHFileConverter {
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
         int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
         long   maxMemoryBytes = parseLong(cmd.getOptionValue("max-memory-mb", "0"), 0) * 1024L * 1024L;
+        int    compressionThreads = parseInt(cmd.getOptionValue("compression-threads", "0"), 0);
+        int    compressionQueueDepth = parseInt(cmd.getOptionValue("compression-queue-depth", "0"), 0);
+        String numericSortFastPath = cmd.getOptionValue("numeric-sort-fast-path", "auto");
         long   defaultTimestampMs = parseLong(cmd.getOptionValue("timestamp-ms", "0"), 0);
 
         // ── Validate input file ────────────────────────────────────────────
@@ -283,7 +286,10 @@ public class ArrowToHFileConverter {
                 .fsyncPolicy(fsyncPolicy)
                 .errorPolicy(errorPolicy)
                 .blockSize(blockSize)
-                .maxMemoryBytes(maxMemoryBytes);
+                .maxMemoryBytes(maxMemoryBytes)
+                .compressionThreads(compressionThreads)
+                .compressionQueueDepth(compressionQueueDepth)
+                .numericSortFastPath(numericSortFastPath);
             optsBuilder.defaultTimestampMs(defaultTimestampMs);
 
             // Column exclusion — exact names
@@ -360,6 +366,9 @@ public class ArrowToHFileConverter {
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
         int    compLevel   = parseInt(cmd.getOptionValue("compression-level", "1"), 1);
         long   maxMemoryBytes = parseLong(cmd.getOptionValue("max-memory-mb", "0"), 0) * 1024L * 1024L;
+        int    compressionThreads = parseInt(cmd.getOptionValue("compression-threads", "0"), 0);
+        int    compressionQueueDepth = parseInt(cmd.getOptionValue("compression-queue-depth", "0"), 0);
+        String numericSortFastPath = cmd.getOptionValue("numeric-sort-fast-path", "auto");
         long   defaultTimestampMs = parseLong(cmd.getOptionValue("timestamp-ms", "0"), 0);
         int    parallelism = parseInt(cmd.getOptionValue("parallelism",
             String.valueOf(Runtime.getRuntime().availableProcessors())),
@@ -392,6 +401,9 @@ public class ArrowToHFileConverter {
             .errorPolicy(errorPolicy)
             .blockSize(blockSize)
             .maxMemoryBytes(maxMemoryBytes)
+            .compressionThreads(compressionThreads)
+            .compressionQueueDepth(compressionQueueDepth)
+            .numericSortFastPath(numericSortFastPath)
             .defaultTimestampMs(defaultTimestampMs)
             .parallelism(parallelism)
             .skipExisting(skipExisting)
@@ -533,6 +545,15 @@ public class ArrowToHFileConverter {
         o.addOption(Option.builder().longOpt("max-memory-mb")
             .desc("Soft SDK memory budget in MiB            [default: unlimited]")
             .hasArg().argName("MiB").build());
+        o.addOption(Option.builder().longOpt("compression-threads")
+            .desc("Background data-block compression threads [default: 0=disabled]")
+            .hasArg().argName("N").build());
+        o.addOption(Option.builder().longOpt("compression-queue-depth")
+            .desc("Max in-flight compressed blocks          [default: auto when threads>0]")
+            .hasArg().argName("N").build());
+        o.addOption(Option.builder().longOpt("numeric-sort-fast-path")
+            .desc("Numeric row-key sort fast path: auto|on|off [default: auto]")
+            .hasArg().argName("MODE").build());
         o.addOption(Option.builder().longOpt("timestamp-ms")
             .desc("Fixed cell timestamp in milliseconds      [default: current time]")
             .hasArg().argName("MILLIS").build());

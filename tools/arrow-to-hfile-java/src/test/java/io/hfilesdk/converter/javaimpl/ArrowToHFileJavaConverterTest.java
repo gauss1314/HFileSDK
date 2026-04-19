@@ -78,6 +78,10 @@ final class ArrowToHFileJavaConverterTest {
         assertTrue(result.isSuccess(), result.summary());
         assertTrue(Files.exists(hfile));
         assertTrue(Files.size(hfile) > 0L);
+        assertTrue(result.sortMs >= 0L);
+        assertTrue(result.writeMs >= 0L);
+        assertTrue(result.toJson().contains("\"sort_ms\":"));
+        assertTrue(result.toJson().contains("\"write_ms\":"));
 
         Configuration conf = new Configuration();
         FileSystem fs = new RawLocalFileSystem();
@@ -133,6 +137,8 @@ final class ArrowToHFileJavaConverterTest {
         );
 
         assertTrue(result.isSuccess(), result.summary());
+        assertTrue(result.sortMs >= 0L);
+        assertTrue(result.writeMs >= 0L);
 
         Configuration conf = new Configuration();
         FileSystem fs = new RawLocalFileSystem();

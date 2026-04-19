@@ -42,6 +42,9 @@ public final class BatchConvertOptions {
     public final String errorPolicy;
     public final int    blockSize;
     public final long   maxMemoryBytes;
+    public final int    compressionThreads;
+    public final int    compressionQueueDepth;
+    public final String numericSortFastPath;
     public final long   defaultTimestampMs;
     public final List<String> excludedColumnPrefixes;
     public final List<String> excludedColumns;
@@ -84,6 +87,9 @@ public final class BatchConvertOptions {
         this.errorPolicy           = b.errorPolicy;
         this.blockSize             = b.blockSize;
         this.maxMemoryBytes        = requireNonNegative(b.maxMemoryBytes, "maxMemoryBytes");
+        this.compressionThreads    = (int) requireNonNegative(b.compressionThreads, "compressionThreads");
+        this.compressionQueueDepth = (int) requireNonNegative(b.compressionQueueDepth, "compressionQueueDepth");
+        this.numericSortFastPath   = normalizeNumericSortFastPath(b.numericSortFastPath);
         this.defaultTimestampMs    = requireNonNegative(b.defaultTimestampMs, "defaultTimestampMs");
         this.excludedColumnPrefixes = b.excludedColumnPrefixes != null
                                       ? List.copyOf(b.excludedColumnPrefixes) : List.of();
@@ -110,6 +116,15 @@ public final class BatchConvertOptions {
         return v;
     }
 
+    private static String normalizeNumericSortFastPath(String value) {
+        String normalized = value == null ? "auto" : value.trim().toLowerCase();
+        if (normalized.isEmpty()) normalized = "auto";
+        if (!normalized.equals("auto") && !normalized.equals("on") && !normalized.equals("off")) {
+            throw new IllegalArgumentException("numericSortFastPath must be one of: auto|on|off");
+        }
+        return normalized;
+    }
+
     public static Builder builder() { return new Builder(); }
 
     public static final class Builder {
@@ -126,6 +141,9 @@ public final class BatchConvertOptions {
         private String     errorPolicy       = "skip_row";
         private int        blockSize         = 65536;
         private long       maxMemoryBytes;
+        private int        compressionThreads;
+        private int        compressionQueueDepth;
+        private String     numericSortFastPath = "auto";
         private long       defaultTimestampMs;
         private List<String> excludedColumnPrefixes;
         private List<String> excludedColumns;
@@ -150,6 +168,9 @@ public final class BatchConvertOptions {
         public Builder errorPolicy(String v)         { errorPolicy = v;           return this; }
         public Builder blockSize(int v)              { blockSize = v;             return this; }
         public Builder maxMemoryBytes(long v)        { maxMemoryBytes = v;        return this; }
+        public Builder compressionThreads(int v)     { compressionThreads = v;    return this; }
+        public Builder compressionQueueDepth(int v)  { compressionQueueDepth = v; return this; }
+        public Builder numericSortFastPath(String v) { numericSortFastPath = v;   return this; }
         public Builder defaultTimestampMs(long v)    { defaultTimestampMs = v;    return this; }
         public Builder excludedColumnPrefixes(List<String> v) { excludedColumnPrefixes = v; return this; }
         public Builder excludedColumns(List<String> v)        { excludedColumns = v;        return this; }

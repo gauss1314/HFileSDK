@@ -236,6 +236,22 @@ public:
 
     size_t compress(std::span<const uint8_t> input,
                     uint8_t* output, size_t capacity) const noexcept override {
+        return compress_impl(input, output, capacity, false, 0);
+    }
+
+    size_t compress_with_crc32(std::span<const uint8_t> input,
+                               uint8_t* output,
+                               size_t capacity,
+                               uint32_t precomputed_crc32) const noexcept override {
+        return compress_impl(input, output, capacity, true, precomputed_crc32);
+    }
+
+private:
+    size_t compress_impl(std::span<const uint8_t> input,
+                         uint8_t* output,
+                         size_t capacity,
+                         bool use_precomputed_crc32,
+                         uint32_t precomputed_crc32) const noexcept {
         static constexpr uint8_t kGzipHeader[10] = {
             0x1f, 0x8b, 0x08, 0x00,
             0x00, 0x00, 0x00, 0x00,
@@ -280,9 +296,11 @@ public:
 
         size_t deflated_size = strm_.total_out;
 
-        const uint32_t crc = static_cast<uint32_t>(
-            ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
-                    static_cast<uInt>(input.size())));
+        const uint32_t crc = use_precomputed_crc32
+            ? precomputed_crc32
+            : static_cast<uint32_t>(
+                ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
+                        static_cast<uInt>(input.size())));
         const uint32_t input_size = static_cast<uint32_t>(input.size());
         uint8_t* trailer = output + sizeof(kGzipHeader) + deflated_size;
         trailer[0] = static_cast<uint8_t>(crc & 0xff);
@@ -296,6 +314,7 @@ public:
         return sizeof(kGzipHeader) + deflated_size + 8;
     }
 
+public:
     Status decompress(std::span<const uint8_t> compressed,
                       uint8_t* output, size_t output_size) const noexcept override {
         uint8_t scratch = 0;

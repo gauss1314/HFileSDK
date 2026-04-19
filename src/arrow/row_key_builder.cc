@@ -331,12 +331,21 @@ int RowKeyBuilder::direct_passthrough_col_index() const noexcept {
 }
 
 Status RowKeyBuilder::build_checked(const std::vector<std::string_view>& fields, std::string* out) {
+    return build_checked_from_segment(0, fields, out);
+}
+
+Status RowKeyBuilder::build_checked_from_segment(size_t start_segment_index,
+                                                 const std::vector<std::string_view>& fields,
+                                                 std::string* out) {
     out->clear();
     if (out->capacity() < 64)
         out->reserve(64);
+    if (start_segment_index >= segments_.size())
+        return Status::OK();
     std::string encoded_value;
 
-    for (const auto& seg : segments_) {
+    for (size_t index = start_segment_index; index < segments_.size(); ++index) {
+        const auto& seg = segments_[index];
         if (seg.type == RowKeySegment::Type::Random) {
             const int len = std::max(seg.pad_len, 0);
             out->reserve(out->size() + static_cast<size_t>(len));

@@ -33,6 +33,7 @@ static std::string ascii_lower(std::string value) {
 struct InstanceState {
     jobject       weak_ref{nullptr};
     WriterOptions writer_opts;
+    NumericSortFastPathMode numeric_sort_fast_path{NumericSortFastPathMode::Auto};
     ConvertResult last_result;
     std::string   last_result_json{"{}"};
     int64_t       default_timestamp_ms{0};
@@ -53,10 +54,23 @@ static std::string result_to_json(const ConvertResult& r) {
         << "\"duplicate_key_count\":" << static_cast<long long>(r.duplicate_key_count) << ','
         << "\"memory_budget_bytes\":" << static_cast<long long>(r.memory_budget_bytes) << ','
         << "\"tracked_memory_peak_bytes\":" << static_cast<long long>(r.tracked_memory_peak_bytes) << ','
+        << "\"numeric_sort_fast_path_mode\":\""
+        << numeric_sort_fast_path_mode_name(r.numeric_sort_fast_path_mode) << "\","
+        << "\"numeric_sort_fast_path_used\":" << (r.numeric_sort_fast_path_used ? "true" : "false") << ','
         << "\"hfile_size_bytes\":"    << static_cast<long long>(r.hfile_size_bytes) << ','
         << "\"elapsed_ms\":"          << static_cast<long long>(r.elapsed_ms.count()) << ','
         << "\"sort_ms\":"             << static_cast<long long>(r.sort_ms.count()) << ','
-        << "\"write_ms\":"            << static_cast<long long>(r.write_ms.count())
+        << "\"write_ms\":"            << static_cast<long long>(r.write_ms.count()) << ','
+        << "\"data_block_encode_ms\":" << static_cast<long long>(r.data_block_encode_ms.count()) << ','
+        << "\"data_block_compress_ms\":" << static_cast<long long>(r.data_block_compress_ms.count()) << ','
+        << "\"data_block_write_ms\":" << static_cast<long long>(r.data_block_write_ms.count()) << ','
+        << "\"leaf_index_write_ms\":" << static_cast<long long>(r.leaf_index_write_ms.count()) << ','
+        << "\"bloom_chunk_write_ms\":" << static_cast<long long>(r.bloom_chunk_write_ms.count()) << ','
+        << "\"load_on_open_write_ms\":" << static_cast<long long>(r.load_on_open_write_ms.count()) << ','
+        << "\"data_block_count\":" << static_cast<unsigned long long>(r.data_block_count) << ','
+        << "\"leaf_index_block_count\":" << static_cast<unsigned long long>(r.leaf_index_block_count) << ','
+        << "\"bloom_chunk_flush_count\":" << static_cast<unsigned long long>(r.bloom_chunk_flush_count) << ','
+        << "\"load_on_open_block_count\":" << static_cast<unsigned long long>(r.load_on_open_block_count)
         << "}";
     return oss.str();
 }
@@ -121,6 +135,7 @@ static hfile::WriterOptions get_instance_writer_opts(JNIEnv* env, jobject obj) {
 /// Called once per convert() invocation under the lock, then used without lock.
 struct InstanceSnapshot {
     hfile::WriterOptions     writer_opts;
+    hfile::NumericSortFastPathMode numeric_sort_fast_path;
     int64_t                  default_timestamp_ms;
     std::vector<std::string> excluded_columns;
     std::vector<std::string> excluded_column_prefixes;
@@ -128,7 +143,13 @@ struct InstanceSnapshot {
 static InstanceSnapshot get_instance_snapshot(JNIEnv* env, jobject obj) {
     std::lock_guard<std::mutex> lk(g_config_mutex);
     const auto& s = get_or_create_instance_state_locked(env, obj);
-    return {s.writer_opts, s.default_timestamp_ms, s.excluded_columns, s.excluded_column_prefixes};
+    return {
+        s.writer_opts,
+        s.numeric_sort_fast_path,
+        s.default_timestamp_ms,
+        s.excluded_columns,
+        s.excluded_column_prefixes
+    };
 }
 
 // ─── JNI exports ─────────────────────────────────────────────────────────────
@@ -210,6 +231,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
 
         auto snap = get_instance_snapshot(env, obj);
         opts.writer_opts  = snap.writer_opts;
+        opts.numeric_sort_fast_path = snap.numeric_sort_fast_path;
         opts.default_timestamp = snap.default_timestamp_ms;
         opts.excluded_columns         = snap.excluded_columns;
         opts.excluded_column_prefixes = snap.excluded_column_prefixes;
@@ -289,6 +311,10 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         std::lock_guard<std::mutex> lk(g_config_mutex);
         auto& state = get_or_create_instance_state_locked(env, obj);
         auto next_opts = state.writer_opts;
+        auto next_numeric_sort_fast_path = state.numeric_sort_fast_path;
+        auto next_default_timestamp_ms = state.default_timestamp_ms;
+        auto next_excluded_columns = state.excluded_columns;
+        auto next_excluded_column_prefixes = state.excluded_column_prefixes;
         auto fail_config = [&](std::string message) {
             state.last_result = hfile::jni::make_error_result(
                 hfile::ErrorCode::INVALID_ARGUMENT, std::move(message));
@@ -316,6 +342,9 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             "bloom_type",
             "include_mvcc",
             "max_memory_bytes",
+            "compression_threads",
+            "compression_queue_depth",
+            "numeric_sort_fast_path",
             "default_timestamp_ms",
             // Column exclusion — used for Hudi / CDC metadata columns
             "excluded_columns",          // ["col1","col2",...]  exact names
@@ -392,22 +421,49 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             next_opts.max_memory_bytes = static_cast<size_t>(*mm);
         }
 
+        if (auto ct = hfile::jni::config_int(cfg, "compression_threads")) {
+            if (*ct < 0) return fail_config("compression_threads must be >= 0");
+            next_opts.compression_threads = static_cast<uint32_t>(*ct);
+        }
+
+        if (auto cq = hfile::jni::config_int(cfg, "compression_queue_depth")) {
+            if (*cq < 0) return fail_config("compression_queue_depth must be >= 0");
+            next_opts.compression_queue_depth = static_cast<uint32_t>(*cq);
+        }
+
+        if (auto nsfp = hfile::jni::config_string(cfg, "numeric_sort_fast_path")) {
+            std::string normalized = hfile::jni::ascii_lower(*nsfp);
+            if (normalized == "auto") {
+                next_numeric_sort_fast_path = hfile::NumericSortFastPathMode::Auto;
+            } else if (normalized == "on") {
+                next_numeric_sort_fast_path = hfile::NumericSortFastPathMode::On;
+            } else if (normalized == "off") {
+                next_numeric_sort_fast_path = hfile::NumericSortFastPathMode::Off;
+            } else {
+                return fail_config("numeric_sort_fast_path must be one of: auto|on|off");
+            }
+        }
+
         if (auto ts = hfile::jni::config_int(cfg, "default_timestamp_ms")) {
             if (*ts < 0) return fail_config("default_timestamp_ms must be >= 0");
-            state.default_timestamp_ms = *ts;
+            next_default_timestamp_ms = *ts;
         }
 
         // ── Column exclusion ──────────────────────────────────────────────────
         // These are stored on InstanceState, not on WriterOptions, because they
         // are a converter-level concept (applied at Arrow → HFile mapping time).
         if (auto cols = hfile::jni::config_string_array(cfg, "excluded_columns")) {
-            state.excluded_columns = std::move(*cols);
+            next_excluded_columns = std::move(*cols);
         }
         if (auto pfxs = hfile::jni::config_string_array(cfg, "excluded_column_prefixes")) {
-            state.excluded_column_prefixes = std::move(*pfxs);
+            next_excluded_column_prefixes = std::move(*pfxs);
         }
 
         state.writer_opts = std::move(next_opts);
+        state.numeric_sort_fast_path = next_numeric_sort_fast_path;
+        state.default_timestamp_ms = next_default_timestamp_ms;
+        state.excluded_columns = std::move(next_excluded_columns);
+        state.excluded_column_prefixes = std::move(next_excluded_column_prefixes);
         state.last_result = {};
         state.last_result_json = hfile::jni::result_to_json(state.last_result);
         return 0;
