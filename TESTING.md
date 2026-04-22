@@ -2,9 +2,9 @@
 
 ## 当前状态
 
-- 当前已纳入 `ctest` 的测试目标共 **25** 个
-- 测试源码文件共 **22** 个（C++ 21 个 + Java JNI 集成测试 1 个）
-- 覆盖范围包含：编码、压缩、元数据、Writer、Arrow 转换、BulkLoad、基础 I/O、故障注入、Java JNI 端到端、HBase Reader 黑盒校验
+- 当前已纳入 `ctest` 的测试目标覆盖主路径与回归场景
+- 测试源码包含 C++ 单元/集成测试与 Java JNI 集成测试
+- 覆盖范围包含：编码、压缩、元数据、Writer、Arrow 转换、基础 I/O、故障注入、Java JNI 端到端、HBase Reader 黑盒校验
 
 ## 运行方式
 
@@ -109,10 +109,6 @@ bash scripts/coverage.sh
 
 | 模块 | 已覆盖场景 | 对应用例 |
 |---|---|---|
-| WideTable 转换 | 正常映射、缺失 row key、null row key | `test_arrow_converter` |
-| TallTable 转换 | 正常映射、缺列 | `test_arrow_converter` |
-| RawKV 转换 | 正常预编码 key、损坏 key 拒绝 | `test_arrow_converter`、`test_bulk_load_writer_behavior` |
-| 标量序列化 | Int64/Float32 大端序、Bool 字节、String 透传、时间戳单位归一化 | `test_arrow_converter` |
 | convert() 输入校验 | 空路径、缺失 Arrow 文件、损坏 stream、非法 row key rule、内存超限 | `test_arrow_converter` |
 | convert() 结果路径 | 重复 row key、重复 qualifier、LargeString、空 row key 全过滤、进度回调 | `test_arrow_converter` |
 
@@ -122,15 +118,6 @@ bash scripts/coverage.sh
 |---|---|---|
 | RowKeyBuilder | 规则编译、分隔、pad、reverse、随机段、越界列、排序稳定性 | `test_row_key_builder` |
 | RegionPartitioner | 无 split、单/多 split、无序 split、二进制 key、空 key | `test_region_partitioner`、`test_round3_bugs` |
-| CFGrouper | 列族注册、排序输出、family 校验、列表重建 | `test_cf_grouper` |
-
-### BulkLoad
-
-| 模块 | 已覆盖场景 | 对应用例 |
-|---|---|---|
-| BulkLoadWriter 正常路径 | `SkipBatch`、`max_open_files` 滚动、TallTable 多 CF、RawKV、多批次统计 | `test_bulk_load_writer_behavior` |
-| BulkLoadWriter 异常路径 | Strict 未知 CF、SkipBatch 批内乱序、Builder 必填参数校验 | `test_bulk_load_writer_behavior` |
-| 结果与进度语义 | `BulkLoadResult`、`partial_success()`、进度回调异常收敛 | `test_production_features` |
 
 ### I/O 与可靠性
 
@@ -161,6 +148,161 @@ bash scripts/coverage.sh
 - 当前已接入 `llvm-cov` 报表流程，但这里仍不表示 100% 行覆盖率或分支覆盖率
 - `io_uring` 与 `HDFS` 后端属于条件编译路径，当前 macOS 构建未启用，因此未进入当前 `ctest` 矩阵
 - Java/JNI 端到端与 HBase Reader 黑盒校验已纳入自动化测试，但当前仍不包含 Java 侧 HBase 集群集成链路
+
+## Linux 性能测试（更偏生产口径）
+
+性能对比建议优先在 Linux 上采集。`tools/hfile-bulkload-perf` 的官方对比口径就是 Linux，同机、同核集、同进程内存上限下对比 JNI 实现 `arrow-to-hfile` 与纯 Java 实现 `arrow-to-hfile-java`。
+
+当前版本的参数边界：
+
+- `--encoding` 只建议使用 `NONE`
+- `--compression` 只建议使用 `GZ` 或 `NONE`
+- 更贴近生产的默认口径建议使用 `--compression GZ --encoding NONE`
+- `--table` 目前建议使用 `tdr_signal_stor_20550`
+  - `tdr_mock` 更适合作为轻量 smoke/perf 冒烟
+
+运行建议：
+
+- 对 JNI 与纯 Java 使用同一组 `--cpu-set` 和 `--process-memory-mb`
+- 将 `--report-json`、当前 commit SHA、`lscpu`、`free -h`、磁盘类型与挂载点一起归档
+- 如需排查异常波动，可追加 `--keep-generated-files` 保留 Arrow/HFile/worker 日志
+- 若机器是 NUMA 架构，建议将 `--cpu-set` 固定在同一 NUMA 节点内
+
+### 单文件延迟基线
+
+适合观察单个大 Arrow 文件转单个 HFile 的延迟表现，建议关注 `single-100mb` 和 `single-500mb` 两个场景。
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib /path/to/libhfilesdk.so \
+  --table tdr_signal_stor_20550 \
+  --scenario-filter single-500mb \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --error-policy skip_row \
+  --block-size 65536 \
+  --cpu-set 0-7 \
+  --process-memory-mb 16384 \
+  --parallelism 1 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 8192 \
+  --jni-sdk-compression-threads 4 \
+  --jni-sdk-compression-queue-depth 8 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 4096 \
+  --java-direct-memory-mb 1024 \
+  --work-dir /data/tmp/hfilesdk-perf-single \
+  --report-json /data/tmp/hfilesdk-perf-single/report.json
+```
+
+建议说明：
+
+- `--parallelism 1`：单文件场景下避免把目录批处理并行度混入延迟口径
+- `--jni-sdk-compression-threads 4`：适合 8 核左右机器做 GZip 压缩延迟基线
+- `--jni-sdk-max-memory-mb 8192`：让 JNI 侧排序/写出更接近生产预算，不被开发机默认小内存误伤
+- `--java-xmx-mb` 建议显式大于 2 GiB，否则大文件场景更容易把结果变成 JVM 堆配置对比，而不是实现对比
+
+### 目录吞吐基线
+
+适合观察大量 Arrow 文件批量转换时的整体吞吐，建议关注 `directory-100x010mb` 场景。
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib /path/to/libhfilesdk.so \
+  --table tdr_signal_stor_20550 \
+  --scenario-filter directory-100x010mb \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --error-policy skip_row \
+  --block-size 65536 \
+  --cpu-set 0-7 \
+  --process-memory-mb 16384 \
+  --parallelism 4 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 8192 \
+  --jni-sdk-compression-threads 2 \
+  --jni-sdk-compression-queue-depth 8 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 4096 \
+  --java-direct-memory-mb 1024 \
+  --work-dir /data/tmp/hfilesdk-perf-directory \
+  --report-json /data/tmp/hfilesdk-perf-directory/report.json
+```
+
+建议说明：
+
+- `--parallelism 4`：目录场景更偏吞吐，通常不建议直接打满所有核，保留一部分给压缩线程和文件系统更稳
+- `--jni-sdk-compression-threads 2`：与目录并行度叠加时更容易避免线程过量竞争
+- 若机器核数明显更多，可按经验把 `--cpu-set` 扩大到专属核集，再将 `--parallelism` 调到 `4~8` 区间观察吞吐拐点
+
+### 全矩阵回归
+
+在版本发布前或优化项对比前，建议跑完整矩阵而不是只跑单一场景：
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib /path/to/libhfilesdk.so \
+  --table tdr_signal_stor_20550 \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --error-policy skip_row \
+  --block-size 65536 \
+  --cpu-set 0-7 \
+  --process-memory-mb 16384 \
+  --parallelism 4 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 8192 \
+  --jni-sdk-compression-threads 2 \
+  --jni-sdk-compression-queue-depth 8 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 4096 \
+  --java-direct-memory-mb 1024 \
+  --work-dir /data/tmp/hfilesdk-perf-full \
+  --report-json /data/tmp/hfilesdk-perf-full/report.json
+```
+
+如果是在集群机或需要先 `source` / `kinit`，可以复用包装脚本：
+
+```bash
+bash scripts/hfile-bulkload-perf-runner.sh \
+  --env-script /opt/client/bigdata_env \
+  --principal ossuser \
+  --keytab /opt/client/keytab/ossuser.keytab \
+  --native-lib /path/to/libhfilesdk.so \
+  --work-dir /data/tmp/hfilesdk-perf-full \
+  -- \
+  --table tdr_signal_stor_20550 \
+  --compression GZ \
+  --encoding NONE \
+  --cpu-set 0-7 \
+  --process-memory-mb 16384 \
+  --parallelism 4 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 8192 \
+  --jni-sdk-compression-threads 2 \
+  --jni-sdk-compression-queue-depth 8 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 4096 \
+  --java-direct-memory-mb 1024 \
+  --report-json /data/tmp/hfilesdk-perf-full/report.json
+```
+
+### 建议一起记录的信息
+
+- `git rev-parse HEAD`
+- `lscpu`
+- `free -h`
+- `uname -a`
+- 磁盘介质类型与挂载目录
+- perf runner 输出的 `report.json`
+- 是否开启 `--keep-generated-files`
 
 ## 建议的后续增强
 

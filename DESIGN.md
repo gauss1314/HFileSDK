@@ -54,9 +54,8 @@ Arrow RecordBatch → HFile v3 → 本地/HDFS → BulkLoadHFilesTool → HBase 
 | C-3 | 每个 Cell 必须有 `tags_length`（2B BE）和 `mvcc`（VarInt），即使为零 | 所有 `*_encoder.h` |
 | C-4 | Trailer 必须用 **ProtoBuf** 序列化，尾部固定 4 KB：`[TRABLK"$][varint pb_length][FileTrailerProto][padding][materialized_version]` | `TrailerBuilder::finish()` |
 | C-5 | FileInfo 必须包含全部 **10 个字段**（见 §2.3） | `FileInfoBuilder` |
-| C-6 | Bulk Load 目录：`<output_dir>/<cf>/<hfile>` | `BulkLoadWriterImpl` |
-| C-7 | KV 严格有序：Row↑→Family↑→Qualifier↑→Timestamp↓→Type↓ | `compare_keys()` + 写入验证 |
-| C-8 | 所有多字节整数为 **Big-Endian** | `write_be64/32/16()` 辅助函数 |
+| C-6 | KV 严格有序：Row↑→Family↑→Qualifier↑→Timestamp↓→Type↓ | `compare_keys()` + 写入验证 |
+| C-7 | 所有多字节整数为 **Big-Endian** | `write_be64/32/16()` 辅助函数 |
 
 ---
 
@@ -228,8 +227,6 @@ Step 4: Load     — hbase org.apache.hadoop.hbase.tool.BulkLoadHFilesTool <dir>
       ├── hfile_region_0000.hfile
       └── ...
 ```
-
-命名格式：`hfile_region_%04d.hfile`，由 `BulkLoadWriterImpl` 自动生成。
 
 ### 3.3 Region 分区策略
 
@@ -425,15 +422,7 @@ flowchart LR
 
 **内存占用**：所有 batch 保留在内存，同时存储 sort index（每条 ~40 字节 + row key 长度）。对于 1GB Arrow 文件约需 1–3 GB 内存。如果内存紧张可考虑外排序（当前未实现）。
 
-### 4.4 三种映射模式（保留，供 BulkLoadWriter 使用）
-
-- **WideTable**：每行 → N 个 KV，需 `__row_key__` 列
-- **TallTable**：每行 → 1 个 KV，需 `row_key/cf/qualifier/timestamp/value` 列
-- **RawKV**：预编码的 `key`+`value` 两列
-
-这三种模式用于 `BulkLoadWriter::write_batch()`。JNI 转换器（`converter.cc`）使用不同路径：直接按 RowKeyRule 生成 key，所有列值作为 qualifier。
-
-### 4.5 Arrow 类型序列化规则
+### 4.4 Arrow 类型序列化规则
 
 | Arrow 类型 | rowValue 字符串化 | HBase Value 字节 |
 |-----------|-----------------|-----------------|
@@ -453,11 +442,11 @@ flowchart LR
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│  API 层         HFileWriter / BulkLoadWriter / Builder      │
+│  API 层         HFileWriter / Builder                       │
 ├─────────────────────────────────────────────────────────────┤
-│  Partition 层   RegionPartitioner / CFGrouper               │
+│  Partition 层   RegionPartitioner                           │
 ├─────────────────────────────────────────────────────────────┤
-│  Transform 层   ArrowToKVConverter（3 种映射模式）            │
+│  Transform 层   RowKeyBuilder + converter.cc               │
 ├─────────────────────────────────────────────────────────────┤
 │  Encoding 层    DataBlockEncoder（None）                    │
 │                 BlockIndexWriter（1级/2级自动切换）            │
@@ -481,7 +470,6 @@ flowchart LR
 |------|-------|---------|------|
 | 公开 API | `include/hfile/*.h` | — | 用户直接使用的接口 |
 | HFileWriter | `src/writer.cc` | — | 核心写入器（含 `HFileWriterImpl`） |
-| BulkLoadWriter | `src/bulk_load_writer.cc` | — | 含内置 ThreadPool |
 | DataBlockEncoder | `src/block/` | `block_builder.cc` | 工厂 + 4 种实现 |
 | BlockIndexWriter | `src/index/block_index_writer.h` | `.cc` | 2 级索引 |
 | BloomFilter | `src/bloom/compound_bloom_filter_writer.h` | `.cc` | 分块 Bloom |
@@ -495,8 +483,6 @@ flowchart LR
 | IoUringWriter | `src/io/iouring_writer.h` | `.cc` | 双缓冲，Linux only |
 | HdfsWriter | `src/io/hdfs_writer.h` | `.cc` | libhdfs3，Linux/macOS |
 | RegionPartitioner | `include/hfile/region_partitioner.h` | `src/partition/region_partitioner.cc` | 手动分裂 |
-| CFGrouper | `src/partition/cf_grouper.h` | `.cc` | CF 注册与验证 |
-| ArrowToKVConverter | `src/arrow/arrow_to_kv_converter.h` | `.cc` | 3 种映射模式 |
 
 ### 5.3 JNI 接口层（v4.0 新增）
 
@@ -593,27 +579,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject,
 }
 ```
 
-```cpp
-auto [bulk, s] = hfile::BulkLoadWriter::builder()
-    .set_table_name("my_table")
-    .set_column_families({"cf1", "cf2"})
-    .set_output_dir("/tmp/staging/my_table")
-    .set_partitioner(RegionPartitioner::from_splits(splits))
-    .set_compression(hfile::Compression::GZip)
-    .set_block_size(64 * 1024)
-    .set_data_block_encoding(hfile::Encoding::None)
-    .set_bloom_type(hfile::BloomType::Row)
-    .set_parallelism(4)     // finish() 时 4 个线程并行关闭各 HFile
-    .build();
-
-for (auto& batch : record_batches)
-    bulk->write_batch(batch, MappingMode::WideTable);
-
-auto [result, s2] = bulk->finish();
-// result.staging_dir = "/tmp/staging/my_table"
-// result.files = ["cf1/hfile_region_0000.hfile", "cf2/hfile_region_0000.hfile", ...]
-// result.total_entries = ...
-```
+当前收口后只保留单文件转换主路径：`Arrow/JNI -> convert() -> HFileWriter`。
 
 ### 5.4 HFileWriter API
 
@@ -676,7 +642,6 @@ ArenaAllocator（bump-pointer）
 | 64 字节对齐 Block 缓冲区 | `alignas(64)` | 中 |
 | `[[likely]]/[[unlikely]]` 分支提示 | 热路径分支判断 | 中 |
 | Arrow String/Binary 零拷贝 | `std::span` 引用原始 Arrow 缓冲区 | 高 |
-| BulkLoad 多文件并行 finish | `ThreadPool` in `BulkLoadWriterImpl` | 中高 |
 | IoUringWriter 双缓冲 | `buf_[2]` + `cur_` 轮换 | 中 |
 
 ### 6.2 未实现的优化
@@ -770,11 +735,9 @@ HFileSDK/
 │   ├── status.h             Status 错误处理
 │   ├── writer_options.h     WriterOptions 配置
 │   ├── writer.h             HFileWriter + Builder
-│   ├── bulk_load_writer.h   BulkLoadWriter + Builder + MappingMode
 │   └── region_partitioner.h RegionPartitioner 接口
 ├── src/
 │   ├── writer.cc            HFileWriterImpl + HFileWriter 公开 API
-│   ├── bulk_load_writer.cc  BulkLoadWriterImpl + ThreadPool + 公开 API
 │   ├── checksum/            CRC32C
 │   ├── memory/              ArenaAllocator + BlockPool
 │   ├── block/               NONE 数据块编码器 + 工厂
@@ -783,9 +746,9 @@ HFileSDK/
 │   ├── index/               2 级 Block Index
 │   ├── meta/                FileInfoBuilder + TrailerBuilder
 │   ├── io/                  BufferedFileWriter / IoUringWriter / HdfsWriter
-│   ├── partition/           RegionPartitioner 实现 + CFGrouper
-│   └── arrow/               ArrowToKVConverter（3 种映射模式）
-├── test/                    21 个测试文件（已全部纳入 ctest）
+│   ├── partition/           RegionPartitioner 实现
+│   └── arrow/               RowKeyBuilder 与 Arrow 读取辅助
+├── test/                    主路径测试文件（已全部纳入 ctest）
 ├── tools/
 │   ├── arrow-to-hfile/      JNI 版 Arrow → HFile 转换器
 │   ├── arrow-to-hfile-java/ 纯 Java 版 Arrow → HFile 转换器
@@ -820,10 +783,10 @@ HFileSDK/
 
 | 测试层次 | 覆盖范围 | 工具 | 数量 |
 |---------|---------|------|------|
-| 单元/回归测试 | 编码、压缩、元数据、Writer、Arrow、BulkLoad、I/O、CFGrouper 与历史缺陷回归 | Google Test + 自定义框架 | 21 文件 |
+| 单元/回归测试 | 编码、压缩、元数据、Writer、Arrow、I/O 与历史缺陷回归 | Google Test + 自定义框架 | 多个测试文件 |
 | `ctest` 目标 | 单元、集成、自定义测试、chaos、Java JNI 与 HBase Reader 黑盒校验 | GTest + 自定义测试 + `hfile-chaos` + Maven JNI 集成测试 | 25 个 |
 | 覆盖率报表 | 自动执行测试并输出文本/HTML 覆盖率报告，并约定 CI 产物目录 | `llvm-cov` + `llvm-profdata` + `hfile_coverage` / `hfile_coverage_ci` | 已实现 |
-| 独立集成测试 | `convert()`、BulkLoad、多批次统计、RawKV/TallTable 等跨模块交互 | 同上 | 已纳入 `ctest` |
+| 独立集成测试 | `convert()`、JNI、排序、压缩与异常路径等跨模块交互 | 同上 | 已纳入 `ctest` |
 | 格式验证 | HFile 文件可被 HBase 原生 Reader 读取，并校验顺序与关键元数据 | `hfile-verify` (Java) | 已纳入 `ctest` |
 | Bulk Load 验证 | 完整链路 + HBase Scan 数据完整性 | `hfile-bulkload-verify` (Java) | 手动 |
 | 内存安全 | AddressSanitizer + UndefinedBehaviorSanitizer | Clang Sanitizers | 构建时选项 |
@@ -834,8 +797,7 @@ HFileSDK/
 - 编码与序列化：CRC32C、KV 编码、None、VarInt 边界
 - 格式与元数据：Bloom、Index、FileInfo、Trailer
 - Writer 主链路：AutoSort、内存预算、磁盘阈值、tags/MVCC、排序校验、错误策略
-- Arrow 与转换编排：WideTable / TallTable / RawKV、坏 stream、非法 row key rule、空 row key 过滤、进度回调
-- BulkLoad：`SkipBatch`、`Strict`、`max_open_files`、多 CF、多批次统计、Builder 校验
+- Arrow 与转换编排：坏 stream、非法 row key rule、空 row key 过滤、进度回调、排序与压缩主路径
 - I/O 与可靠性：`BufferedFileWriter`、`AtomicFileWriter`、`hfile-chaos` 掉电/磁盘满模拟
 - Java JNI：`configure()` 非法 JSON、空路径、非法 row key rule、Java→JNI→HFile 本地转换闭环
 - HBase Reader：固定 fixture 由 JNI 生成后，使用 HBase 原生 Reader 校验版本、entry count、编码、压缩，以及 row/family/qualifier/value/type 顺序
@@ -889,8 +851,8 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 | Phase 1 | 基础框架 + HFile v3 格式（PB Trailer、FileInfo 全字段、Tags+MVCC） | ✅ **完成** |
 | Phase 2 | 核心写入器（NONE 编码、无压缩、单 CF 约束） | ✅ **完成** |
 | Phase 3 | NONE 编码 + 压缩（GZip/None）+ Bloom Filter | ✅ **完成** |
-| Phase 4 | Region 分裂（手动模式）+ BulkLoadWriter + HDFS I/O | ✅ **完成** |
-| Phase 5 | Arrow 集成（WideTable/TallTable/RawKV）+ RowKeyRule 引擎 + JNI 层 + AutoSort | ✅ **完成** |
+| Phase 4 | Region 分裂（手动模式）+ HDFS I/O | ✅ **完成** |
+| Phase 5 | Arrow 集成 + RowKeyRule 引擎 + JNI 层 + AutoSort | ✅ **完成** |
 | Phase 6 | 性能优化（SSE4.2 CRC、SIMD 前缀、栈缓冲、双缓冲 IoUring） | ⚠️ **核心完成**，Pipeline 待基准数据驱动 |
 | Phase 7 | 基准工具 + 验证工具 + 文档 | ✅ **完成** |
 
@@ -970,7 +932,6 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 | B-01 | 🔴 数据损坏 | `src/checksum/crc32c.cc` | 三路 CRC 合并算法错误：把 CRC 值当作普通数据再次喂给 `_mm_crc32_u64`，产生错误校验值 | 去掉错误的三路合并，改为正确的串行 8 字节 `_mm_crc32_u64` |
 | B-02 | 🟡 性能 | `src/index/block_index_writer.cc` | `inline_threshold_` 从不被检查，任何规模文件都只生成单级根索引 | 实现真正的 2 级索引：entries>128 时生成 `IDXINTE2` 中间块 |
 | B-03 | 🟡 性能 | `src/block/prefix_encoder.h` `diff_encoder.h` | `append()` 热路径每次 `std::vector<uint8_t>(kv.key_length())` 触发 malloc | 512B 栈缓冲 + 超长 Key 才 fallback 到堆 |
-| B-04 | 🟠 功能缺失 | `src/bulk_load_writer.cc` | `set_parallelism(n)` 存储但被忽略，`finish()` 串行 | 内置 `ThreadPool`（50行），`finish()` 并发调用各 writer |
 | B-05 | 🔴 数据损坏 | `src/io/iouring_writer.cc` | 单缓冲：`submit_pending()` 提交 SQE 后立即置 `buf_used_=0`，in-flight 写入被下次 `write()` 覆盖 | 双缓冲轮换：`buf_[2]`+`cur_`，提交前等上一个 SQE 完成 |
 
 ### 第二轮（2026-03）

@@ -1,7 +1,6 @@
 #include "hfile/types.h"
 #include "hfile/writer.h"
 #include "hfile/writer_options.h"
-#include "hfile/bulk_load_writer.h"
 #include "io/atomic_file_writer.h"
 #include "memory/memory_budget.h"
 #include "metrics/metrics_registry.h"
@@ -488,79 +487,6 @@ void test_writer_with_max_memory_set_does_not_crash() {
     fs::remove(path);
 }
 
-// ─── 7. BulkLoadResult enhancements ─────────────────────────────────────────
-
-void test_bulk_load_result_has_skipped_rows_and_elapsed() {
-    auto dir = tmpfile("test_bulk_result");
-    fs::remove_all(dir);
-    auto [bulk, s] = BulkLoadWriter::builder()
-        .set_output_dir(dir.string())
-        .set_column_families({"cf"})
-        .set_partitioner(RegionPartitioner::none())
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_error_policy(ErrorPolicy::SkipRow)
-        .build();
-    EXPECT_OK(s);
-
-    // Write via write_kv directly is private; just call finish on empty writer
-    auto [result, fs2] = bulk->finish();
-    EXPECT_OK(fs2);
-    EXPECT_EQ(result.staging_dir, dir.string());
-    EXPECT_TRUE(result.elapsed.count() >= 0);
-
-    fs::remove_all(dir);
-}
-
-void test_bulk_load_partial_success_flag() {
-    BulkLoadResult r;
-    r.files = {"cf/file1.hfile"};
-    r.failed_files = {"cf/file2.hfile"};
-    EXPECT_TRUE(r.partial_success());
-
-    BulkLoadResult r2;
-    r2.files = {"cf/file1.hfile"};
-    EXPECT_FALSE(r2.partial_success());
-}
-
-// ─── 8. ProgressCallback ─────────────────────────────────────────────────────
-
-void test_progress_info_fields() {
-    ProgressInfo p;
-    p.total_kv_written    = 1000;
-    p.total_bytes_written = 50000;
-    p.files_completed     = 2;
-    p.skipped_rows        = 5;
-    p.elapsed             = std::chrono::milliseconds(123);
-    p.estimated_progress  = 0.5;
-    EXPECT_EQ(p.total_kv_written, 1000);
-    EXPECT_EQ(p.skipped_rows, 5);
-    EXPECT_EQ(p.elapsed.count(), 123);
-}
-
-void test_bulk_load_progress_callback_exception_is_contained() {
-    auto dir = tmpfile("test_bulk_progress_exception");
-    fs::remove_all(dir);
-    std::atomic<int> calls{0};
-    auto [bulk, s] = BulkLoadWriter::builder()
-        .set_output_dir(dir.string())
-        .set_column_families({"cf"})
-        .set_partitioner(RegionPartitioner::none())
-        .set_progress_callback([&](const ProgressInfo&) {
-            ++calls;
-            throw std::runtime_error("boom");
-        }, std::chrono::seconds(0))
-        .build();
-    EXPECT_OK(s);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    auto [result, fs2] = bulk->finish();
-    EXPECT_OK(fs2);
-    EXPECT_EQ(result.staging_dir, dir.string());
-    EXPECT_TRUE(calls.load() > 0);
-    fs::remove_all(dir);
-}
-
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -605,14 +531,6 @@ int main() {
 
     // MemoryBudget integration
     test_writer_with_max_memory_set_does_not_crash();
-
-    // BulkLoadResult
-    test_bulk_load_result_has_skipped_rows_and_elapsed();
-    test_bulk_load_partial_success_flag();
-
-    // ProgressInfo
-    test_progress_info_fields();
-    test_bulk_load_progress_callback_exception_is_contained();
 
     printf("Tests run: %d  Passed: %d  Failed: %d\n\n",
            TESTS, PASSED, TESTS - PASSED);

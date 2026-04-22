@@ -1,6 +1,5 @@
 #include <gtest/gtest.h>
 
-#include "arrow/arrow_to_kv_converter.h"
 #include "convert/converter.h"
 
 #include <arrow/api.h>
@@ -16,7 +15,6 @@
 
 namespace fs = std::filesystem;
 using namespace hfile;
-using namespace hfile::arrow_convert;
 
 namespace {
 
@@ -153,31 +151,6 @@ fs::path write_single_numeric_arrow(const fs::path& dir,
 }
 
 }  // namespace
-
-TEST(ConverterAdditionalCoverage, WideTableSupportsRemainingScalarTypesAndCallbackErrors) {
-    auto batch = make_wide_types_batch();
-    WideTableConfig cfg;
-    cfg.column_family = "cf";
-    cfg.default_timestamp = 99;
-
-    int callback_count = 0;
-    auto ok = ArrowToKVConverter::convert_wide_table(
-        *batch, cfg, [&](const KeyValue& kv) {
-            ++callback_count;
-            EXPECT_FALSE(kv.row.empty());
-            EXPECT_FALSE(kv.family.empty());
-            return Status::OK();
-        });
-    ASSERT_TRUE(ok.ok()) << ok.message();
-    EXPECT_EQ(callback_count, 10);
-
-    auto stopped = ArrowToKVConverter::convert_wide_table(
-        *batch, cfg, [&](const KeyValue&) {
-            return Status::Internal("stop");
-        });
-    EXPECT_FALSE(stopped.ok());
-    EXPECT_EQ(stopped.code(), Status::Code::Internal);
-}
 
 TEST(ConverterAdditionalCoverage, ConvertRejectsEmptyHFilePathAndInvalidOutputParent) {
     ConvertOptions empty_path;

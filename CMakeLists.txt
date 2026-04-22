@@ -254,12 +254,9 @@ set(HFILE_SOURCES
   src/io/atomic_file_writer.cc
   src/metrics/metrics_registry.cc
   src/partition/region_partitioner.cc
-  src/partition/cf_grouper.cc
   src/arrow/row_key_builder.cc
-  src/arrow/arrow_to_kv_converter.cc
   src/convert/converter.cc
   src/writer.cc
-  src/bulk_load_writer.cc
   ${PROTO_SRCS}
 )
 
@@ -443,7 +440,6 @@ set(GTEST_SOURCES
   test/test_compressor.cc
   test/test_arrow_converter.cc
   test/test_region_partitioner.cc
-  test/test_cf_grouper.cc
   test/test_io_writers.cc
   test/test_memory_allocators.cc
   test/test_block_pool_extra.cc
@@ -452,7 +448,6 @@ set(GTEST_SOURCES
   test/test_compressor_error_paths.cc
   test/test_writer_additional_coverage.cc
   test/test_converter_additional_coverage.cc
-  test/test_bulk_load_writer_behavior.cc
 )
 
 foreach(TEST_SRC ${GTEST_SOURCES})

@@ -4,5 +4,4 @@
 #include "hfile/status.h"
 #include "hfile/writer_options.h"
 #include "hfile/writer.h"
-#include "hfile/bulk_load_writer.h"
 #include "hfile/region_partitioner.h"

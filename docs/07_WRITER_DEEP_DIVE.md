@@ -417,7 +417,7 @@ if (sort_mode == AutoSort && !auto_sorted_kvs_.empty()) {
 }
 ```
 
-AutoSort 是 writer 的"保底"排序——如果调用方没有预排序，writer 在 finish 时内存排序。converter.cc 不使用这个路径（它自己排序后用 PreSortedVerified），但 BulkLoadWriter 和直接使用 HFileWriter 的测试代码会用到。
+AutoSort 是 writer 的"保底"排序——如果调用方没有预排序，writer 在 finish 时内存排序。`converter.cc` 不使用这个路径，它会先完成排序，再以预排序模式写入 HFile。
 
 `stable_sort` 保证相同 key 的 KV 保持原始插入顺序。
 

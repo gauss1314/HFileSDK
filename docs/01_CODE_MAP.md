@@ -21,8 +21,6 @@ src/
 ├── arrow/                 ← Arrow 数据处理层
 │   ├── row_key_builder.cc    rowKeyRule 编译器与执行引擎
 │   ├── row_key_builder.h     RowKeySegment / RowKeyBuilder
-│   ├── arrow_to_kv_converter.cc  Arrow 类型序列化（Wide/Tall/RawKV 三种模式）
-│   └── arrow_to_kv_converter.h   ArrowToKVConverter / WideTableConfig
 │
 ├── block/                 ← 数据块编码器
 │   ├── data_block_encoder.h  抽象基类 + serialize_kv/serialize_key 内联函数
@@ -66,12 +64,9 @@ src/
 │   └── metrics_registry.h    Counter / Gauge / Histogram（无外部依赖）
 │
 ├── partition/             ← Region 分区路由
-│   ├── cf_grouper.h          Column Family 路由（BulkLoadWriter 用）
 │   ├── region_partitioner.cc 手动分裂点 + 单 Region 模式
-│   └── cf_grouper.cc
 │
-├── writer.cc              ← HFile 单文件写入器（核心，约 900 行）
-└── bulk_load_writer.cc    ← 批量写入器（多 CF + 多 Region 路由）
+└── writer.cc              ← HFile 单文件写入器（核心，约 900 行）
 ```
 
 公开头文件在 `include/hfile/` 下，内部头文件与对应 `.cc` 同目录。
@@ -169,25 +164,7 @@ writer->finish()
   → 写 Load-on-open Section → 写 Trailer → commit
 ```
 
-### 路径 C：BulkLoadWriter 批量写入
-
-```
-BulkLoadWriter::builder()
-  .set_table_name(...)
-  .set_column_families({...})
-  .set_partitioner(...)
-  .build()
-
-writer->write_batch(batch, MappingMode::WideTable)
-  → ArrowToKVConverter::convert_wide_table()
-  → 对每个 KV: CFGrouper 路由到 (cf, region) → 找到或创建 HFileWriter → append
-
-writer->finish()
-  → 逐个 HFileWriter::finish()
-  → 返回 BulkLoadResult
-```
-
-### 路径 D：configure() 配置
+### 路径 C：configure() 配置
 
 ```
 Java: HFileSDK.configure(configJson)
@@ -209,9 +186,9 @@ Java: HFileSDK.configure(configJson)
 ├──────────────────────────────────────────┤
 │  convert/converter.cc                    │  转换编排
 ├──────────────────────────────────────────┤
-│  arrow/row_key_builder     arrow/arrow_to_kv_converter  │  Arrow 处理
+│  arrow/row_key_builder                       │  Arrow 处理
 ├──────────────────────────────────────────┤
-│  writer.cc  /  bulk_load_writer.cc       │  HFile 写入
+│  writer.cc                               │  HFile 写入
 ├──────────┬──────────┬──────────┬─────────┤
 │ block/   │ bloom/   │ index/   │ meta/   │  HFile 组件
 ├──────────┼──────────┴──────────┴─────────┤
@@ -227,7 +204,7 @@ Java: HFileSDK.configure(configJson)
 
 关键依赖细节：
 
-- `converter.cc` 直接使用 Arrow C++ API（`arrow::ipc::RecordBatchStreamReader`），不经过 `arrow_to_kv_converter.cc`。后者的 WideTable/TallTable/RawKV 模式只被 `bulk_load_writer.cc` 使用。
+- `converter.cc` 直接使用 Arrow C++ API（`arrow::ipc::RecordBatchStreamReader`），按 RowKeyRule 生成 row key，再调用 `HFileWriter` 写出单个 HFile。
 - `writer.cc` 是 HFile 物理格式的唯一出口，所有 Block/Bloom/Index/Meta 组件都在这里被组装。
 - `hfile_jni.cc` 持有全局 `InstanceState` 数组，通过 WeakGlobalRef 跟踪 Java 对象生命周期。
 
@@ -240,9 +217,7 @@ Java: HFileSDK.configure(configJson)
 | `writer.cc` | ~900 | 高 | HFile 物理格式组装，最复杂的单文件 |
 | `converter.cc` | ~700 | 高 | 两遍扫描 + 排序 + Arrow 类型转换 |
 | `hfile_jni.cc` | ~300 | 中 | JNI 桥接 + configure 解析 |
-| `bulk_load_writer.cc` | ~635 | 中 | 多文件编排 |
 | `row_key_builder.cc` | ~330 | 中 | 规则解析 + base64/hash 编码 |
-| `arrow_to_kv_converter.cc` | ~300 | 中 | 三种映射模式 |
 | `block_index_writer.cc` | ~170 | 中 | 多级索引构建 |
 | `compound_bloom_filter_writer.h` | ~290 | 中 | Murmur3 + 分块 Bloom |
 | `crc32c.cc` | ~117 | 低 | SSE4.2 + 标量回退 |

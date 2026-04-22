@@ -127,8 +127,8 @@ struct WriterOptions {
     size_t       min_free_disk_bytes = 512ULL * 1024 * 1024;  // 512 MB
     /// Check disk space every N bytes written (0 = disable periodic check).
     size_t       disk_check_interval_bytes = 256ULL * 1024 * 1024;  // 256 MB
-    /// Maximum simultaneously open file handles across a BulkLoadWriter.
-    /// When exceeded, older active writers are finished and new HFiles are rolled.
+    /// Maximum simultaneously open file handles the writer pipeline may keep.
+    /// This is retained for API compatibility with the single-file conversion path.
     int          max_open_files    = 64;
 };
 

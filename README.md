@@ -100,30 +100,10 @@ for (auto& kv : input_kvs) {
 writer->finish();  // AutoSort + 写 Index、Bloom、FileInfo、Trailer
 ```
 
-### Bulk Load 写入（推荐）
+### 当前收口范围
 
-```cpp
-#include <hfile/hfile.h>
-
-auto [bulk, status] = hfile::BulkLoadWriter::builder()
-    .set_output_dir("/tmp/staging/my_table")
-    .set_column_families({"cf1", "cf2"})
-    .set_partitioner(hfile::RegionPartitioner::from_splits(split_points))
-    .set_compression(hfile::Compression::GZip)
-    .set_parallelism(4)   // 并行 finish 4 个 HFile
-    .build();
-
-// 写入（自动按 CF + Region 路由到对应 HFile）
-for (auto& batch : arrow_batches)
-    bulk->write_batch(batch, hfile::MappingMode::WideTable);
-
-auto [result, s] = bulk->finish();
-// result.staging_dir = "/tmp/staging/my_table"
-// result.files = ["cf1/hfile_region_0000.hfile", "cf2/hfile_region_0001.hfile", ...]
-// 若 max_open_files 触发滚动关闭，同一 Region 可能生成 *_0001.hfile 等后续分片
-
-// 之后通过 BulkLoadHFilesTool 加载到 HBase
-```
+当前版本只保留单文件转换主路径：`Arrow/JNI -> convert() -> 1 个 HFile`。
+多列族、多 Region 自动拆分、多 HFile 批量编排能力已移除。
 
 ***
 
@@ -142,10 +122,10 @@ src/
   io/                   BufferedFileWriter（跨平台）
                          IoUringWriter（Linux only，双缓冲）
                          HdfsWriter（Linux/macOS only）
-  partition/            RegionPartitioner + CFGrouper
-  arrow/                Arrow → KV 转换（WideTable / TallTable / RawKV）
+  partition/            RegionPartitioner
+  arrow/                RowKeyRule 相关 Arrow 处理
 proto/                  FileTrailerProto（HFile v3）
-test/                   21 个测试文件（已全部纳入 ctest）
+ test/                   主路径与回归测试（已全部纳入 ctest）
 tools/                  Java 转换器 / 性能对比工具 / 验证工具 / hfile-chaos / Python HTML 报告生成器
 ```
 
