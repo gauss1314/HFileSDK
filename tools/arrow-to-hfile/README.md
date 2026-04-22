@@ -73,8 +73,8 @@ Throughput: 612.4 MB/s
 | `--table NAME` | | `""` | HBase 表名（仅用于日志） |
 | `--native-lib PATH` | | 从环境变量 | `libhfilesdk.so` 的绝对路径 |
 | `--cf CF` | | `cf` | Column Family 名称 |
-| `--compression ALG` | | `GZ` | 压缩算法：`none`/`lz4`/`zstd`/`snappy`/`GZ`（兼容 `gzip`） |
-| `--encoding ENC` | | `FAST_DIFF` | 块编码：`NONE`/`PREFIX`/`DIFF`/`FAST_DIFF` |
+| `--compression ALG` | | `GZ` | 压缩算法：`none`/`GZ`（兼容 `gzip`） |
+| `--encoding ENC` | | `NONE` | 块编码：`NONE` |
 | `--bloom TYPE` | | `row` | Bloom Filter：`none`/`row`/`rowcol` |
 | `--block-size BYTES` | | `65536` | 数据块大小（字节） |
 | `--max-memory-mb MB` | | `0` | C++ SDK 内部软内存预算，单位 MiB；`0` 表示不限制 |
@@ -84,7 +84,7 @@ Throughput: 612.4 MB/s
 | `--fsync-policy` | | `safe` | Fsync 策略：`safe`/`fast`/`paranoid` |
 | `--error-policy` | | `skip_row` | 行错误策略：`strict`/`skip_row`/`skip_batch` |
 
-说明：CLI 仍接受 `FAST_DIFF` 等编码参数，但当前 C++ writer 为保证 HBase 可读性，实际落盘会统一回退为 `NONE`。
+说明：当前 SDK 只支持 `NONE` 编码；传入其他编码参数会直接报错。
 
 ### 内存控制与观测
 
@@ -168,7 +168,7 @@ ConvertResult result = converter.convert(
         .tableName("events_table")
         .rowKeyRule("STARTTIME,0,false,10#IMSI,1,true,15")
         .columnFamily("cf")
-        .compression("lz4")
+        .compression("GZ")
         .build());
 
 if (!result.isSuccess()) {

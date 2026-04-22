@@ -289,7 +289,7 @@ Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject obj)
 /**
  * Java: public native int configure(String configJson)
  * Apply global configuration before the first convert() call.
- * configJson: {"compression":"lz4","block_size":65536,"column_family":"cf",...}
+ * configJson: {"compression":"GZ","block_size":65536,"column_family":"cf",...}
  */
 JNIEXPORT jint JNICALL
 Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
@@ -357,13 +357,10 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
 
         if (auto comp = hfile::jni::config_string(cfg, "compression")) {
             std::string normalized = hfile::jni::ascii_lower(*comp);
-            if      (normalized == "none")             next_opts.compression = hfile::Compression::None;
-            else if (normalized == "lz4")              next_opts.compression = hfile::Compression::LZ4;
-            else if (normalized == "zstd")             next_opts.compression = hfile::Compression::Zstd;
-            else if (normalized == "snappy")           next_opts.compression = hfile::Compression::Snappy;
+            if      (normalized == "none") next_opts.compression = hfile::Compression::None;
             else if (normalized == "gzip" || normalized == "gz")
-                                                     next_opts.compression = hfile::Compression::GZip;
-            else return fail_config("Invalid compression: " + *comp);
+                next_opts.compression = hfile::Compression::GZip;
+            else return fail_config("Only compression=NONE or GZ is supported");
         }
 
         if (auto cl = hfile::jni::config_int(cfg, "compression_level")) {
@@ -383,11 +380,8 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         }
 
         if (auto enc = hfile::jni::config_string(cfg, "data_block_encoding")) {
-            if      (*enc == "NONE")      next_opts.data_block_encoding = hfile::Encoding::None;
-            else if (*enc == "PREFIX")    next_opts.data_block_encoding = hfile::Encoding::Prefix;
-            else if (*enc == "DIFF")      next_opts.data_block_encoding = hfile::Encoding::Diff;
-            else if (*enc == "FAST_DIFF") next_opts.data_block_encoding = hfile::Encoding::FastDiff;
-            else return fail_config("Invalid data_block_encoding: " + *enc);
+            if (*enc == "NONE") next_opts.data_block_encoding = hfile::Encoding::None;
+            else return fail_config("Only data_block_encoding=NONE is supported");
         }
 
         if (auto fp = hfile::jni::config_string(cfg, "fsync_policy")) {

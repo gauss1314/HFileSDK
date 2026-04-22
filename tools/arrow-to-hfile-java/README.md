@@ -63,6 +63,6 @@ JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
 
 - 当前实现会像 JNI 版本一样在内存中构建 sort index 后再写出 HFile
 - 默认输出采用与 C++ 写入链路一致的 `GZ + NONE`
-- 即使调用方传入 `PREFIX`、`DIFF`、`FAST_DIFF`，当前落盘仍统一按 `NONE` 处理
+- 当前只支持 `NONE`；传入 `PREFIX`、`DIFF`、`FAST_DIFF` 会直接报错
 - 比较 Comparator 时应以 Trailer 为准；HBase 原生 Java writer 不要求在 FileInfo 中额外重复写 `hfile.COMPARATOR`
 - 推荐与 `tools/hfile-bulkload-perf` 配合使用同一批 mock Arrow 数据

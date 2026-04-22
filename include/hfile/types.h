@@ -163,7 +163,6 @@ inline int decode_writable_vint(const uint8_t* src, int64_t& out) noexcept {
 inline constexpr size_t kBlockMagicSize = 8;
 
 inline constexpr std::array<uint8_t, 8> kDataBlockMagic   = {'D','A','T','A','B','L','K','*'};
-inline constexpr std::array<uint8_t, 8> kEncodedDataBlockMagic = {'D','A','T','A','B','L','K','E'};
 inline constexpr std::array<uint8_t, 8> kLeafIndexMagic   = {'I','D','X','L','E','A','F','2'};
 inline constexpr std::array<uint8_t, 8> kRootIndexMagic   = {'I','D','X','R','O','O','T','2'};
 inline constexpr std::array<uint8_t, 8> kIntermedIdxMagic = {'I','D','X','I','N','T','E','2'};
@@ -204,18 +203,12 @@ enum class KeyType : uint8_t {
 // ─── Compression codec IDs (matching HBase enum) ─────────────────────────────
 enum class Compression : uint32_t {
     None   = 0,
-    LZ4    = 4,
-    Snappy = 2,
-    Zstd   = 7,
     GZip   = 1,
 };
 
 // ─── Data block encoding types ───────────────────────────────────────────────
 enum class Encoding : uint8_t {
-    None     = 0,
-    Prefix   = 1,
-    Diff     = 2,
-    FastDiff = 3,
+    None = 0,
 };
 
 // ─── Bloom filter types ───────────────────────────────────────────────────────

@@ -623,6 +623,13 @@ BulkLoadWriter::Builder::build() {
         return {nullptr, Status::InvalidArg("output_dir must be set")};
     if (column_families_.empty())
         return {nullptr, Status::InvalidArg("column_families must not be empty")};
+    if (opts_.compression != Compression::None &&
+        opts_.compression != Compression::GZip) {
+        return {nullptr, Status::InvalidArg("only compression=NONE or GZ is supported")};
+    }
+    if (opts_.data_block_encoding != Encoding::None) {
+        return {nullptr, Status::InvalidArg("only data_block_encoding=NONE is supported")};
+    }
     if (!partitioner_)
         partitioner_ = RegionPartitioner::none();
 

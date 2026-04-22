@@ -35,7 +35,7 @@ writer.cc 使用经典的 **Pimpl（Pointer to Implementation）** 模式：
 auto [writer, status] = HFileWriter::builder()
     .set_path("/staging/cf/events.hfile")
     .set_column_family("cf")
-    .set_compression(Compression::LZ4)
+    .set_compression(Compression::GZip)
     .set_block_size(65536)
     .set_bloom_type(BloomType::Row)
     .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
@@ -105,20 +105,7 @@ if (opts_.fsync_policy == FsyncPolicy::Safe) {
 
 ### 2.3 编码/压缩的强制降级
 
-```cpp
-if (opts_.data_block_encoding != Encoding::None) {
-    log::warn("...falling back to NONE...");
-    opts_.data_block_encoding = Encoding::None;
-}
-if (opts_.compression != Compression::None) {
-    log::warn("...falling back to NONE...");
-    opts_.compression = Compression::None;
-}
-```
-
-这两行是**当前版本的临时安全措施**。即使调用方请求了 LZ4 + FastDiff，实际生成的 HFile 也是 NONE + NONE。原因是 C++ 编码器尚未通过 HBase 端到端读取验证。
-
-这意味着 `compressor_` 实际上是一个 `NoneCompressor`，`encoder_` 实际上是一个 `NoneEncoder`。所有压缩/编码相关的代码路径在当前版本是**死代码**（但保留完好，未来启用时可以直接工作）。
+当前版本中，builder 会拒绝非 `NONE` 的数据块编码，并且只接受 `NONE` 或 `GZ` 压缩。也就是说，writer 的压缩路径只剩 `NoneCompressor` 和 `GZipCompressor` 两种实现，编码路径只剩 `NoneEncoder`。
 
 ### 2.4 子系统创建
 

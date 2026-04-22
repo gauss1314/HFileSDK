@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -106,7 +107,7 @@ final class ArrowToHFileJavaConverterTest {
     }
 
     @Test
-    void fallsBackToNoneEncodingWhenCallerRequestsFastDiff() throws Exception {
+    void rejectsUnsupportedDataBlockEncoding() throws Exception {
         java.nio.file.Path tempDir = Files.createTempDirectory("arrow-to-hfile-java-encoding-test");
         java.nio.file.Path arrowFile = tempDir.resolve("input.arrow");
         java.nio.file.Path hfile = tempDir.resolve("output.hfile");
@@ -136,16 +137,44 @@ final class ArrowToHFileJavaConverterTest {
                 .build()
         );
 
-        assertTrue(result.isSuccess(), result.summary());
-        assertTrue(result.sortMs >= 0L);
-        assertTrue(result.writeMs >= 0L);
+        assertFalse(result.isSuccess(), result.summary());
+        assertTrue(result.errorMessage.contains("仅支持 NONE"), result.errorMessage);
+        assertFalse(Files.exists(hfile));
+    }
 
-        Configuration conf = new Configuration();
-        FileSystem fs = new RawLocalFileSystem();
-        fs.initialize(java.net.URI.create("file:///"), conf);
-        try (HFile.Reader reader = HFile.createReader(fs, new Path(hfile.toString()), new CacheConfig(conf), true, conf)) {
-            assertEquals(Compression.Algorithm.GZ, reader.getFileContext().getCompression());
-            assertEquals(DataBlockEncoding.NONE, reader.getFileContext().getDataBlockEncoding());
+    @Test
+    void rejectsUnsupportedCompression() throws Exception {
+        java.nio.file.Path tempDir = Files.createTempDirectory("arrow-to-hfile-java-compression-test");
+        java.nio.file.Path arrowFile = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfile = tempDir.resolve("output.hfile");
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             VarCharVector userId = new VarCharVector("USER_ID", allocator);
+             VectorSchemaRoot root = new VectorSchemaRoot(java.util.List.of(userId));
+             ArrowStreamWriter writer = new ArrowStreamWriter(root, null, Channels.newChannel(Files.newOutputStream(arrowFile)))) {
+            userId.allocateNew();
+            userId.setSafe(0, "user-0001".getBytes(StandardCharsets.UTF_8));
+            userId.setValueCount(0 + 1);
+            root.setRowCount(1);
+            writer.start();
+            writer.writeBatch();
+            writer.end();
         }
+
+        JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
+            JavaConvertOptions.builder()
+                .arrowPath(arrowFile.toString())
+                .hfilePath(hfile.toString())
+                .tableName("perf_table")
+                .rowKeyRule("USER_ID,0,false,0")
+                .columnFamily("cf")
+                .compression("LZ4")
+                .dataBlockEncoding("NONE")
+                .build()
+        );
+
+        assertFalse(result.isSuccess(), result.summary());
+        assertTrue(result.errorMessage.contains("仅支持 NONE 或 GZ"), result.errorMessage);
+        assertFalse(Files.exists(hfile));
     }
 }

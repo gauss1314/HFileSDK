@@ -20,7 +20,7 @@ TEST(FileInfoBuilder, AllMandatoryFields) {
     fib.set_key_value_version(1);
     fib.set_max_memstore_ts(0);
     fib.set_comparator(kCellComparator);
-    fib.set_data_block_encoding(Encoding::FastDiff);
+    fib.set_data_block_encoding(Encoding::None);
     fib.set_create_time(1700000000000LL);
     fib.set_key_of_biggest_cell({biggest_key_data, 4});
     fib.set_len_of_biggest_cell(10240);
@@ -36,31 +36,28 @@ TEST(FileInfoBuilder, AllMandatoryFields) {
 }
 
 TEST(FileInfoBuilder, EncodingNames) {
-    for (auto enc : {Encoding::None, Encoding::Prefix,
-                     Encoding::Diff, Encoding::FastDiff}) {
-        FileInfoBuilder fib;
-        const uint8_t biggest_key_data[] = {'k'};
-        fib.set_last_key({});
-        fib.set_avg_key_len(0);
-        fib.set_avg_value_len(0);
-        fib.set_max_tags_len(0);
-        fib.set_tags_compressed(false);
-        fib.set_key_value_version(1);
-        fib.set_max_memstore_ts(0);
-        fib.set_comparator(kCellComparator);
-        fib.set_data_block_encoding(enc);
-        fib.set_create_time();
-        fib.set_key_of_biggest_cell({biggest_key_data, 1});
-        fib.set_len_of_biggest_cell(0);
-        fib.set_delete_family_count(0);
-        fib.set_historical(false);
+    FileInfoBuilder fib;
+    const uint8_t biggest_key_data[] = {'k'};
+    fib.set_last_key({});
+    fib.set_avg_key_len(0);
+    fib.set_avg_value_len(0);
+    fib.set_max_tags_len(0);
+    fib.set_tags_compressed(false);
+    fib.set_key_value_version(1);
+    fib.set_max_memstore_ts(0);
+    fib.set_comparator(kCellComparator);
+    fib.set_data_block_encoding(Encoding::None);
+    fib.set_create_time();
+    fib.set_key_of_biggest_cell({biggest_key_data, 1});
+    fib.set_len_of_biggest_cell(0);
+    fib.set_delete_family_count(0);
+    fib.set_historical(false);
 
-        std::vector<uint8_t> out;
-        ASSERT_TRUE(fib.validate_required_fields().ok());
-        fib.finish(out);
-        EXPECT_GE(out.size(), 5u);
-        EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
-    }
+    std::vector<uint8_t> out;
+    ASSERT_TRUE(fib.validate_required_fields().ok());
+    fib.finish(out);
+    EXPECT_GE(out.size(), 5u);
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
 }
 
 TEST(FileInfoBuilder, ComparatorString) {

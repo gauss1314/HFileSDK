@@ -37,7 +37,7 @@ TEST(TrailerBuilder, ProtobufDeserializable) {
     tb.set_last_data_block_offset(65536);
     tb.set_total_uncompressed_bytes(10 * 1024 * 1024);
     tb.set_comparator_class_name(std::string(kCellComparator));
-    tb.set_compression_codec(static_cast<uint32_t>(Compression::LZ4));
+    tb.set_compression_codec(static_cast<uint32_t>(Compression::GZip));
 
     std::vector<uint8_t> out;
     auto s = tb.finish(out);

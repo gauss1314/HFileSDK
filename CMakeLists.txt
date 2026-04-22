@@ -184,14 +184,6 @@ if(HFILE_ENABLE_JAVA_TESTS)
   endif()
 endif()
 
-find_library(ZSTD_LIB zstd REQUIRED)
-find_library(LZ4_LIB lz4 REQUIRED)
-find_library(SNAPPY_LIB snappy REQUIRED)
-
-find_path(ZSTD_INCLUDE_DIR zstd.h)
-find_path(LZ4_INCLUDE_DIR lz4.h)
-find_path(SNAPPY_INCLUDE_DIR snappy.h)
-
 # ─── io_uring: Linux only ─────────────────────────────────────────────────────
 if(HFILE_ENABLE_IO_URING AND NOT HFILE_PLATFORM_LINUX)
   message(STATUS "io_uring: disabled (Linux only, current platform is not Linux)")
@@ -253,9 +245,6 @@ set(HFILE_SOURCES
   src/memory/memory_budget.cc
   src/codec/compressor.cc
   src/block/none_encoder.cc
-  src/block/prefix_encoder.cc
-  src/block/diff_encoder.cc
-  src/block/fast_diff_encoder.cc
   src/block/block_builder.cc
   src/index/block_index_writer.cc
   src/bloom/compound_bloom_filter_writer.cc
@@ -292,9 +281,6 @@ target_include_directories(hfile
   PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_BINARY_DIR}   # for generated protobuf headers
-    ${ZSTD_INCLUDE_DIR}
-    ${LZ4_INCLUDE_DIR}
-    ${SNAPPY_INCLUDE_DIR}
     ${Protobuf_INCLUDE_DIRS}
 )
 
@@ -304,9 +290,6 @@ target_link_libraries(hfile
     protobuf::libprotobuf
     Threads::Threads
   PRIVATE
-    ${ZSTD_LIB}
-    ${LZ4_LIB}
-    ${SNAPPY_LIB}
     ZLIB::ZLIB
 )
 
@@ -325,15 +308,12 @@ if(HFILE_ENABLE_JEMALLOC AND JEMALLOC_LIB)
 endif()
 
 if(HFILE_ENABLE_JAVA_TESTS)
-  get_filename_component(ZSTD_LIB_DIR ${ZSTD_LIB} DIRECTORY)
-  get_filename_component(LZ4_LIB_DIR ${LZ4_LIB} DIRECTORY)
-  get_filename_component(SNAPPY_LIB_DIR ${SNAPPY_LIB} DIRECTORY)
   add_library(hfilesdk SHARED src/jni/hfile_jni.cc)
   set_target_properties(hfilesdk PROPERTIES
     OUTPUT_NAME hfilesdk
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
-    BUILD_RPATH "$<TARGET_FILE_DIR:Arrow::arrow_shared>;$<TARGET_FILE_DIR:protobuf::libprotobuf>;$<TARGET_FILE_DIR:ZLIB::ZLIB>;${ZSTD_LIB_DIR};${LZ4_LIB_DIR};${SNAPPY_LIB_DIR}")
+    BUILD_RPATH "$<TARGET_FILE_DIR:Arrow::arrow_shared>;$<TARGET_FILE_DIR:protobuf::libprotobuf>;$<TARGET_FILE_DIR:ZLIB::ZLIB>")
   target_link_libraries(hfilesdk PRIVATE hfile)
   if(TARGET JNI::JNI)
     target_link_libraries(hfilesdk PRIVATE JNI::JNI)
@@ -459,9 +439,6 @@ set(GTEST_SOURCES
   test/test_file_info.cc
   test/test_trailer.cc
   test/test_hfile_writer.cc
-  test/test_prefix_encoder.cc
-  test/test_diff_encoder.cc
-  test/test_fast_diff_encoder.cc
   test/test_index_writer.cc
   test/test_compressor.cc
   test/test_arrow_converter.cc
@@ -469,7 +446,12 @@ set(GTEST_SOURCES
   test/test_cf_grouper.cc
   test/test_io_writers.cc
   test/test_memory_allocators.cc
+  test/test_block_pool_extra.cc
+  test/test_status_types_extra.cc
   test/test_jni_json_utils.cc
+  test/test_compressor_error_paths.cc
+  test/test_writer_additional_coverage.cc
+  test/test_converter_additional_coverage.cc
   test/test_bulk_load_writer_behavior.cc
 )
 

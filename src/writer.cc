@@ -1,8 +1,6 @@
 #include <hfile/writer.h>
 
 #include "block/data_block_encoder.h"
-#include "block/none_encoder.h"
-#include "block/fast_diff_encoder.h"
 #include "codec/compressor.h"
 #include "checksum/crc32c.h"
 #include "index/block_index_writer.h"
@@ -261,21 +259,8 @@ static uint32_t hbase_compression_codec(Compression c) noexcept {
     switch (c) {
         case Compression::None:   return 2;
         case Compression::GZip:   return 1;
-        case Compression::Snappy: return 3;
-        case Compression::LZ4:    return 4;
-        case Compression::Zstd:   return 6;
         default:                  return 2;
     }
-}
-
-static uint16_t hbase_data_block_encoding_id(Encoding e) noexcept {
-    switch (e) {
-        case Encoding::None:     return 0; // NONE
-        case Encoding::Prefix:   return 2; // PREFIX
-        case Encoding::Diff:     return 3; // DIFF
-        case Encoding::FastDiff: return 4; // FAST_DIFF
-    }
-    return 0;
 }
 
 constexpr size_t kHBaseInlineLeafIndexTargetBytes = 128 * 1024;
@@ -382,14 +367,6 @@ public:
             writer_ = plain_writer_.get();    // BlockWriter* view
         }
 
-        // Current C++ encoders are not byte-level compatible with HBase's
-        // Prefix/Diff/FastDiff decoder implementations yet.
-        // To guarantee HFile readability, force NONE on disk for now.
-        if (opts_.data_block_encoding != Encoding::None) {
-            log::warn("Requested data_block_encoding is not HBase-compatible yet; "
-                      "falling back to NONE for on-disk blocks");
-            opts_.data_block_encoding = Encoding::None;
-        }
         encoder_    = block::DataBlockEncoder::create(opts_.data_block_encoding,
                                                       opts_.block_size);
         compressor_ = codec::Compressor::create(opts_.compression,
@@ -931,15 +908,6 @@ private:
         stats_.data_block_encode_ns += std::chrono::steady_clock::now() - encode_start;
         if (raw.empty()) { encoder_->reset(); return Status::OK(); }
 
-        std::vector<uint8_t> encoded_block_with_id;
-        if (opts_.data_block_encoding != Encoding::None) {
-            encoded_block_with_id.resize(2 + raw.size());
-            write_be16(encoded_block_with_id.data(),
-                       hbase_data_block_encoding_id(opts_.data_block_encoding));
-            std::memcpy(encoded_block_with_id.data() + 2, raw.data(), raw.size());
-            raw = {encoded_block_with_id.data(), encoded_block_with_id.size()};
-        }
-
         int64_t block_offset = writer_->position();
         KeyValue prev_block_last_key_view;
         const KeyValue* prev_block_last_key = nullptr;
@@ -948,9 +916,7 @@ private:
             prev_block_last_key = &prev_block_last_key_view;
         }
         auto index_key = compute_midpoint_key(prev_block_last_key, first_kv_in_block_.as_view());
-        const bool has_raw_crc32 =
-            opts_.data_block_encoding == Encoding::None &&
-            encoder_->supports_block_crc32();
+        const bool has_raw_crc32 = encoder_->supports_block_crc32();
         const uint32_t raw_crc32 = has_raw_crc32 ? encoder_->current_block_crc32() : 0;
         size_t ready_bloom_chunk_count = 0;
         if (compression_pipeline_enabled()) {
@@ -1053,9 +1019,7 @@ private:
         // Build block header (33 bytes)
         uint8_t hdr[kBlockHeaderSize];
         uint8_t* p = hdr;
-        const auto& magic = opts_.data_block_encoding == Encoding::None
-            ? kDataBlockMagic
-            : kEncodedDataBlockMagic;
+        const auto& magic = kDataBlockMagic;
         std::memcpy(p, magic.data(), 8); p += 8;
         uint32_t on_disk_size_without_header = static_cast<uint32_t>(
             compressed_data.size() + checksum_buf_.size());
@@ -1878,6 +1842,13 @@ std::pair<std::unique_ptr<HFileWriter>, Status> HFileWriter::Builder::build() {
         return {nullptr, Status::InvalidArg("path must be set")};
     if (opts_.column_family.empty())
         return {nullptr, Status::InvalidArg("column_family must be set")};
+    if (opts_.compression != Compression::None &&
+        opts_.compression != Compression::GZip) {
+        return {nullptr, Status::InvalidArg("only compression=NONE or GZ is supported")};
+    }
+    if (opts_.data_block_encoding != Encoding::None) {
+        return {nullptr, Status::InvalidArg("only data_block_encoding=NONE is supported")};
+    }
 
     try {
         auto impl = std::make_unique<HFileWriterImpl>(path_, opts_);

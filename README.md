@@ -32,7 +32,7 @@
 - SIMD 前缀扫描（`_mm_cmpeq_epi8` 等）
 - `__builtin_ctz`、`__builtin_expect`（Clang 完全支持）
 - `std::filesystem`（C++20 标准，Windows 完全支持）
-- Arrow C++ 15+、Protobuf、LZ4、ZSTD、Snappy（均有官方 Windows 构建）
+- Arrow C++ 15+、Protobuf、zlib/zlib-ng（均有官方 Windows 构建）
 
 ***
 
@@ -84,8 +84,8 @@ bash scripts/hfile-bulkload-perf-runner.sh --skip-login -- --help
 auto [writer, status] = hfile::HFileWriter::builder()
     .set_path("/tmp/staging/cf1/hfile_0001.hfile")
     .set_column_family("cf1")
-    .set_compression(hfile::Compression::LZ4)
-    .set_data_block_encoding(hfile::Encoding::FastDiff)
+    .set_compression(hfile::Compression::GZip)
+    .set_data_block_encoding(hfile::Encoding::None)
     .set_bloom_type(hfile::BloomType::Row)
     .build();
 
@@ -109,7 +109,7 @@ auto [bulk, status] = hfile::BulkLoadWriter::builder()
     .set_output_dir("/tmp/staging/my_table")
     .set_column_families({"cf1", "cf2"})
     .set_partitioner(hfile::RegionPartitioner::from_splits(split_points))
-    .set_compression(hfile::Compression::LZ4)
+    .set_compression(hfile::Compression::GZip)
     .set_parallelism(4)   // 并行 finish 4 个 HFile
     .build();
 
@@ -135,7 +135,7 @@ src/
   checksum/             CRC32C（SSE4.2 + 标量回退）
   memory/               ArenaAllocator + BlockPool（零热路径分配）
   block/                数据块编码器（None / Prefix / Diff / FastDiff）
-  codec/                压缩（LZ4 / ZSTD / Snappy / GZip / None）
+  codec/                压缩（GZip / None）
   bloom/                Compound Bloom Filter（Murmur3，分块）
   index/                2级 Block Index（单级 + 中间索引块）
   meta/                 FileInfo（10个必填字段）+ ProtoBuf Trailer

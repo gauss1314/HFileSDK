@@ -369,10 +369,7 @@ public final class ArrowToHFileJavaConverter {
         return switch (compression) {
             case "GZ", "GZIP" -> Compression.Algorithm.GZ;
             case "NONE" -> Compression.Algorithm.NONE;
-            case "LZ4" -> Compression.Algorithm.LZ4;
-            case "SNAPPY" -> Compression.Algorithm.SNAPPY;
-            case "ZSTD" -> Compression.Algorithm.ZSTD;
-            default -> throw new IllegalArgumentException("不支持的压缩算法: " + rawCompression);
+            default -> throw new IllegalArgumentException("不支持的压缩算法: " + rawCompression + "，当前仅支持 NONE 或 GZ");
         };
     }
 
@@ -381,10 +378,7 @@ public final class ArrowToHFileJavaConverter {
         if (encoding.isEmpty() || encoding.equals("NONE")) {
             return DataBlockEncoding.NONE;
         }
-        return switch (encoding) {
-            case "PREFIX", "DIFF", "FAST_DIFF" -> DataBlockEncoding.NONE;
-            default -> throw new IllegalArgumentException("不支持的 Data Block Encoding: " + rawEncoding);
-        };
+        throw new IllegalArgumentException("不支持的 Data Block Encoding: " + rawEncoding + "，当前仅支持 NONE");
     }
 
     private static List<String> parseCsv(String raw) {

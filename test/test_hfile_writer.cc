@@ -480,7 +480,7 @@ TEST(HFileWriter, MultipleKVsSorted) {
         .set_path(path.string())
         .set_column_family("cf")
         .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::FastDiff)
+        .set_data_block_encoding(Encoding::None)
         .set_bloom_type(BloomType::Row)
         .build();
     ASSERT_TRUE(s.ok());
@@ -543,48 +543,6 @@ TEST(HFileWriter, WrongFamilyRejected) {
     kv.timestamp = 1; kv.key_type = KeyType::Put; kv.value = v;
     auto st = w->append(kv);
     EXPECT_FALSE(st.ok());
-    fs::remove(path);
-}
-
-TEST(HFileWriter, WithLZ4Compression) {
-    auto path = tmp_path("lz4");
-    auto [w, s] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::LZ4)
-        .set_data_block_encoding(Encoding::FastDiff)
-        .set_bloom_type(BloomType::Row)
-        .build();
-    ASSERT_TRUE(s.ok());
-
-    std::vector<uint8_t> rk, fam, q, v;
-    for (int i = 0; i < 500; ++i) {
-        char row[32];
-        std::snprintf(row, sizeof(row), "row%08d", i);
-        ASSERT_TRUE(w->append(
-            make_kv(rk, fam, q, v, row, "col", 1000 - i, "compressible_value_payload")).ok());
-    }
-    EXPECT_TRUE(w->finish().ok());
-    fs::remove(path);
-}
-
-TEST(HFileWriter, WithZstdCompression) {
-    auto path = tmp_path("zstd");
-    auto [w, s] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::Zstd)
-        .set_data_block_encoding(Encoding::FastDiff)
-        .build();
-    ASSERT_TRUE(s.ok());
-
-    std::vector<uint8_t> rk, fam, q, v;
-    for (int i = 0; i < 200; ++i) {
-        char row[32]; std::snprintf(row, sizeof(row), "key%06d", i);
-        ASSERT_TRUE(w->append(
-            make_kv(rk, fam, q, v, row, "c", 9999 - i, "value")).ok());
-    }
-    EXPECT_TRUE(w->finish().ok());
     fs::remove(path);
 }
 
@@ -1001,18 +959,6 @@ TEST(HFileWriter, BloomFileInfoContainsBloomTypeAndLastBloomKey) {
     EXPECT_NE(content.find("row99"), std::string::npos);
 
     fs::remove(path);
-}
-
-TEST(HFileWriter, LZ4RoundTripAcrossMajorBlockTypes) {
-    verify_compressed_major_blocks_round_trip(Compression::LZ4, "lz4_roundtrip_major_blocks");
-}
-
-TEST(HFileWriter, ZstdRoundTripAcrossMajorBlockTypes) {
-    verify_compressed_major_blocks_round_trip(Compression::Zstd, "zstd_roundtrip_major_blocks");
-}
-
-TEST(HFileWriter, SnappyRoundTripAcrossMajorBlockTypes) {
-    verify_compressed_major_blocks_round_trip(Compression::Snappy, "snappy_roundtrip_major_blocks");
 }
 
 TEST(HFileWriter, GZipRoundTripAcrossMajorBlockTypes) {

@@ -49,7 +49,7 @@ public:
 
     /// Create a compressor for the given algorithm.
     /// @param level Compression level (1=fastest, 9=best ratio).
-    ///              Only meaningful for GZip and Zstd; ignored for LZ4/Snappy/None.
+    ///              Only meaningful for GZip; ignored for None.
     ///              Default (0) uses the algorithm's default level.
     static std::unique_ptr<Compressor> create(Compression c, int level = 0);
 

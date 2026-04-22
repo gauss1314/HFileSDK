@@ -55,15 +55,10 @@ public:
     }
 
     void set_data_block_encoding(Encoding enc) {
-        const char* name = "";
-        switch (enc) {
-        case Encoding::None:     name = "NONE";      break;
-        case Encoding::Prefix:   name = "PREFIX";    break;
-        case Encoding::Diff:     name = "DIFF";      break;
-        case Encoding::FastDiff: name = "FAST_DIFF"; break;
-        }
+        (void)enc;
+        static constexpr char name[] = "NONE";
         set_bytes(std::string(fileinfo::kDataBlockEncoding),
-                  {reinterpret_cast<const uint8_t*>(name), strlen(name)});
+                  {reinterpret_cast<const uint8_t*>(name), sizeof(name) - 1});
     }
 
     void set_bloom_filter_type(BloomType type) {

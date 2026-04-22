@@ -140,7 +140,7 @@ Arrow RecordBatch → HFile v3 → 本地/HDFS → BulkLoadHFilesTool → HBase 
 | `hfile.KEY_VALUE_VERSION` | int32 BE | = 1，表示包含 MemstoreTS |
 | `hfile.MAX_MEMSTORE_TS_KEY` | int64 BE | Bulk Load 场景为 0 |
 | `hfile.COMPARATOR` | UTF-8 | `org.apache.hadoop.hbase.CellComparatorImpl` |
-| `DATA_BLOCK_ENCODING` | UTF-8 | `NONE`/`PREFIX`/`DIFF`/`FAST_DIFF` |
+| `DATA_BLOCK_ENCODING` | UTF-8 | `NONE` |
 | `hfile.CREATE_TIME_TS` | int64 BE | 文件创建时间戳（毫秒） |
 | `hfile.LEN_OF_BIGGEST_CELL` | int64 BE | 最大 Cell 的字节数 |
 
@@ -192,30 +192,16 @@ Root Index Block (IDXROOT2)            → 指向各 Intermediate Block
 - 分块存储：每个 Data Block 对应一个 Bloom Chunk（`BLMFBLK2`）
 - 元数据块：`BLMFMET2`，包含 chunk 目录和参数
 
-### 2.8 数据块编码（4 种，全部已实现）
+### 2.8 数据块编码（仅支持 NONE）
 
-| 编码 | 压缩原理 | 热路径实现细节 |
-|------|---------|--------------|
-| `NONE` | 无压缩，顺序拼接 | 最快写路径 |
-| `PREFIX` | 共享 Key 前缀压缩 | 512B 栈缓冲 + SSE4.2 SIMD 前缀扫描 |
-| `DIFF` | PREFIX + 时间戳/类型差分 | 同上 |
-| `FAST_DIFF` | 优化的 DIFF，减少分支预测失败 | 同上，生产推荐 |
+当前 SDK 只支持 `NONE` 编码。Data Block 中的 KeyValue 以 HFile v3 原始格式顺序拼接，不再提供 `PREFIX`、`DIFF`、`FAST_DIFF` 等可选实现。
 
-所有编码器的 `append()` 热路径：
-- Key 序列化使用 **512B 栈缓冲**（`kStackBuf = 512`），超长 Key 才回退到堆分配
-- 前缀比较使用 **SSE4.2 `_mm_cmpeq_epi8`**（16B/次），标量回退
-
-### 2.9 压缩算法（5 种，全部已实现）
+### 2.9 压缩算法（仅支持 2 种）
 
 | 算法 | 压缩比 | 压缩速度 | 解压速度 | 推荐场景 |
 |------|-------|---------|---------|---------|
 | None | 1:1 | N/A | N/A | 最快写入，CPU 敏感 |
-| LZ4 | ~2.5:1 | 极快 | 极快 | **默认推荐，综合最佳** |
-| ZSTD | ~3.5:1 | 快 | 快 | 存储空间敏感 |
-| Snappy | ~2:1 | 极快 | 极快 | 低延迟场景 |
-| GZip | ~4:1 | 慢 | 中 | 归档存储 |
-
-Snappy 解压特别说明：已验证 `GetUncompressedLength()` 后才调用 `RawUncompress()`，防止输出缓冲区溢出。
+| GZip | ~4:1 | 慢 | 中 | 当前唯一压缩算法，兼顾 HBase 兼容性 |
 
 ---
 
@@ -473,12 +459,12 @@ flowchart LR
 ├─────────────────────────────────────────────────────────────┤
 │  Transform 层   ArrowToKVConverter（3 种映射模式）            │
 ├─────────────────────────────────────────────────────────────┤
-│  Encoding 层    DataBlockEncoder（None/Prefix/Diff/FastDiff）│
+│  Encoding 层    DataBlockEncoder（None）                    │
 │                 BlockIndexWriter（1级/2级自动切换）            │
 │                 CompoundBloomFilterWriter                    │
 │                 FileInfoBuilder / TrailerBuilder             │
 ├─────────────────────────────────────────────────────────────┤
-│  Codec 层       Compressor（LZ4/ZSTD/Snappy/GZip/None）     │
+│  Codec 层       Compressor（GZip/None）                    │
 │                 CRC32C（SSE4.2 + 标量回退）                   │
 ├─────────────────────────────────────────────────────────────┤
 │  I/O 层         BufferedFileWriter（跨平台，FILE*）           │
@@ -613,9 +599,9 @@ auto [bulk, s] = hfile::BulkLoadWriter::builder()
     .set_column_families({"cf1", "cf2"})
     .set_output_dir("/tmp/staging/my_table")
     .set_partitioner(RegionPartitioner::from_splits(splits))
-    .set_compression(hfile::Compression::LZ4)
+    .set_compression(hfile::Compression::GZip)
     .set_block_size(64 * 1024)
-    .set_data_block_encoding(hfile::Encoding::FastDiff)
+    .set_data_block_encoding(hfile::Encoding::None)
     .set_bloom_type(hfile::BloomType::Row)
     .set_parallelism(4)     // finish() 时 4 个线程并行关闭各 HFile
     .build();
@@ -635,8 +621,8 @@ auto [result, s2] = bulk->finish();
 auto [writer, s] = hfile::HFileWriter::builder()
     .set_path("/tmp/staging/cf1/hfile_0000.hfile")
     .set_column_family("cf1")
-    .set_compression(hfile::Compression::LZ4)
-    .set_data_block_encoding(hfile::Encoding::FastDiff)
+    .set_compression(hfile::Compression::GZip)
+    .set_data_block_encoding(hfile::Encoding::None)
     .set_bloom_type(hfile::BloomType::Row)
     .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
     .build();
@@ -791,7 +777,7 @@ HFileSDK/
 │   ├── bulk_load_writer.cc  BulkLoadWriterImpl + ThreadPool + 公开 API
 │   ├── checksum/            CRC32C
 │   ├── memory/              ArenaAllocator + BlockPool
-│   ├── block/               4 种数据块编码器 + 工厂
+│   ├── block/               NONE 数据块编码器 + 工厂
 │   ├── codec/               5 种压缩算法
 │   ├── bloom/               Compound Bloom Filter
 │   ├── index/               2 级 Block Index
@@ -817,9 +803,6 @@ HFileSDK/
 |-----|---------|------|------|
 | Apache Arrow C++ | 15.0+ | 核心数据格式 | 全平台 |
 | protobuf | 3.21+ | Trailer 序列化 | 全平台 |
-| lz4 | 1.9+ | LZ4 压缩 | 全平台 |
-| zstd | 1.5+ | ZSTD 压缩 | 全平台 |
-| snappy | 1.1+ | Snappy 压缩 | 全平台 |
 | zlib | 1.2+ | GZip 压缩 | 全平台 |
 | liburing | 2.3+ | io_uring 支持 | Linux only |
 | libhdfs3 | 2.3+ | HDFS 直写 | Linux/macOS only |
@@ -848,7 +831,7 @@ HFileSDK/
 
 当前自动化测试矩阵已覆盖：
 
-- 编码与序列化：CRC32C、KV 编码、None/Prefix/Diff/FastDiff、VarInt 边界
+- 编码与序列化：CRC32C、KV 编码、None、VarInt 边界
 - 格式与元数据：Bloom、Index、FileInfo、Trailer
 - Writer 主链路：AutoSort、内存预算、磁盘阈值、tags/MVCC、排序校验、错误策略
 - Arrow 与转换编排：WideTable / TallTable / RawKV、坏 stream、非法 row key rule、空 row key 过滤、进度回调
@@ -905,7 +888,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 |-------|------|------|
 | Phase 1 | 基础框架 + HFile v3 格式（PB Trailer、FileInfo 全字段、Tags+MVCC） | ✅ **完成** |
 | Phase 2 | 核心写入器（NONE 编码、无压缩、单 CF 约束） | ✅ **完成** |
-| Phase 3 | 编码（FAST_DIFF/DIFF/PREFIX）+ 压缩（LZ4/ZSTD/Snappy）+ Bloom Filter | ✅ **完成** |
+| Phase 3 | NONE 编码 + 压缩（GZip/None）+ Bloom Filter | ✅ **完成** |
 | Phase 4 | Region 分裂（手动模式）+ BulkLoadWriter + HDFS I/O | ✅ **完成** |
 | Phase 5 | Arrow 集成（WideTable/TallTable/RawKV）+ RowKeyRule 引擎 + JNI 层 + AutoSort | ✅ **完成** |
 | Phase 6 | 性能优化（SSE4.2 CRC、SIMD 前缀、栈缓冲、双缓冲 IoUring） | ⚠️ **核心完成**，Pipeline 待基准数据驱动 |
@@ -994,7 +977,6 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 
 | Bug ID | 严重度 | 位置 | 问题描述 | 修复方案 |
 |--------|--------|------|---------|---------|
-| B-06 | 🔴 安全 | `src/codec/compressor.cc:112` | `snappy::RawUncompress` 不验证输出缓冲区大小，`output_size` 不足时堆溢出 | 先 `GetUncompressedLength()` 验证，不足则返回 `InvalidArg` |
 | B-07 | 🟠 并发安全 | `src/memory/block_pool.h` | 无 double-release 和 foreign-pointer 检测，同指针 release 两次导致两线程同时 acquire 同一块内存 | `HFILE_DEBUG_POOL` 宏：`owned_` + `in_use_` 两个 set 检测，Debug 构建自动开启 |
 | B-08 | 🟡 性能+行为 | `src/partition/region_partitioner.cc` | `region_for()` 每次构造临时 `std::vector`（热路径堆分配）；空 key 无显式处理 | 自定义 `upper_bound` lambda 直接比较 `std::span` 和 `std::vector`，零分配 |
 | B-09 | 🔴 安全 | `include/hfile/types.h:decode_varint64` | 超过 10 个续位字节时 `shift≥64` 触发 C++ UB，并越界读缓冲区 | `kMaxBytes=10` 循环上限，第 10 字节仍有续位则截止返回 -1 |

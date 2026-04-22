@@ -207,7 +207,7 @@ public final class ConvertOptions {
         private String columnFamily      = "cf";
         private String compression       = "GZ";
         private int    compressionLevel  = 1;
-        private String dataBlockEncoding = "FAST_DIFF";
+        private String dataBlockEncoding = "NONE";
         private String bloomType         = "row";
         private String fsyncPolicy       = "safe";
         private String errorPolicy       = "skip_row";

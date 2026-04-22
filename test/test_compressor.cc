@@ -249,10 +249,7 @@ INSTANTIATE_TEST_SUITE_P(
     AllCodecs, CompressorTest,
     ::testing::Values(
         CompressTestParam{Compression::None,   "None"},
-        CompressTestParam{Compression::GZip,   "GZip"},
-        CompressTestParam{Compression::LZ4,    "LZ4"},
-        CompressTestParam{Compression::Zstd,   "Zstd"},
-        CompressTestParam{Compression::Snappy, "Snappy"}
+        CompressTestParam{Compression::GZip,   "GZip"}
     ),
     [](const ::testing::TestParamInfo<CompressTestParam>& info) {
         return info.param.name;

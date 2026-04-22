@@ -183,20 +183,16 @@ auto [writer, ws] = HFileWriter::builder()
 
 关键：排序模式是 `PreSortedVerified`。converter 已经在外部完成了排序，但 writer 仍然会**逐 KV 验证**排序正确性。如果发现乱序，立即返回 `SORT_ORDER_VIOLATION`。
 
-`[!]` 当前实现中，`open()` 方法会**强制覆盖**用户请求的编码和压缩为 NONE：
+`[!]` 当前实现中，Writer 只支持 `data_block_encoding = NONE`，压缩只支持 `NONE` 或 `GZ`：
 
 ```cpp
-if (opts_.data_block_encoding != Encoding::None) {
-    log::warn("...falling back to NONE...");
-    opts_.data_block_encoding = Encoding::None;
-}
-if (opts_.compression != Compression::None) {
-    log::warn("...falling back to NONE...");
-    opts_.compression = Compression::None;
+if (opts_.compression != Compression::None &&
+    opts_.compression != Compression::GZip) {
+    return Status::InvalidArg("only compression=NONE or GZ is supported");
 }
 ```
 
-原因是 Prefix/Diff/FastDiff 编码器的输出还不能保证与 HBase 解码器字节级兼容。这意味着目前实际生成的 HFile **始终使用 NONE 编码 + 无压缩**。
+原因是 SDK 已经正式收口为 `NONE` 编码，压缩层也只保留 `NONE/GZ` 两种模式，以减少不可达代码和兼容性分支。
 
 ### 3.7 Pass 2：按排序顺序写入
 

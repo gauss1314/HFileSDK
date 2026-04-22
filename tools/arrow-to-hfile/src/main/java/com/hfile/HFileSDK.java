@@ -10,10 +10,10 @@ package com.hfile;
  * // Optional: global configuration (call once before first convert())
  * sdk.configure("""
  *     {
- *       "compression":          "lz4",
+ *       "compression":          "GZ",
  *       "block_size":           65536,
  *       "column_family":        "cf",
- *       "data_block_encoding":  "FAST_DIFF"
+ *       "data_block_encoding":  "NONE"
  *     }
  *     """);
  *
@@ -139,11 +139,11 @@ public class HFileSDK {
      *
      * <p>Supported JSON keys:
      * <ul>
-     *   <li>{@code compression}                — {@code "none" | "lz4" | "zstd" | "snappy" | "GZ"}
+     *   <li>{@code compression}                — {@code "none" | "GZ"}
      *                                            (also accepts {@code "gzip"} for compatibility)
      *   <li>{@code block_size}                 — data block size in bytes (default 65536)
      *   <li>{@code column_family}              — HBase column family name (default "cf")
-     *   <li>{@code data_block_encoding}        — {@code "NONE" | "PREFIX" | "DIFF" | "FAST_DIFF"}
+     *   <li>{@code data_block_encoding}        — {@code "NONE"}
      *   <li>{@code fsync_policy}               — {@code "safe" | "fast" | "paranoid"}
      *   <li>{@code error_policy}               — {@code "strict" | "skip_row" | "skip_batch"}
      *   <li>{@code bloom_type}                 — {@code "none" | "row" | "rowcol"}
@@ -172,7 +172,7 @@ public class HFileSDK {
      * <pre>{@code
      * sdk.configure("""
      *     {
-     *       "compression":               "lz4",
+     *       "compression":               "GZ",
      *       "column_family":             "cf",
      *       "excluded_column_prefixes":  ["_hoodie"]
      *     }
@@ -207,7 +207,7 @@ public class HFileSDK {
         private int    compressionLevel   = 1;
         private int    blockSize          = 65536;
         private String columnFamily       = "cf";
-        private String dataBlockEncoding  = "FAST_DIFF";
+        private String dataBlockEncoding  = "NONE";
         private long   maxMemoryBytes     = 0;
         private int    compressionThreads = 0;
         private int    compressionQueueDepth = 0;

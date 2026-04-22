@@ -21,8 +21,8 @@ import java.nio.file.Paths;
  *   --table       events_table \
  *   --rule        "STARTTIME,0,false,10#IMSI,1,true,15#MSISDN,2,false,11" \
  *   [--cf         cf] \
- *   [--compression lz4] \
- *   [--encoding   FAST_DIFF] \
+ *   [--compression GZ] \
+ *   [--encoding   NONE] \
  *   [--block-size 65536] \
  *   [--error-policy skip_row]
  * }</pre>
@@ -43,7 +43,7 @@ import java.nio.file.Paths;
  *         .tableName("events_table")
  *         .rowKeyRule("STARTTIME,0,false,10#IMSI,1,true,15")
  *         .columnFamily("cf")
- *         .compression("lz4")
+ *         .compression("GZ")
  *         .build());
  *
  * if (!result.isSuccess()) {
@@ -222,7 +222,7 @@ public class ArrowToHFileConverter {
         String nativeLib   = cmd.getOptionValue("native-lib");
         String cf          = cmd.getOptionValue("cf",            "cf");
         String compression = cmd.getOptionValue("compression",   "GZ");
-        String encoding    = cmd.getOptionValue("encoding",      "FAST_DIFF");
+        String encoding    = cmd.getOptionValue("encoding",      "NONE");
         String bloomType   = cmd.getOptionValue("bloom",         "row");
         String fsyncPolicy = cmd.getOptionValue("fsync-policy",  "safe");
         String errorPolicy = cmd.getOptionValue("error-policy",  "skip_row");
@@ -360,7 +360,7 @@ public class ArrowToHFileConverter {
         String nativeLib = cmd.getOptionValue("native-lib");
         String cf          = cmd.getOptionValue("cf",           "cf");
         String compression = cmd.getOptionValue("compression",  "GZ");
-        String encoding    = cmd.getOptionValue("encoding",     "FAST_DIFF");
+        String encoding    = cmd.getOptionValue("encoding",     "NONE");
         String bloomType   = cmd.getOptionValue("bloom",        "row");
         String errorPolicy = cmd.getOptionValue("error-policy", "skip_row");
         int    blockSize   = parseInt(cmd.getOptionValue("block-size", "65536"), 65536);
@@ -528,13 +528,13 @@ public class ArrowToHFileConverter {
             .desc("Absolute path to libhfilesdk.so/.dll     [default: from env/library.path]")
             .hasArg().argName("PATH").build());
         o.addOption(Option.builder().longOpt("compression")
-            .desc("Compression: none|lz4|zstd|snappy|GZ    [default: GZ, also accepts gzip]")
+            .desc("Compression: none|GZ                     [default: GZ, also accepts gzip]")
             .hasArg().argName("ALG").build());
         o.addOption(Option.builder().longOpt("compression-level")
             .desc("Compression level 1(fastest)-9(best ratio), 0 = codec default [default: 1]")
             .hasArg().argName("N").build());
         o.addOption(Option.builder().longOpt("encoding")
-            .desc("Encoding: NONE|PREFIX|DIFF|FAST_DIFF     [default: FAST_DIFF]")
+            .desc("Encoding: NONE                            [default: NONE]")
             .hasArg().argName("ENC").build());
         o.addOption(Option.builder().longOpt("bloom")
             .desc("Bloom filter: none|row|rowcol            [default: row]")

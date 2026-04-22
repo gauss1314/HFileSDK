@@ -1,8 +1,6 @@
 #include <gtest/gtest.h>
 #include "block/data_block_encoder.h"
 #include "block/none_encoder.h"
-#include "block/prefix_encoder.h"
-#include "block/fast_diff_encoder.h"
 #include <hfile/types.h>
 #include <vector>
 #include <cstring>
@@ -103,12 +101,6 @@ TEST(NoneEncoder, Reset) {
 // ─── Factory ─────────────────────────────────────────────────────────────────
 
 TEST(DataBlockEncoder, Factory) {
-    auto none     = DataBlockEncoder::create(Encoding::None,     64*1024);
-    auto prefix   = DataBlockEncoder::create(Encoding::Prefix,   64*1024);
-    auto diff     = DataBlockEncoder::create(Encoding::Diff,     64*1024);
-    auto fastdiff = DataBlockEncoder::create(Encoding::FastDiff, 64*1024);
-    EXPECT_NE(none,     nullptr);
-    EXPECT_NE(prefix,   nullptr);
-    EXPECT_NE(diff,     nullptr);
-    EXPECT_NE(fastdiff, nullptr);
+    auto none = DataBlockEncoder::create(Encoding::None, 64 * 1024);
+    EXPECT_NE(none, nullptr);
 }

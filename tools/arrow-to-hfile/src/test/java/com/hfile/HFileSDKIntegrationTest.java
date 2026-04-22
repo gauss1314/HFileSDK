@@ -71,6 +71,13 @@ public class HFileSDKIntegrationTest {
     }
 
     @Test
+    void configureRejectsUnsupportedCompressionModes() {
+        HFileSDK sdk = new HFileSDK();
+        assertEquals(HFileSDK.INVALID_ARGUMENT, sdk.configure("{\"compression\":\"lz4\"}"));
+        assertTrue(sdk.getLastResult().contains("NONE or GZ"));
+    }
+
+    @Test
     void configureRejectsNegativeMaxMemoryBytes() {
         HFileSDK sdk = new HFileSDK();
         int rc = sdk.configure("{\"max_memory_bytes\":-1}");

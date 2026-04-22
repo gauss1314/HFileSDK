@@ -65,7 +65,6 @@ Magic 字符串标识了 Block 类型：
 | Magic | 常量 | 用途 |
 |-------|------|------|
 | `DATABLK*` | `kDataBlockMagic` | NONE 编码的数据块 |
-| `DATABLKE` | `kEncodedDataBlockMagic` | 非 NONE 编码的数据块 |
 | `IDXROOT2` | `kRootIndexMagic` | 根索引块 |
 | `IDXINTE2` | `kIntermedIdxMagic` | 中间索引块 |
 | `FILEINF2` | `kFileInfoMagic` | FileInfo 块 |
@@ -314,7 +313,7 @@ load_on_open_offset = 当前写入位置（Bloom 数据块之后）
 | 限制 | 说明 | 代码位置 |
 |------|------|----------|
 | 编码强制 NONE | Prefix/Diff/FastDiff 还不兼容 HBase | `writer.cc: open()` |
-| 压缩强制 NONE | 压缩也被禁用 | `writer.cc: open()` |
+| 压缩只支持 NONE/GZ | 其他算法已移除 | `writer.cc: build()` |
 | 索引单级 | max_per_block 设为 MAX，禁用多级 | `writer.cc: index_writer_` |
 | 无 Encryption | encryption_key 字段未使用 | `trailer_builder.h` |
 | Tags 始终为空 | Bulk Load 不需要 ACL/Visibility | `converter.cc` |

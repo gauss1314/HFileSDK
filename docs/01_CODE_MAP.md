@@ -27,9 +27,6 @@ src/
 ├── block/                 ← 数据块编码器
 │   ├── data_block_encoder.h  抽象基类 + serialize_kv/serialize_key 内联函数
 │   ├── none_encoder.h        NONE 编码：KV 原样拼接
-│   ├── prefix_encoder.h      PREFIX 编码：公共前缀压缩
-│   ├── diff_encoder.h        DIFF 编码：时间戳/类型差分
-│   ├── fast_diff_encoder.h   FAST_DIFF 编码：优化的差分编码
 │   └── block_builder.cc      工厂方法 DataBlockEncoder::create()
 │
 ├── bloom/                 ← Bloom Filter
@@ -41,7 +38,7 @@ src/
 │
 ├── codec/                 ← 压缩编解码
 │   ├── compressor.h          Compressor 抽象 + 工厂
-│   └── compressor.cc         LZ4/ZSTD/Snappy/GZip 封装
+│   └── compressor.cc         GZip/None 封装
 │
 ├── io/                    ← 文件 I/O 后端
 │   ├── buffered_writer.h     BlockWriter 抽象 + BufferedFileWriter（FILE* 封装）

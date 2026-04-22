@@ -22,7 +22,7 @@
 
 - [07_WRITER_DEEP_DIVE.md](07_WRITER_DEEP_DIVE.md) — **writer.cc 的逐层拆解**：从 Builder 到 open()、append() 三道关卡、flush_data_block 物理写入、finish() 的偏移量依赖链求解、析构安全网、全部状态变量解析
 - [04_ROW_KEY_ENGINE.md](04_ROW_KEY_ENGINE.md) — rowKeyRule 编译与执行引擎，列排除机制，与 Arrow Schema 的交互
-- [05_BLOCK_ENCODERS.md](05_BLOCK_ENCODERS.md) — 四种数据块编码器（None/Prefix/Diff/FastDiff）的实现原理与二进制格式
+- [05_BLOCK_ENCODERS.md](05_BLOCK_ENCODERS.md) — 当前唯一数据块编码器 `NONE` 的实现与约束
 - [06_PRODUCTION_FEATURES.md](06_PRODUCTION_FEATURES.md) — 崩溃安全、内存控制、输入校验、JNI 异常隔离、可观测性
 
 ## 最短路径

@@ -80,9 +80,6 @@ bash scripts/coverage.sh
 | CRC32C | 已知值、增量计算、大缓冲区、chunk checksum | `test_crc32c` |
 | KV 编码 | KV 序列化、tags 长度、时间戳大端序、`compare_keys`、VarInt 边界 | `test_kv_encoding`、`test_round3_bugs` |
 | NoneEncoder | 空块、单 KV、满块、reset、工厂创建 | `test_block_builder` |
-| PrefixEncoder | 空块、共享前缀、首 key、reset | `test_prefix_encoder` |
-| DiffEncoder | 空块、单 KV、压缩收益、首 key、reset、大 key 回退 | `test_diff_encoder` |
-| FastDiffEncoder | 空块、单/多 KV、压缩收益、首 key、reset、tags、大 key回退 | `test_fast_diff_encoder` |
 
 ### 元数据与格式
 
