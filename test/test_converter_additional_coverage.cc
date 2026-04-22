@@ -251,25 +251,38 @@ TEST(ConverterAdditionalCoverage, NumericFastPathCoversMultipleIntegralTypes) {
 
     for (const auto& test_case : cases) {
         auto arrow_path = test_case.write_input();
-        auto hfile_path = dir / (test_case.name + ".hfile");
+        auto hfile_path_off = dir / (test_case.name + "_off.hfile");
+        auto hfile_path_on = dir / (test_case.name + "_on.hfile");
 
-        ConvertOptions opts;
-        opts.arrow_path = arrow_path.string();
-        opts.hfile_path = hfile_path.string();
-        opts.row_key_rule = "id,0,false,4";
-        opts.column_family = "cf";
-        opts.default_timestamp = 1;
-        opts.writer_opts.column_family = "cf";
-        opts.writer_opts.compression = Compression::None;
-        opts.writer_opts.data_block_encoding = Encoding::None;
-        opts.writer_opts.bloom_type = BloomType::None;
-        opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+        ConvertOptions off_opts;
+        off_opts.arrow_path = arrow_path.string();
+        off_opts.hfile_path = hfile_path_off.string();
+        off_opts.row_key_rule = "id,0,false,4";
+        off_opts.column_family = "cf";
+        off_opts.default_timestamp = 1;
+        off_opts.writer_opts.column_family = "cf";
+        off_opts.writer_opts.compression = Compression::None;
+        off_opts.writer_opts.data_block_encoding = Encoding::None;
+        off_opts.writer_opts.bloom_type = BloomType::None;
+        off_opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
 
-        auto result = convert(opts);
-        EXPECT_EQ(result.error_code, ErrorCode::OK) << test_case.name << ": " << result.error_message;
-        EXPECT_EQ(result.numeric_sort_fast_path_mode, NumericSortFastPathMode::On);
-        EXPECT_TRUE(result.numeric_sort_fast_path_used) << test_case.name;
-        EXPECT_TRUE(fs::exists(hfile_path));
+        auto off_result = convert(off_opts);
+        EXPECT_EQ(off_result.error_code, ErrorCode::OK)
+            << test_case.name << " off: " << off_result.error_message;
+        EXPECT_EQ(off_result.numeric_sort_fast_path_mode, NumericSortFastPathMode::Off);
+        EXPECT_FALSE(off_result.numeric_sort_fast_path_used) << test_case.name << " off";
+        EXPECT_TRUE(fs::exists(hfile_path_off));
+
+        ConvertOptions on_opts = off_opts;
+        on_opts.hfile_path = hfile_path_on.string();
+        on_opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+        auto on_result = convert(on_opts);
+        EXPECT_EQ(on_result.error_code, ErrorCode::OK)
+            << test_case.name << " on: " << on_result.error_message;
+        EXPECT_EQ(on_result.numeric_sort_fast_path_mode, NumericSortFastPathMode::On);
+        EXPECT_TRUE(on_result.numeric_sort_fast_path_used) << test_case.name << " on";
+        EXPECT_TRUE(fs::exists(hfile_path_on));
     }
 
     fs::remove_all(dir);

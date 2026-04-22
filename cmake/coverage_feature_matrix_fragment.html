@@ -46,68 +46,87 @@
 </style>
 <section class="hfile-feature-matrix">
   <h1>HFileSDK 正交功能点覆盖矩阵</h1>
-  <p>该矩阵展示的是组合功能覆盖视图，用来补充下方的行覆盖率 HTML 报告。表格内容基于当前 C++ 自动化测试维护。</p>
+  <p>该矩阵展示的是组合功能覆盖视图，用来补充下方的行覆盖率 HTML 报告。矩阵只统计当前真实支持域：压缩仅支持 <code>Compression::{None, GZip}</code>，编码仅支持 <code>Encoding::None</code>。</p>
+  <p>表格内容基于当前稳定自动化测试维护；像 <code>hfile_chaos_kill</code> 这类时间敏感、默认不纳入覆盖率脚本口径的用例，不计入“已覆盖”判定。</p>
   <div class="legend">
     <span>✅ 已有自动化覆盖</span>
     <span>⚠️ 仅部分覆盖或间接覆盖</span>
     <span>❌ 尚未覆盖</span>
     <span>N/A 不适用</span>
   </div>
-  <h2>1. 压缩 × Block 类型</h2>
+  <h2>1. 当前支持面 × 自动化状态</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>能力项</th>
+        <th>当前支持面</th>
+        <th>自动化状态</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>压缩算法</td><td>None / GZip</td><td>✅</td></tr>
+      <tr><td>Data Block Encoding</td><td>None</td><td>✅</td></tr>
+      <tr><td>不支持的压缩算法被拒绝</td><td>LZ4 / Zstd / Snappy / 其他别名</td><td>✅</td></tr>
+      <tr><td>不支持的编码方式被拒绝</td><td>FastDiff / PrefixTree / 其他非 NONE</td><td>✅</td></tr>
+    </tbody>
+  </table>
+  <h2>2. 压缩 × 关键 Block 类型</h2>
   <table>
     <thead>
       <tr>
         <th>Block 类型</th>
         <th>None</th>
-        <th>LZ4</th>
-        <th>Zstd</th>
-        <th>Snappy</th>
         <th>GZip</th>
       </tr>
     </thead>
     <tbody>
-      <tr><td>DataBlock</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
-      <tr><td>RootIndex (IDXROOT2)</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
-      <tr><td>FileInfo (FILEINF2)</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
-      <tr><td>BloomChunk (BLMFBLK2)</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
-      <tr><td>BloomMeta (BLMFMET2)</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
-      <tr><td>compressor round-trip</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td><td>✅</td></tr>
+      <tr><td>DataBlock</td><td>✅</td><td>✅</td></tr>
+      <tr><td>RootIndex (IDXROOT2)</td><td>✅</td><td>✅</td></tr>
+      <tr><td>FileInfo (FILEINF2)</td><td>✅</td><td>✅</td></tr>
+      <tr><td>BloomChunk (BLMFBLK2)</td><td>✅</td><td>✅</td></tr>
+      <tr><td>BloomMeta (BLMFMET2)</td><td>✅</td><td>✅</td></tr>
+      <tr><td>compressor round-trip</td><td>✅</td><td>✅</td></tr>
     </tbody>
   </table>
-  <h2>2. 压缩 × E2E 写入+验证</h2>
+  <h2>3. 端到端写入 / 读取 / 校验</h2>
   <table>
     <thead>
       <tr>
         <th>场景</th>
         <th>None</th>
-        <th>GZip Level 1</th>
+        <th>GZip</th>
       </tr>
     </thead>
     <tbody>
       <tr><td>Writer 写入成功</td><td>✅</td><td>✅</td></tr>
+      <tr><td>Converter 端到端转换成功</td><td>✅</td><td>✅</td></tr>
       <tr><td>C++ 侧 block 可解压验证</td><td>N/A</td><td>✅</td></tr>
       <tr><td>Bloom 块被压缩</td><td>N/A</td><td>✅</td></tr>
       <tr><td>Index 块被压缩</td><td>N/A</td><td>✅</td></tr>
-      <tr><td>hbase hfile 可读</td><td>✅</td><td>❌</td></tr>
-      <tr><td>BulkLoad 成功</td><td>✅</td><td>❌</td></tr>
+      <tr><td>Java/HBase Reader 可读验证</td><td>✅</td><td>✅</td></tr>
+      <tr><td>JNI / Java 产物一致性</td><td>N/A</td><td>✅</td></tr>
+      <tr><td>真实 HBase BulkLoad 成功（集群）</td><td>❌</td><td>❌</td></tr>
     </tbody>
   </table>
-  <h2>3. 排序 × 列排除 × 压缩</h2>
+  <h2>4. 排序 / 列排除 / 热路径</h2>
   <table>
     <thead>
       <tr>
-        <th>排序模式</th>
-        <th>无列排除</th>
-        <th>有列排除 (_hoodie / exact)</th>
+        <th>能力项</th>
+        <th>Writer</th>
+        <th>Converter</th>
       </tr>
     </thead>
     <tbody>
       <tr><td>AutoSort</td><td>✅</td><td>✅</td></tr>
-      <tr><td>PreSortedVerified</td><td>✅</td><td>✅</td></tr>
-      <tr><td>PreSortedTrusted</td><td>❌</td><td>❌</td></tr>
+      <tr><td>PreSortedVerified</td><td>✅</td><td>⚠️</td></tr>
+      <tr><td>PreSortedTrusted</td><td>✅</td><td>✅</td></tr>
+      <tr><td>列排除（exact / prefix，如 <code>_hoodie</code>）</td><td>N/A</td><td>✅</td></tr>
+      <tr><td>numeric_sort_fast_path</td><td>N/A</td><td>✅</td></tr>
+      <tr><td>grouped / hot path 追加路径</td><td>✅</td><td>✅</td></tr>
     </tbody>
   </table>
-  <h2>4. 错误处理路径</h2>
+  <h2>5. 错误处理路径</h2>
   <table>
     <thead>
       <tr>
@@ -119,10 +138,26 @@
     </thead>
     <tbody>
       <tr><td>空 Row Key</td><td>✅</td><td>✅</td><td>✅</td></tr>
-      <tr><td>超长 Row Key</td><td>✅</td><td>❌</td><td>❌</td></tr>
-      <tr><td>超大 Value</td><td>✅</td><td>✅</td><td>❌</td></tr>
-      <tr><td>排序违规</td><td>✅</td><td>N/A</td><td>✅</td></tr>
+      <tr><td>超长 Row Key</td><td>✅</td><td>⚠️</td><td>⚠️</td></tr>
+      <tr><td>超大 Value</td><td>✅</td><td>⚠️</td><td>⚠️</td></tr>
+      <tr><td>排序违规</td><td>✅</td><td>N/A</td><td>❌</td></tr>
       <tr><td>max_error_count 触发</td><td>N/A</td><td>✅</td><td>N/A</td></tr>
+    </tbody>
+  </table>
+  <h2>6. Builder / 配置校验</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>校验项</th>
+        <th>C++ Builder</th>
+        <th>JNI / Java 配置层</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>不支持的压缩算法被拒绝</td><td>✅</td><td>✅</td></tr>
+      <tr><td>不支持的编码方式被拒绝</td><td>✅</td><td>✅</td></tr>
+      <tr><td>负数 compression_threads / queue_depth 被拒绝</td><td>N/A</td><td>✅</td></tr>
+      <tr><td>非法 numeric_sort_fast_path 模式被拒绝</td><td>N/A</td><td>✅</td></tr>
     </tbody>
   </table>
 </section>

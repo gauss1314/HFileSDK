@@ -144,18 +144,6 @@ static size_t estimate_owned_kv_bytes(const OwnedKeyValue& kv) noexcept {
          + kv.tags.size();
 }
 
-static void copy_key_only(const KeyValue& kv, OwnedKeyValue* out) {
-    out->row.assign(kv.row.begin(), kv.row.end());
-    out->family.assign(kv.family.begin(), kv.family.end());
-    out->qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
-    out->timestamp = kv.timestamp;
-    out->key_type = kv.key_type;
-    out->value.clear();
-    out->tags.clear();
-    out->memstore_ts = 0;
-    out->has_memstore_ts = false;
-}
-
 static void copy_key_only_same_family(const KeyValue& kv, OwnedKeyValue* out) {
     out->row.assign(kv.row.begin(), kv.row.end());
     out->qualifier.assign(kv.qualifier.begin(), kv.qualifier.end());
@@ -242,9 +230,6 @@ static std::vector<uint8_t> compute_midpoint_key(const KeyValue* left,
     std::vector<uint8_t> midpoint;
     if (midpoint_bytes(left->row, right.row, &midpoint)) {
         return serialize_index_key(midpoint, {}, {});
-    }
-    if (midpoint_bytes(left->family, right.family, &midpoint)) {
-        return serialize_index_key(right.row, midpoint, {});
     }
     if (midpoint_bytes(left->qualifier, right.qualifier, &midpoint)) {
         return serialize_index_key(right.row, right.family, midpoint);
@@ -681,7 +666,6 @@ public:
 
     int64_t  position()    const noexcept { return writer_ ? writer_->position() : 0; }
     uint64_t entry_count() const noexcept { return entry_count_; }
-    uint64_t skipped_rows() const noexcept { return skipped_rows_; }
     WriterStats stats() const noexcept {
         WriterStats stats = stats_;
         stats.data_block_count = data_block_count_;
@@ -719,10 +703,6 @@ private:
                             uint8_t* output,
                             size_t output_capacity,
                             size_t* output_size) {
-        if (opts_.compression == Compression::None) {
-            *output_size = raw.size();
-            return Status::OK();
-        }
         const size_t compressed_size = has_raw_crc32
             ? compressor.compress_with_crc32(raw, output, output_capacity, raw_crc32)
             : compressor.compress(raw, output, output_capacity);
@@ -1047,15 +1027,6 @@ private:
             std::vector<uint8_t>(index_key.begin(), index_key.end()),
             block_offset,
             static_cast<int32_t>(kBlockHeaderSize + on_disk_size_without_header));
-        return Status::OK();
-    }
-
-    // ── Write any raw block (index, meta, etc.) with header ───────────────────
-    Status write_raw_block(const std::array<uint8_t, 8>& magic,
-                            std::span<const uint8_t> data) {
-        auto block = build_raw_block(magic, data, prev_block_offset_);
-        prev_block_offset_ = writer_->position();
-        HFILE_RETURN_IF_ERROR(writer_->write(block));
         return Status::OK();
     }
 
@@ -1463,24 +1434,8 @@ private:
         const auto encoder_append_start = hotpath_profile_enabled_
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        if (!encoder_->append_sized(kv, encoded_size)) {
-            if (hotpath_profile_enabled_) {
-                append_encoder_ns_ += std::chrono::steady_clock::now() - encoder_append_start;
-            }
-            HFILE_RETURN_IF_ERROR(flush_data_block());
-            if (encoder_->empty()) {
-                copy_key_only_same_family(kv, &first_kv_in_block_);
-                has_first_kv_in_block_ = true;
-            }
-            const auto retry_append_start = hotpath_profile_enabled_
-                ? std::chrono::steady_clock::now()
-                : std::chrono::steady_clock::time_point{};
-            if (!encoder_->append_sized(kv, encoded_size))
-                return Status::Internal("Failed to append KV even after flush");
-            if (hotpath_profile_enabled_) {
-                append_encoder_ns_ += std::chrono::steady_clock::now() - retry_append_start;
-            }
-        } else if (hotpath_profile_enabled_) {
+        encoder_->append_sized(kv, encoded_size);
+        if (hotpath_profile_enabled_) {
             append_encoder_ns_ += std::chrono::steady_clock::now() - encoder_append_start;
         }
 

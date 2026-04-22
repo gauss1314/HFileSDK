@@ -84,6 +84,26 @@ void test_compile_bad_padlen(){
     auto [b, s] = RowKeyBuilder::compile("COL,0,false,xyz");
     EXPECT(!s.ok());
 }
+void test_compile_only_hashes_produces_no_segments(){
+    auto [b, s] = RowKeyBuilder::compile("#");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("produced no segments") != std::string::npos);
+}
+void test_compile_malformed_encoded_segment_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("long(hash,0,false,0");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("malformed encoded segment") != std::string::npos);
+}
+void test_compile_unsupported_encoded_segment_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("bytes(hash),0,false,0");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("unsupported encoded segment") != std::string::npos);
+}
+void test_compile_unsupported_transform_rejected(){
+    auto [b, s] = RowKeyBuilder::compile("short(md5),0,false,0");
+    EXPECT(!s.ok());
+    EXPECT(std::string(s.message()).find("unsupported transform") != std::string::npos);
+}
 
 // ─── Document example: full 4-segment rule ───────────────────────────────────
 // rowKeyRule: "STARTTIME,0,false,10#IMSI,1,true,15#MSISDN,2,false,11,RIGHT,#$RND$,3,false,4"
@@ -356,6 +376,10 @@ int main(){
     test_compile_too_few_fields();
     test_compile_bad_index();
     test_compile_bad_padlen();
+    test_compile_only_hashes_produces_no_segments();
+    test_compile_malformed_encoded_segment_rejected();
+    test_compile_unsupported_encoded_segment_rejected();
+    test_compile_unsupported_transform_rejected();
     test_doc_example();
     test_left_pad();
     test_right_pad();

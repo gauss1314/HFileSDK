@@ -88,12 +88,6 @@ private:
     // Shared PRNG — seeded once at construction, NOT thread-safe.
     // Each RowKeyBuilder instance has its own RNG.
     std::mt19937 rng_{std::random_device{}()};
-
-    /// Apply pad + reverse to one segment value.
-    static std::string apply_segment(const RowKeySegment& seg, std::string val);
-
-    /// Generate `len` random digits (0–8), matching UniverseHbaseBeanUtil.getRandomValue().
-    std::string random_digits(int len);
 };
 
 // ─── rowValue helper ─────────────────────────────────────────────────────────

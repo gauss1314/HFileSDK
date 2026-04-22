@@ -374,40 +374,6 @@ Status RowKeyBuilder::build_checked_from_segment(size_t start_segment_index,
     return Status::OK();
 }
 
-// ─── RowKeyBuilder::apply_segment ─────────────────────────────────────────────
-
-std::string RowKeyBuilder::apply_segment(const RowKeySegment& seg, std::string val) {
-    // 1. Padding (only if padLen > 0 and value is shorter)
-    if (seg.pad_len > 0 && static_cast<int>(val.size()) < seg.pad_len) {
-        int deficit = seg.pad_len - static_cast<int>(val.size());
-        std::string pad(static_cast<size_t>(deficit), seg.pad_char);
-        if (seg.pad_right)
-            val += pad;        // StringUtils.rightPad
-        else
-            val = pad + val;   // StringUtils.leftPad
-    }
-
-    // 2. Reverse (after padding, matching Java setValue order)
-    if (seg.reverse) {
-        std::reverse(val.begin(), val.end());
-    }
-
-    return val;
-}
-
-// ─── RowKeyBuilder::random_digits ────────────────────────────────────────────
-
-std::string RowKeyBuilder::random_digits(int len) {
-    // Matches UniverseHbaseBeanUtil.getRandomValue():
-    //   RANDOM.nextInt(SEED) where SEED = 9  → digits 0–8 (NOT 0–9)
-    std::uniform_int_distribution<int> dist(0, 8);
-    std::string result;
-    result.reserve(static_cast<size_t>(len));
-    for (int i = 0; i < len; ++i)
-        result += static_cast<char>('0' + dist(rng_));
-    return result;
-}
-
 // ─── split_row_value ──────────────────────────────────────────────────────────
 
 std::vector<std::string_view> split_row_value(std::string_view row_value,

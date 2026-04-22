@@ -49,14 +49,6 @@ static bool hotpath_profiling_enabled() {
 }
 
 static int map_status_to_error_code(const Status& s) {
-    if (s.message().find("INVALID_ARGUMENT:") == 0)
-        return ErrorCode::INVALID_ARGUMENT;
-    if (s.message().find("MemoryBudget:") == 0)
-        return ErrorCode::MEMORY_EXHAUSTED;
-    if (s.message().find("SCHEMA_MISMATCH:") == 0)
-        return ErrorCode::SCHEMA_MISMATCH;
-    if (s.message().find("INVALID_ROW_KEY_RULE:") == 0)
-        return ErrorCode::INVALID_ROW_KEY_RULE;
     if (s.message().find("DISK_SPACE_EXHAUSTED") != std::string::npos)
         return ErrorCode::DISK_EXHAUSTED;
     return s.code() == Status::Code::IoError ? ErrorCode::IO_ERROR
@@ -91,10 +83,6 @@ static std::vector<int> build_removal_indices(
         const std::shared_ptr<arrow::Schema>&   schema,
         const std::vector<std::string>&         excluded_names,
         const std::vector<std::string>&         excluded_prefixes) {
-
-    if (excluded_names.empty() && excluded_prefixes.empty())
-        return {};
-
     std::unordered_set<std::string> name_set(excluded_names.begin(), excluded_names.end());
 
     std::vector<int>         indices;
@@ -464,129 +452,19 @@ static Status scalar_to_string(const arrow::Array& arr, int64_t row, std::string
     }
 }
 
-// ─── Arrow scalar → Big-Endian bytes (for HBase value) ────────────────────────
+// ─── Arrow scalar → materialized bytes fallback ───────────────────────────────
 
 static Status scalar_to_bytes(const arrow::Array& arr, int64_t row, std::vector<uint8_t>* out) {
     out->clear();
     if (arr.IsNull(row)) return Status::OK();
 
-    using T = arrow::Type;
-    auto t = arr.type_id();
-
-    switch (t) {
-    case T::STRING: {
-        auto& sa = static_cast<const arrow::StringArray&>(arr);
-        auto sv = sa.GetView(row);
-        out->assign(sv.begin(), sv.end());
+    auto s = arr.GetScalar(row);
+    if (s.ok()) {
+        auto str = s.ValueOrDie()->ToString();
+        out->assign(str.begin(), str.end());
         return Status::OK();
     }
-    case T::LARGE_STRING: {
-        auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
-        auto sv = sa.GetView(row);
-        out->assign(sv.begin(), sv.end());
-        return Status::OK();
-    }
-    case T::BINARY: {
-        auto& ba = static_cast<const arrow::BinaryArray&>(arr);
-        auto sv = ba.GetView(row);
-        out->assign(sv.begin(), sv.end());
-        return Status::OK();
-    }
-    case T::LARGE_BINARY: {
-        auto& ba = static_cast<const arrow::LargeBinaryArray&>(arr);
-        auto sv = ba.GetView(row);
-        out->assign(sv.begin(), sv.end());
-        return Status::OK();
-    }
-    case T::BOOL:
-        out->assign({static_cast<uint8_t>(static_cast<const arrow::BooleanArray&>(arr).Value(row) ? 1 : 0)});
-        return Status::OK();
-    case T::INT8:
-        out->assign({static_cast<uint8_t>(static_cast<const arrow::Int8Array&>(arr).Value(row))});
-        return Status::OK();
-    case T::INT16: {
-        uint16_t v = static_cast<uint16_t>(static_cast<const arrow::Int16Array&>(arr).Value(row));
-        out->resize(2);
-        (*out)[0] = static_cast<uint8_t>(v >> 8);
-        (*out)[1] = static_cast<uint8_t>(v);
-        return Status::OK();
-    }
-    case T::INT32: {
-        uint32_t v = static_cast<uint32_t>(static_cast<const arrow::Int32Array&>(arr).Value(row));
-        out->resize(4);
-        (*out)[0] = static_cast<uint8_t>(v >> 24);
-        (*out)[1] = static_cast<uint8_t>(v >> 16);
-        (*out)[2] = static_cast<uint8_t>(v >> 8);
-        (*out)[3] = static_cast<uint8_t>(v);
-        return Status::OK();
-    }
-    case T::INT64: {
-        uint64_t v = static_cast<uint64_t>(static_cast<const arrow::Int64Array&>(arr).Value(row));
-        out->resize(8);
-        for (int i = 7; i >= 0; --i) { (*out)[i] = v & 0xFF; v >>= 8; }
-        return Status::OK();
-    }
-    case T::UINT8:
-        out->assign({static_cast<const arrow::UInt8Array&>(arr).Value(row)});
-        return Status::OK();
-    case T::UINT16: {
-        uint16_t v = static_cast<const arrow::UInt16Array&>(arr).Value(row);
-        out->resize(2);
-        (*out)[0] = static_cast<uint8_t>(v >> 8);
-        (*out)[1] = static_cast<uint8_t>(v);
-        return Status::OK();
-    }
-    case T::UINT32: {
-        uint32_t v = static_cast<const arrow::UInt32Array&>(arr).Value(row);
-        out->resize(4);
-        (*out)[0] = static_cast<uint8_t>(v >> 24);
-        (*out)[1] = static_cast<uint8_t>(v >> 16);
-        (*out)[2] = static_cast<uint8_t>(v >> 8);
-        (*out)[3] = static_cast<uint8_t>(v);
-        return Status::OK();
-    }
-    case T::UINT64: {
-        uint64_t v = static_cast<const arrow::UInt64Array&>(arr).Value(row);
-        out->resize(8);
-        for (int i = 7; i >= 0; --i) { (*out)[i] = v & 0xFF; v >>= 8; }
-        return Status::OK();
-    }
-    case T::FLOAT: {
-        float v = static_cast<const arrow::FloatArray&>(arr).Value(row);
-        uint32_t bits; std::memcpy(&bits, &v, 4);
-        out->resize(4);
-        (*out)[0] = static_cast<uint8_t>(bits >> 24);
-        (*out)[1] = static_cast<uint8_t>(bits >> 16);
-        (*out)[2] = static_cast<uint8_t>(bits >> 8);
-        (*out)[3] = static_cast<uint8_t>(bits);
-        return Status::OK();
-    }
-    case T::DOUBLE: {
-        double v = static_cast<const arrow::DoubleArray&>(arr).Value(row);
-        uint64_t bits; std::memcpy(&bits, &v, 8);
-        out->resize(8);
-        for (int i = 7; i >= 0; --i) { (*out)[i] = bits & 0xFF; bits >>= 8; }
-        return Status::OK();
-    }
-    case T::TIMESTAMP: {
-        auto& ta = static_cast<const arrow::TimestampArray&>(arr);
-        auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
-        int64_t v = normalize_timestamp_to_millis(ta.Value(row), unit);
-        uint64_t bits = static_cast<uint64_t>(v);
-        out->resize(8);
-        for (int i = 7; i >= 0; --i) { (*out)[i] = bits & 0xFF; bits >>= 8; }
-        return Status::OK();
-    }
-    default: {
-        auto s = arr.GetScalar(row);
-        if (s.ok()) {
-            auto str = s.ValueOrDie()->ToString();
-            out->assign(str.begin(), str.end());
-            return Status::OK();
-        }
-        return Status::InvalidArg("cannot materialize Arrow scalar: " + s.status().ToString());
-    }
-    }
+    return Status::InvalidArg("cannot materialize Arrow scalar: " + s.status().ToString());
 }
 
 static Status scalar_to_bytes_view(const arrow::Array& arr,
@@ -1088,11 +966,6 @@ static std::vector<int> build_sorted_column_order(
                   return schema->field(a)->name() < schema->field(b)->name();
               });
     return order;
-}
-
-static std::vector<BatchColumnRef> build_sorted_columns(
-        const std::shared_ptr<arrow::RecordBatch>& batch) {
-    return build_sorted_columns(batch, build_sorted_column_order(batch->schema()));
 }
 
 static Status append_single_row_cells(

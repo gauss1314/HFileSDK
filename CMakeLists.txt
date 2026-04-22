@@ -448,6 +448,10 @@ set(GTEST_SOURCES
   test/test_compressor_error_paths.cc
   test/test_writer_additional_coverage.cc
   test/test_converter_additional_coverage.cc
+  test/test_io_writer_error_paths_extra.cc
+  test/test_writer_hotpath_and_edge_cases.cc
+  test/test_converter_more_coverage.cc
+  test/test_converter_hotpath_grouped.cc
 )
 
 foreach(TEST_SRC ${GTEST_SOURCES})
