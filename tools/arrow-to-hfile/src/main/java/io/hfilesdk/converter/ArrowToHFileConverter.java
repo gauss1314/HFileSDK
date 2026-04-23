@@ -130,15 +130,10 @@ public class ArrowToHFileConverter {
         }
 
         // Build and invoke SDK
-        String configJson = opts.toConfigJson();
         HFileSDK sdk = new HFileSDK();
-
-        if (!configJson.equals("{}")) {
-            int cfgRc = sdk.configure(configJson);
-            if (cfgRc != HFileSDK.OK) {
-                String detail = sdk.getLastResult();
-                return ConvertResult.fromJson(detail, cfgRc);
-            }
+        ConfigAttempt configureAttempt = configureWithBackwardCompat(sdk, opts);
+        if (!configureAttempt.success()) {
+            return ConvertResult.fromJson(configureAttempt.detail(), configureAttempt.rc());
         }
 
         int rc = sdk.convert(
@@ -148,6 +143,68 @@ public class ArrowToHFileConverter {
             opts.rowKeyRule());
 
         return ConvertResult.fromJson(sdk.getLastResult(), rc);
+    }
+
+    private static ConfigAttempt configureWithBackwardCompat(HFileSDK sdk, ConvertOptions opts) {
+        String configJson = opts.toConfigJson();
+        if (configJson.equals("{}")) {
+            return new ConfigAttempt(HFileSDK.OK, "{}");
+        }
+
+        int cfgRc = sdk.configure(configJson);
+        if (cfgRc == HFileSDK.OK) {
+            return new ConfigAttempt(HFileSDK.OK, "");
+        }
+
+        String detail = sdk.getLastResult();
+        if (!shouldRetryWithoutCompressionQueueDepth(opts, detail)) {
+            return new ConfigAttempt(cfgRc, detail);
+        }
+
+        ConvertOptions fallback = copyWithCompressionQueueDepth(opts, 0);
+        String fallbackConfigJson = fallback.toConfigJson();
+        int fallbackRc = sdk.configure(fallbackConfigJson);
+        if (fallbackRc == HFileSDK.OK) {
+            return new ConfigAttempt(HFileSDK.OK, detail);
+        }
+        return new ConfigAttempt(fallbackRc, sdk.getLastResult());
+    }
+
+    private static boolean shouldRetryWithoutCompressionQueueDepth(ConvertOptions opts, String detail) {
+        return opts.compressionQueueDepth() > 0
+            && detail != null
+            && detail.contains("Unsupported config key: compression_queue_depth");
+    }
+
+    private static ConvertOptions copyWithCompressionQueueDepth(ConvertOptions source, int compressionQueueDepth) {
+        return ConvertOptions.builder()
+            .arrowPath(source.arrowPath())
+            .hfilePath(source.hfilePath())
+            .tableName(source.tableName())
+            .rowKeyRule(source.rowKeyRule())
+            .columnFamily(source.columnFamily())
+            .compression(source.compression())
+            .compressionLevel(source.compressionLevel())
+            .dataBlockEncoding(source.dataBlockEncoding())
+            .bloomType(source.bloomType())
+            .fsyncPolicy(source.fsyncPolicy())
+            .errorPolicy(source.errorPolicy())
+            .blockSize(source.blockSize())
+            .maxMemoryBytes(source.maxMemoryBytes())
+            .compressionThreads(source.compressionThreads())
+            .compressionQueueDepth(compressionQueueDepth)
+            .numericSortFastPath(source.numericSortFastPath())
+            .defaultTimestampMs(source.defaultTimestampMs())
+            .excludedColumns(source.excludedColumns())
+            .excludedColumnPrefixes(source.excludedColumnPrefixes())
+            .nativeLibPath(source.nativeLibPath())
+            .build();
+    }
+
+    private record ConfigAttempt(int rc, String detail) {
+        private boolean success() {
+            return rc == HFileSDK.OK;
+        }
     }
 
     /**

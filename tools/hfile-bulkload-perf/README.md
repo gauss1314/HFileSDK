@@ -7,6 +7,8 @@
 
 每个用例固定执行 3 次，输出每轮耗时与平均耗时，便于横向对比两种实现。
 
+默认不注入固定 timestamp：`--default-timestamp-ms` 默认值为 `0`，表示沿用转换器“未配置 timestamp”语义（使用当前时间）。
+
 生成的 Arrow 输入默认会在批内打乱行顺序，以模拟生产环境中的乱序源文件；这样 JNI 与纯 Java 实现都会在相同的乱序输入上完成内部排序后再写出 HFile。
 
 从当前版本开始，perf runner 会将每个 `implementation + iteration` 放到独立 worker 进程中执行，再由父进程汇总报告。这样才能对 JNI 实现和纯 Java 实现做进程级 CPU / 内存对比，而不是把两者混在同一个 JVM 内部。
@@ -89,6 +91,7 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 - `--trigger-size` / `--trigger-count` / `--trigger-interval`：JNI 小文件合并策略参数
 - `--payload-bytes`：每行 `PAYLOAD` 的字节数
 - `--batch-rows`：每个 Arrow RecordBatch 行数
+- `--default-timestamp-ms`：默认 timestamp（毫秒）；默认 `0`，表示使用当前时间。仅在需要做字节级一致性对比时，才建议手动传入固定值
 - `--rule`：rowKeyRule，默认 `USER_ID,0,false,0`
 - `--cpu-set`：Linux 上通过 `taskset` 绑定 worker CPU，确保两种实现使用同一组核
 - `--process-memory-mb`：worker 进程总内存硬限制；优先 cgroup v2，失败时退化为 `prlimit`
