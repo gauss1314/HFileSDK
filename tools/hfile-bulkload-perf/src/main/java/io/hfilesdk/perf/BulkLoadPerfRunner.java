@@ -501,7 +501,9 @@ public final class BulkLoadPerfRunner {
             .build();
         BatchConvertResult batchResult = new AdaptiveBatchConverter().convertAll(options, policy);
         while (!batchResult.isFullSuccess()) {
-            if (compressionQueueDepth > 0 && hasUnsupportedCompressionQueueDepthFailure(batchResult)) {
+            if (compressionQueueDepth > 0
+                && (hasUnsupportedCompressionQueueDepthFailure(batchResult)
+                || hasInvalidArgumentFailure(batchResult))) {
                 compressionQueueDepth = 0;
                 batchResult = new AdaptiveBatchConverter().convertAll(
                     buildJniBatchConvertOptions(config, arrowFiles, hfileDir, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth),
@@ -509,7 +511,9 @@ public final class BulkLoadPerfRunner {
                 );
                 continue;
             }
-            if (compressionThreads > 0 && hasUnsupportedCompressionThreadsFailure(batchResult)) {
+            if (compressionThreads > 0
+                && (hasUnsupportedCompressionThreadsFailure(batchResult)
+                || hasInvalidArgumentFailure(batchResult))) {
                 compressionThreads = 0;
                 compressionQueueDepth = 0;
                 batchResult = new AdaptiveBatchConverter().convertAll(
@@ -563,14 +567,14 @@ public final class BulkLoadPerfRunner {
             buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
         );
         while (!result.isSuccess()) {
-            if (compressionQueueDepth > 0 && isUnsupportedCompressionQueueDepthError(result.errorMessage)) {
+            if (compressionQueueDepth > 0 && shouldFallbackCompressionQueueDepth(result)) {
                 compressionQueueDepth = 0;
                 result = new ArrowToHFileConverter(config.nativeLib()).convert(
                     buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
                 );
                 continue;
             }
-            if (compressionThreads > 0 && isUnsupportedCompressionThreadsError(result.errorMessage)) {
+            if (compressionThreads > 0 && shouldFallbackCompressionThreads(result)) {
                 compressionThreads = 0;
                 compressionQueueDepth = 0;
                 result = new ArrowToHFileConverter(config.nativeLib()).convert(
@@ -757,11 +761,30 @@ public final class BulkLoadPerfRunner {
     }
 
     private static boolean isUnsupportedCompressionQueueDepthError(String message) {
-        return message != null && message.contains("Unsupported config key: compression_queue_depth");
+        return message != null && message.toLowerCase(Locale.ROOT).contains("unsupported config key: compression_queue_depth");
     }
 
     private static boolean isUnsupportedCompressionThreadsError(String message) {
-        return message != null && message.contains("Unsupported config key: compression_threads");
+        return message != null && message.toLowerCase(Locale.ROOT).contains("unsupported config key: compression_threads");
+    }
+
+    private static boolean shouldFallbackCompressionQueueDepth(ConvertResult result) {
+        return isUnsupportedCompressionQueueDepthError(result.errorMessage)
+            || result.errorCode == ConvertResult.INVALID_ARGUMENT;
+    }
+
+    private static boolean shouldFallbackCompressionThreads(ConvertResult result) {
+        return isUnsupportedCompressionThreadsError(result.errorMessage)
+            || result.errorCode == ConvertResult.INVALID_ARGUMENT;
+    }
+
+    private static boolean hasInvalidArgumentFailure(BatchConvertResult batchResult) {
+        for (ConvertResult result : batchResult.results.values()) {
+            if (!result.isSuccess() && result.errorCode == ConvertResult.INVALID_ARGUMENT) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static List<String> buildWorkerJavaCommand(RunConfig config,
