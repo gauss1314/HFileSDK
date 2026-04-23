@@ -488,27 +488,8 @@ public final class BulkLoadPerfRunner {
 
         long start = System.nanoTime();
         String strategy = decideStrategy(arrowFiles, config.mergeThresholdMb());
-        BatchConvertOptions options = BatchConvertOptions.builder()
-            .arrowFiles(arrowFiles)
-            .hfileDir(hfileDir)
-            .tableName(config.tableName())
-            .rowKeyRule(config.rowKeyRule())
-            .columnFamily(config.columnFamily())
-            .compression(config.compression())
-            .dataBlockEncoding(config.encoding())
-            .bloomType(config.bloom())
-            .errorPolicy(config.errorPolicy())
-            .blockSize(config.blockSize())
-            .defaultTimestampMs(config.defaultTimestampMs())
-            .maxMemoryBytes(sdkMaxMemoryBytes)
-            .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
-            .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
-            .numericSortFastPath(config.jniSdkNumericSortFastPath())
-            // Preserve JNI directory-conversion semantics: a worker may still
-            // convert multiple Arrow files according to the configured parallelism.
-            .parallelism(config.parallelism())
-            .nativeLibPath(config.nativeLib())
-            .build();
+        BatchConvertOptions options = buildJniBatchConvertOptions(config, arrowFiles, hfileDir, sdkMaxMemoryBytes,
+            Math.toIntExact(config.jniSdkCompressionQueueDepth()));
         AdaptiveBatchConverter.Policy policy = AdaptiveBatchConverter.Policy.builder()
             .mergeThresholdMib(config.mergeThresholdMb())
             .triggerSizeMib(config.triggerSizeMb())
@@ -517,6 +498,12 @@ public final class BulkLoadPerfRunner {
             .mergeTmpDir(mergeTmpDir)
             .build();
         BatchConvertResult batchResult = new AdaptiveBatchConverter().convertAll(options, policy);
+        if (!batchResult.isFullSuccess()
+            && config.jniSdkCompressionQueueDepth() > 0
+            && hasUnsupportedCompressionQueueDepthFailure(batchResult)) {
+            BatchConvertOptions fallbackOptions = buildJniBatchConvertOptions(config, arrowFiles, hfileDir, sdkMaxMemoryBytes, 0);
+            batchResult = new AdaptiveBatchConverter().convertAll(fallbackOptions, policy);
+        }
 
         long sdkBudgetBytes = 0L;
         long sdkPeakBytes = 0L;
@@ -556,25 +543,16 @@ public final class BulkLoadPerfRunner {
         Path hfilePath = hfileDir.resolve(hfileName);
         long start = System.nanoTime();
         ConvertResult result = new ArrowToHFileConverter(config.nativeLib()).convert(
-            ConvertOptions.builder()
-                .arrowPath(arrowFile.toString())
-                .hfilePath(hfilePath.toString())
-                .tableName(config.tableName())
-                .rowKeyRule(config.rowKeyRule())
-                .columnFamily(config.columnFamily())
-                .compression(config.compression())
-                .dataBlockEncoding(config.encoding())
-                .bloomType(config.bloom())
-                .errorPolicy(config.errorPolicy())
-                .blockSize(config.blockSize())
-                .defaultTimestampMs(config.defaultTimestampMs())
-                .maxMemoryBytes(sdkMaxMemoryBytes)
-                .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
-                .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
-                .numericSortFastPath(config.jniSdkNumericSortFastPath())
-                .nativeLibPath(config.nativeLib())
-                .build()
+            buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes,
+                Math.toIntExact(config.jniSdkCompressionQueueDepth()))
         );
+        if (!result.isSuccess()
+            && config.jniSdkCompressionQueueDepth() > 0
+            && isUnsupportedCompressionQueueDepthError(result.errorMessage)) {
+            result = new ArrowToHFileConverter(config.nativeLib()).convert(
+                buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes, 0)
+            );
+        }
         String detailJson = "{"
             + "\"source\":\"" + jsonEscape(arrowFile.toString()) + "\","
             + "\"error_code\":" + result.errorCode + ","
@@ -677,6 +655,72 @@ public final class BulkLoadPerfRunner {
             false,
             "[" + String.join(",", resultJsons) + "]"
         );
+    }
+
+    private static ConvertOptions buildJniConvertOptions(RunConfig config,
+                                                         Path arrowFile,
+                                                         Path hfilePath,
+                                                         long sdkMaxMemoryBytes,
+                                                         int compressionQueueDepth) {
+        return ConvertOptions.builder()
+            .arrowPath(arrowFile.toString())
+            .hfilePath(hfilePath.toString())
+            .tableName(config.tableName())
+            .rowKeyRule(config.rowKeyRule())
+            .columnFamily(config.columnFamily())
+            .compression(config.compression())
+            .dataBlockEncoding(config.encoding())
+            .bloomType(config.bloom())
+            .errorPolicy(config.errorPolicy())
+            .blockSize(config.blockSize())
+            .defaultTimestampMs(config.defaultTimestampMs())
+            .maxMemoryBytes(sdkMaxMemoryBytes)
+            .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
+            .compressionQueueDepth(compressionQueueDepth)
+            .numericSortFastPath(config.jniSdkNumericSortFastPath())
+            .nativeLibPath(config.nativeLib())
+            .build();
+    }
+
+    private static BatchConvertOptions buildJniBatchConvertOptions(RunConfig config,
+                                                                   List<Path> arrowFiles,
+                                                                   Path hfileDir,
+                                                                   long sdkMaxMemoryBytes,
+                                                                   int compressionQueueDepth) {
+        return BatchConvertOptions.builder()
+            .arrowFiles(arrowFiles)
+            .hfileDir(hfileDir)
+            .tableName(config.tableName())
+            .rowKeyRule(config.rowKeyRule())
+            .columnFamily(config.columnFamily())
+            .compression(config.compression())
+            .dataBlockEncoding(config.encoding())
+            .bloomType(config.bloom())
+            .errorPolicy(config.errorPolicy())
+            .blockSize(config.blockSize())
+            .defaultTimestampMs(config.defaultTimestampMs())
+            .maxMemoryBytes(sdkMaxMemoryBytes)
+            .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
+            .compressionQueueDepth(compressionQueueDepth)
+            .numericSortFastPath(config.jniSdkNumericSortFastPath())
+            // Preserve JNI directory-conversion semantics: a worker may still
+            // convert multiple Arrow files according to the configured parallelism.
+            .parallelism(config.parallelism())
+            .nativeLibPath(config.nativeLib())
+            .build();
+    }
+
+    private static boolean hasUnsupportedCompressionQueueDepthFailure(BatchConvertResult batchResult) {
+        for (ConvertResult result : batchResult.results.values()) {
+            if (!result.isSuccess() && isUnsupportedCompressionQueueDepthError(result.errorMessage)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean isUnsupportedCompressionQueueDepthError(String message) {
+        return message != null && message.contains("Unsupported config key: compression_queue_depth");
     }
 
     private static List<String> buildWorkerJavaCommand(RunConfig config,
