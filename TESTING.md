@@ -164,6 +164,7 @@ bash scripts/coverage.sh
 运行建议：
 
 - 对 JNI 与纯 Java 使用同一组 `--cpu-set` 和 `--process-memory-mb`
+- `tools/hfile-bulkload-perf` 默认 `--default-timestamp-ms=0`，即不固定 timestamp（使用当前时间）；只有在做字节级一致性对比时才手动传固定值
 - 将 `--report-json`、当前 commit SHA、`lscpu`、`free -h`、磁盘类型与挂载点一起归档
 - 如需排查异常波动，可追加 `--keep-generated-files` 保留 Arrow/HFile/worker 日志
 - 若机器是 NUMA 架构，建议将 `--cpu-set` 固定在同一 NUMA 节点内

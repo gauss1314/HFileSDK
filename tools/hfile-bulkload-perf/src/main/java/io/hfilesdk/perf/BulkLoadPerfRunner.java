@@ -50,7 +50,7 @@ public final class BulkLoadPerfRunner {
     private static final String DEFAULT_ERROR_POLICY = "skip_row";
     private static final int DEFAULT_BLOCK_SIZE = 65536;
     private static final String DEFAULT_WORK_DIR = "/tmp/hfilesdk-bulkload-perf";
-    private static final long DEFAULT_TIMESTAMP_MS = 1_715_678_900_123L;
+    private static final long DEFAULT_TIMESTAMP_MS = 0L;
     private static final String IMPL_JNI = "arrow-to-hfile";
     private static final String IMPL_JAVA = "arrow-to-hfile-java";
     private static final String STRATEGY_DIRECT = "DIRECT-CONVERT";
@@ -136,6 +136,7 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("trigger-interval").hasArg().argName("SEC").desc("JNI 合并时间阈值").build());
         options.addOption(Option.builder().longOpt("batch-rows").hasArg().argName("N").desc("每个 Arrow batch 行数").build());
         options.addOption(Option.builder().longOpt("payload-bytes").hasArg().argName("BYTES").desc("mock-arrow 大文本列近似字节数；tdr_signal_stor_20550 下对应 SIGSTORE 宽度").build());
+        options.addOption(Option.builder().longOpt("default-timestamp-ms").hasArg().argName("MS").desc("默认 timestamp；0 表示使用当前时间").build());
         options.addOption(Option.builder().longOpt("cf").hasArg().argName("CF").desc("列族名").build());
         options.addOption(Option.builder().longOpt("rule").hasArg().argName("RULE").desc("rowKeyRule；未传时默认使用 mock-arrow schema 自带规则").build());
         options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法").build());
@@ -200,6 +201,7 @@ public final class BulkLoadPerfRunner {
             parsePositiveInt(commandLine.getOptionValue("trigger-interval", Integer.toString(DEFAULT_TRIGGER_INTERVAL_SECONDS)), "trigger-interval"),
             parsePositiveInt(commandLine.getOptionValue("batch-rows", Integer.toString(DEFAULT_BATCH_ROWS)), "batch-rows"),
             Math.toIntExact(parseNonNegativeLong(commandLine.getOptionValue("payload-bytes", Integer.toString(DEFAULT_PAYLOAD_BYTES)), "payload-bytes")),
+            parseNonNegativeLong(commandLine.getOptionValue("default-timestamp-ms", Long.toString(DEFAULT_TIMESTAMP_MS)), "default-timestamp-ms"),
             commandLine.getOptionValue("cf", DEFAULT_CF),
             rowKeyRule,
             commandLine.getOptionValue("compression", DEFAULT_COMPRESSION),
@@ -497,7 +499,7 @@ public final class BulkLoadPerfRunner {
             .bloomType(config.bloom())
             .errorPolicy(config.errorPolicy())
             .blockSize(config.blockSize())
-            .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
+            .defaultTimestampMs(config.defaultTimestampMs())
             .maxMemoryBytes(sdkMaxMemoryBytes)
             .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
             .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
@@ -565,7 +567,7 @@ public final class BulkLoadPerfRunner {
                 .bloomType(config.bloom())
                 .errorPolicy(config.errorPolicy())
                 .blockSize(config.blockSize())
-                .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
+                .defaultTimestampMs(config.defaultTimestampMs())
                 .maxMemoryBytes(sdkMaxMemoryBytes)
                 .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
                 .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
@@ -632,7 +634,7 @@ public final class BulkLoadPerfRunner {
                     .dataBlockEncoding(config.encoding())
                     .bloomType(config.bloom())
                     .blockSize(config.blockSize())
-                    .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
+                    .defaultTimestampMs(config.defaultTimestampMs())
                     .build()
             );
             resultJsons.add(result.toJson());
@@ -723,6 +725,8 @@ public final class BulkLoadPerfRunner {
         command.add(Integer.toString(config.triggerIntervalSeconds()));
         command.add("--cf");
         command.add(config.columnFamily());
+        command.add("--default-timestamp-ms");
+        command.add(Long.toString(config.defaultTimestampMs()));
         command.add("--rule");
         command.add(config.rowKeyRule());
         command.add("--compression");
@@ -1316,6 +1320,7 @@ public final class BulkLoadPerfRunner {
         int triggerIntervalSeconds,
         int batchRows,
         int payloadBytes,
+        long defaultTimestampMs,
         String columnFamily,
         String rowKeyRule,
         String compression,
