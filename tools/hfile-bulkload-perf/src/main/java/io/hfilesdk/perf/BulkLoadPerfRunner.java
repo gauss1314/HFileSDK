@@ -490,7 +490,8 @@ public final class BulkLoadPerfRunner {
         String strategy = decideStrategy(arrowFiles, config.mergeThresholdMb());
         int compressionThreads = Math.toIntExact(config.jniSdkCompressionThreads());
         int compressionQueueDepth = Math.toIntExact(config.jniSdkCompressionQueueDepth());
-        BatchConvertOptions options = buildJniBatchConvertOptions(config, arrowFiles, hfileDir, sdkMaxMemoryBytes,
+        long effectiveSdkMaxMemoryBytes = sdkMaxMemoryBytes;
+        BatchConvertOptions options = buildJniBatchConvertOptions(config, arrowFiles, hfileDir, effectiveSdkMaxMemoryBytes,
             compressionThreads, compressionQueueDepth);
         AdaptiveBatchConverter.Policy policy = AdaptiveBatchConverter.Policy.builder()
             .mergeThresholdMib(config.mergeThresholdMb())
@@ -506,7 +507,17 @@ public final class BulkLoadPerfRunner {
                 || hasInvalidArgumentFailure(batchResult))) {
                 compressionQueueDepth = 0;
                 batchResult = new AdaptiveBatchConverter().convertAll(
-                    buildJniBatchConvertOptions(config, arrowFiles, hfileDir, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth),
+                    buildJniBatchConvertOptions(config, arrowFiles, hfileDir, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth),
+                    policy
+                );
+                continue;
+            }
+            if (effectiveSdkMaxMemoryBytes > 0
+                && (hasUnsupportedMaxMemoryBytesFailure(batchResult)
+                || hasInvalidArgumentFailure(batchResult))) {
+                effectiveSdkMaxMemoryBytes = 0L;
+                batchResult = new AdaptiveBatchConverter().convertAll(
+                    buildJniBatchConvertOptions(config, arrowFiles, hfileDir, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth),
                     policy
                 );
                 continue;
@@ -517,7 +528,7 @@ public final class BulkLoadPerfRunner {
                 compressionThreads = 0;
                 compressionQueueDepth = 0;
                 batchResult = new AdaptiveBatchConverter().convertAll(
-                    buildJniBatchConvertOptions(config, arrowFiles, hfileDir, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth),
+                    buildJniBatchConvertOptions(config, arrowFiles, hfileDir, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth),
                     policy
                 );
             }
@@ -563,14 +574,22 @@ public final class BulkLoadPerfRunner {
         long start = System.nanoTime();
         int compressionThreads = Math.toIntExact(config.jniSdkCompressionThreads());
         int compressionQueueDepth = Math.toIntExact(config.jniSdkCompressionQueueDepth());
+        long effectiveSdkMaxMemoryBytes = sdkMaxMemoryBytes;
         ConvertResult result = new ArrowToHFileConverter(config.nativeLib()).convert(
-            buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
+            buildJniConvertOptions(config, arrowFile, hfilePath, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
         );
         while (!result.isSuccess()) {
             if (compressionQueueDepth > 0 && shouldFallbackCompressionQueueDepth(result)) {
                 compressionQueueDepth = 0;
                 result = new ArrowToHFileConverter(config.nativeLib()).convert(
-                    buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
+                    buildJniConvertOptions(config, arrowFile, hfilePath, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
+                );
+                continue;
+            }
+            if (effectiveSdkMaxMemoryBytes > 0 && shouldFallbackMaxMemoryBytes(result)) {
+                effectiveSdkMaxMemoryBytes = 0L;
+                result = new ArrowToHFileConverter(config.nativeLib()).convert(
+                    buildJniConvertOptions(config, arrowFile, hfilePath, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
                 );
                 continue;
             }
@@ -578,7 +597,7 @@ public final class BulkLoadPerfRunner {
                 compressionThreads = 0;
                 compressionQueueDepth = 0;
                 result = new ArrowToHFileConverter(config.nativeLib()).convert(
-                    buildJniConvertOptions(config, arrowFile, hfilePath, sdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
+                    buildJniConvertOptions(config, arrowFile, hfilePath, effectiveSdkMaxMemoryBytes, compressionThreads, compressionQueueDepth)
                 );
             }
             break;
@@ -768,6 +787,10 @@ public final class BulkLoadPerfRunner {
         return message != null && message.toLowerCase(Locale.ROOT).contains("unsupported config key: compression_threads");
     }
 
+    private static boolean isUnsupportedMaxMemoryBytesError(String message) {
+        return message != null && message.toLowerCase(Locale.ROOT).contains("unsupported config key: max_memory_bytes");
+    }
+
     private static boolean shouldFallbackCompressionQueueDepth(ConvertResult result) {
         return isUnsupportedCompressionQueueDepthError(result.errorMessage)
             || result.errorCode == ConvertResult.INVALID_ARGUMENT;
@@ -778,9 +801,23 @@ public final class BulkLoadPerfRunner {
             || result.errorCode == ConvertResult.INVALID_ARGUMENT;
     }
 
+    private static boolean shouldFallbackMaxMemoryBytes(ConvertResult result) {
+        return isUnsupportedMaxMemoryBytesError(result.errorMessage)
+            || result.errorCode == ConvertResult.INVALID_ARGUMENT;
+    }
+
     private static boolean hasInvalidArgumentFailure(BatchConvertResult batchResult) {
         for (ConvertResult result : batchResult.results.values()) {
             if (!result.isSuccess() && result.errorCode == ConvertResult.INVALID_ARGUMENT) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasUnsupportedMaxMemoryBytesFailure(BatchConvertResult batchResult) {
+        for (ConvertResult result : batchResult.results.values()) {
+            if (!result.isSuccess() && isUnsupportedMaxMemoryBytesError(result.errorMessage)) {
                 return true;
             }
         }
