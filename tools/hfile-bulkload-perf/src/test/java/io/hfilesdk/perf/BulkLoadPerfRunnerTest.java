@@ -72,6 +72,8 @@ final class BulkLoadPerfRunnerTest {
         });
 
         String json = Files.readString(reportJson, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"compression\": \"GZ\""));
+        assertTrue(json.contains("\"encoding\": \"NONE\""));
         assertTrue(json.contains("\"process_peak_rss_bytes\":"));
         assertTrue(json.contains("\"process_user_cpu_ms\":"));
         assertTrue(json.contains("\"process_exit_code\":0"));
@@ -79,6 +81,7 @@ final class BulkLoadPerfRunnerTest {
         assertTrue(json.contains("\"jni_sdk_compression_threads\": 0"));
         assertTrue(json.contains("\"jni_sdk_compression_queue_depth\": 0"));
         assertTrue(json.contains("\"jni_sdk_numeric_sort_fast_path\": \"auto\""));
+        assertTrue(json.contains("\"default_timestamp_ms\": 0"));
         assertFalse(Files.exists(tempDir.resolve("single-001mb")));
     }
 
@@ -119,6 +122,77 @@ final class BulkLoadPerfRunnerTest {
         assertEquals(0, exitCode, output.toString(StandardCharsets.UTF_8));
         assertTrue(Files.isRegularFile(expectedReport));
         assertFalse(Files.exists(workDir.resolve("perf-matrix-report.json")));
+    }
+
+    @Test
+    void jniWorkerSingleFileAcceptsAdvancedSdkConfigKeys(@TempDir Path tempDir) throws Exception {
+        Path nativeLib = findNativeLib();
+        Assumptions.assumeTrue(nativeLib != null, "native lib not available for JNI worker test");
+
+        Path inputDir = tempDir.resolve("input");
+        Path outputDir = tempDir.resolve("output");
+        Path resultJson = tempDir.resolve("worker-result.json");
+        Files.createDirectories(inputDir);
+        writeArrowStream(inputDir.resolve("worker.arrow"),
+            List.of("user-000000000001", "user-000000000002"),
+            List.of("value1", "value2"));
+
+        List<String> command = new ArrayList<>();
+        command.add(Path.of(System.getProperty("java.home"), "bin", "java").toString());
+        command.add("--add-opens=java.base/java.nio=ALL-UNNAMED");
+        command.add("--add-opens=java.base/java.lang=ALL-UNNAMED");
+        command.add("-cp");
+        command.add(System.getProperty("java.class.path"));
+        command.add(BulkLoadPerfRunner.class.getName());
+        command.add("--worker-mode");
+        command.add("--worker-implementation");
+        command.add("arrow-to-hfile");
+        command.add("--worker-input-dir");
+        command.add(inputDir.toString());
+        command.add("--worker-output-dir");
+        command.add(outputDir.toString());
+        command.add("--worker-result-json");
+        command.add(resultJson.toString());
+        command.add("--worker-iteration-index");
+        command.add("1");
+        command.add("--native-lib");
+        command.add(nativeLib.toString());
+        command.add("--table");
+        command.add("perf_table");
+        command.add("--rule");
+        command.add("USER_ID,0,false,0");
+        command.add("--cf");
+        command.add("cf");
+        command.add("--compression");
+        command.add("GZ");
+        command.add("--encoding");
+        command.add("NONE");
+        command.add("--bloom");
+        command.add("row");
+        command.add("--block-size");
+        command.add("65536");
+        command.add("--jni-sdk-max-memory-mb");
+        command.add("64");
+        command.add("--jni-sdk-compression-threads");
+        command.add("2");
+        command.add("--jni-sdk-compression-queue-depth");
+        command.add("4");
+        command.add("--jni-sdk-numeric-sort-fast-path");
+        command.add("auto");
+
+        Process process = new ProcessBuilder(command).redirectErrorStream(true).start();
+        ByteArrayOutputStream output = new ByteArrayOutputStream();
+        process.getInputStream().transferTo(output);
+        int exitCode = process.waitFor();
+        String processOutput = output.toString(StandardCharsets.UTF_8);
+        assertEquals(0, exitCode, processOutput);
+        assertFalse(processOutput.contains("Unsupported config key"), processOutput);
+
+        String json = Files.readString(resultJson, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"implementation\":\"arrow-to-hfile\""), json);
+        assertTrue(json.contains("\"success\":true"), json);
+        assertFalse(json.contains("Unsupported config key"), json);
+        assertTrue(Files.exists(outputDir.resolve("cf")), "worker should produce HFile output");
     }
 
     @Test

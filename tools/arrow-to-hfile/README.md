@@ -73,7 +73,7 @@ Throughput: 612.4 MB/s
 | `--table NAME` | | `""` | HBase 表名（仅用于日志） |
 | `--native-lib PATH` | | 从环境变量 | `libhfilesdk.so` 的绝对路径 |
 | `--cf CF` | | `cf` | Column Family 名称 |
-| `--compression ALG` | | `GZ` | 压缩算法：`none`/`GZ`（兼容 `gzip`） |
+| `--compression ALG` | | `GZ` | 压缩算法：`NONE`/`GZ`（兼容 `gzip`） |
 | `--encoding ENC` | | `NONE` | 块编码：`NONE` |
 | `--bloom TYPE` | | `row` | Bloom Filter：`none`/`row`/`rowcol` |
 | `--block-size BYTES` | | `65536` | 数据块大小（字节） |

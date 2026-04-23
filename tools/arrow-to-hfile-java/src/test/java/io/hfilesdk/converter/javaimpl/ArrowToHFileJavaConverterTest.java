@@ -174,7 +174,7 @@ final class ArrowToHFileJavaConverterTest {
         );
 
         assertFalse(result.isSuccess(), result.summary());
-        assertTrue(result.errorMessage.contains("仅支持 NONE 或 GZ"), result.errorMessage);
+        assertTrue(result.errorMessage.contains("仅支持 NONE、GZ 或 gzip"), result.errorMessage);
         assertFalse(Files.exists(hfile));
     }
 }

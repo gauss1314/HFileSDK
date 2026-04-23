@@ -360,7 +360,7 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             if      (normalized == "none") next_opts.compression = hfile::Compression::None;
             else if (normalized == "gzip" || normalized == "gz")
                 next_opts.compression = hfile::Compression::GZip;
-            else return fail_config("Only compression=NONE or GZ is supported");
+            else return fail_config("Only compression=NONE, GZ, or gzip is supported");
         }
 
         if (auto cl = hfile::jni::config_int(cfg, "compression_level")) {

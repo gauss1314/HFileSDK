@@ -528,7 +528,7 @@ public class ArrowToHFileConverter {
             .desc("Absolute path to libhfilesdk.so/.dll     [default: from env/library.path]")
             .hasArg().argName("PATH").build());
         o.addOption(Option.builder().longOpt("compression")
-            .desc("Compression: none|GZ                     [default: GZ, also accepts gzip]")
+            .desc("Compression: NONE|GZ                    [default: GZ, also accepts gzip]")
             .hasArg().argName("ALG").build());
         o.addOption(Option.builder().longOpt("compression-level")
             .desc("Compression level 1(fastest)-9(best ratio), 0 = codec default [default: 1]")

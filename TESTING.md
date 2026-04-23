@@ -156,7 +156,7 @@ bash scripts/coverage.sh
 当前版本的参数边界：
 
 - `--encoding` 只建议使用 `NONE`
-- `--compression` 只建议使用 `GZ` 或 `NONE`
+- `--compression` 只建议使用 `GZ` 或 `NONE`；`gzip` 作为兼容别名保留
 - 更贴近生产的默认口径建议使用 `--compression GZ --encoding NONE`
 - `--table` 目前建议使用 `tdr_signal_stor_20550`
   - `tdr_mock` 更适合作为轻量 smoke/perf 冒烟
@@ -167,6 +167,157 @@ bash scripts/coverage.sh
 - 将 `--report-json`、当前 commit SHA、`lscpu`、`free -h`、磁盘类型与挂载点一起归档
 - 如需排查异常波动，可追加 `--keep-generated-files` 保留 Arrow/HFile/worker 日志
 - 若机器是 NUMA 架构，建议将 `--cpu-set` 固定在同一 NUMA 节点内
+- 如果出现 `Unsupported config key: max_memory_bytes`、`compression_threads` 或 `compression_queue_depth`，不要只看源码是否已更新，要确认当前进程实际加载的 `libhfilesdk.so` 是否包含这些 key；建议先按下面的 clean rebuild 步骤重建，再跑 smoke 命令验证。
+
+### 性能测试前 clean rebuild
+
+性能测试前建议清理 native build、coverage build、所有 Java `target`，以及本地 Maven 仓库里的 `io.hfilesdk` 旧包，确保 perf jar、`arrow-to-hfile` 依赖和 native SDK 来自同一份最新源码。
+
+```bash
+rm -rf build build-coverage \
+  tools/mock-arrow/target \
+  tools/arrow-to-hfile/target \
+  tools/arrow-to-hfile-java/target \
+  tools/hfile-bulkload-perf/target \
+  ~/.m2/repository/io/hfilesdk/mock-arrow \
+  ~/.m2/repository/io/hfilesdk/arrow-to-hfile \
+  ~/.m2/repository/io/hfilesdk/arrow-to-hfile-java \
+  ~/.m2/repository/io/hfilesdk/hfile-bulkload-perf
+
+bash scripts/test.sh -- -E hfile_chaos_kill
+
+export HFILESDK_NATIVE_DIR="$PWD/build"
+export HFILESDK_BUILD_DIR="$PWD/build"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  export HFILESDK_NATIVE_LIB="$PWD/build/libhfilesdk.dylib"
+else
+  export HFILESDK_NATIVE_LIB="$PWD/build/libhfilesdk.so"
+fi
+
+mvn -q -f tools/mock-arrow/pom.xml clean install
+mvn -q -f tools/arrow-to-hfile/pom.xml clean install
+mvn -q -f tools/arrow-to-hfile-java/pom.xml clean install
+mvn -q -f tools/hfile-bulkload-perf/pom.xml clean package
+```
+
+构建完成后，Linux 下 `--native-lib` 使用 `$PWD/build/libhfilesdk.so`；macOS 下使用 `$PWD/build/libhfilesdk.dylib`。
+
+如果需要先做跨平台 smoke，macOS 和 Linux 都可以用下面这个不绑定 CPU、不设置进程内存上限的小场景验证 jar 与 native 库是否匹配：
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
+  --table tdr_signal_stor_20550 \
+  --scenario-filter single-001mb \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --error-policy skip_row \
+  --block-size 65536 \
+  --parallelism 1 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 1024 \
+  --jni-sdk-compression-threads 2 \
+  --jni-sdk-compression-queue-depth 4 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 4096 \
+  --java-direct-memory-mb 1024 \
+  --work-dir /tmp/hfilesdk-perf-smoke \
+  --report-json /tmp/hfilesdk-perf-smoke/report.json
+```
+
+如果 smoke 仍报 `Unsupported config key`，先在同一个 shell 中确认实际传入的 native 库包含这些配置名：
+
+```bash
+strings "$HFILESDK_NATIVE_LIB" | grep -E 'max_memory_bytes|compression_threads|compression_queue_depth'
+```
+
+### Linux x86 最高性能调参
+
+下面参数是“性能优先”口径，不是最保守的资源隔离口径。建议在独占机器或独占 NUMA 节点上执行，输入和输出目录优先放在本地 NVMe / SSD，避免和 HDFS 客户端、本机其他任务或远端网络盘争抢资源。
+
+关键参数含义：
+
+- `--jni-sdk-compression-threads`：每个 JNI 转换任务内部的 GZip 数据块后台压缩线程数。`0` 表示同步压缩，通常不是 GZip 最高性能。
+- `--jni-sdk-compression-queue-depth`：每个转换任务允许排队的未写出压缩块数量。`0` 表示 SDK 自动使用 `max(2, compression_threads * 2)`。
+- `--jni-sdk-max-memory-mb`：C++ SDK 内部 soft budget。纯性能压测且机器内存足够时可设 `0` 表示不限制，避免预算检查和误限流；生产演练建议设为进程内存上限扣除 JVM heap/direct 后的 `60%~70%`。
+- `--process-memory-mb`：worker 进程 OS 级硬限制。性能压测时不要贴满物理内存，至少给 Linux page cache、文件系统和系统守护进程预留 `20%~30%`。
+
+起步配置表：
+
+| 绑定 CPU 核数 | 单文件延迟：`parallelism` | 单文件延迟：压缩线程 | 单文件延迟：队列 | 目录吞吐：`parallelism` | 目录吞吐：每任务压缩线程 | 目录吞吐：队列 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 8 | 1 | 4 | 0 或 8 | 2 | 2 | 0 |
+| 16 | 1 | 8 | 0 或 16 | 4 | 2 | 0 |
+| 32 | 1 | 8~12 | 0 或 `threads*3` | 6~8 | 3 | 0 |
+| 64 | 1 | 12~16 | 0 或 `threads*3` | 8~12 | 3~4 | 0 |
+
+调参规则：
+
+- 单文件场景只有一个 Arrow 文件，`--parallelism` 固定为 `1`，主要增加 `--jni-sdk-compression-threads`；通常从物理核数的 `1/2` 起步，超过 `8~16` 后收益会逐步变小。
+- 目录场景会同时跑多个转换任务，总线程数大致是 `parallelism * (1 + compression_threads)`；建议先让这个值不超过绑定核数的 `75%~90%`，再逐步上调。
+- `compression_queue_depth=0` 是推荐起点，因为 SDK 会自动设置成 `2 * compression_threads`；如果看到压缩线程有空闲、磁盘很快且平均耗时仍随队列增加下降，可以试 `threads*3` 或 `threads*4`。
+- `--jni-sdk-max-memory-mb 0` 通常是纯性能压测最快口径；如果需要避免 OOM kill，则设为 `process_memory_mb - jni_xmx_mb - jni_direct_memory_mb - 4096` 的 `60%~70%`，并确认 `report.json` 里的 `sdk_tracked_memory_peak_bytes` 不贴近预算。
+- `--java-xmx-mb` 和 `--java-direct-memory-mb` 不影响 JNI C++ hot path，但会影响纯 Java 对比实现是否被堆或 direct memory 限制；为了公平，Java 侧也要给足内存。
+- `--compression NONE` 下压缩线程和队列不会启用；只有 `--compression GZ` 或兼容别名 `gzip` 时这些参数才影响性能。
+- 每次只改一个维度，至少保留三轮默认迭代结果。优先比较 `average_ms`、`iteration_ms` 稳定性、`process_peak_rss_bytes` 和 `sdk_tracked_memory_peak_bytes`。
+
+16 核 / 32 GiB 进程限制的最高性能起步命令：
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
+  --table tdr_signal_stor_20550 \
+  --scenario-filter single-500mb \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --error-policy skip_row \
+  --block-size 65536 \
+  --cpu-set 0-15 \
+  --process-memory-mb 32768 \
+  --parallelism 1 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 0 \
+  --jni-sdk-compression-threads 8 \
+  --jni-sdk-compression-queue-depth 0 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 8192 \
+  --java-direct-memory-mb 2048 \
+  --work-dir /data/tmp/hfilesdk-perf-single-fast \
+  --report-json /data/tmp/hfilesdk-perf-single-fast/report.json
+```
+
+32 核机器可优先做这一组单文件 sweep，选择 `average_ms` 最低且 `iteration_ms` 波动最小的组合：
+
+```bash
+for t in 8 12 16; do
+  java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+    --native-lib "$HFILESDK_NATIVE_LIB" \
+    --table tdr_signal_stor_20550 \
+    --scenario-filter single-500mb \
+    --compression GZ \
+    --encoding NONE \
+    --bloom row \
+    --error-policy skip_row \
+    --block-size 65536 \
+    --cpu-set 0-31 \
+    --process-memory-mb 65536 \
+    --parallelism 1 \
+    --jni-xmx-mb 1024 \
+    --jni-direct-memory-mb 1024 \
+    --jni-sdk-max-memory-mb 0 \
+    --jni-sdk-compression-threads "$t" \
+    --jni-sdk-compression-queue-depth 0 \
+    --jni-sdk-numeric-sort-fast-path auto \
+    --java-xmx-mb 16384 \
+    --java-direct-memory-mb 4096 \
+    --work-dir "/data/tmp/hfilesdk-perf-single-t${t}" \
+    --report-json "/data/tmp/hfilesdk-perf-single-t${t}/report.json"
+done
+```
 
 ### 单文件延迟基线
 
@@ -174,7 +325,7 @@ bash scripts/coverage.sh
 
 ```bash
 java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
-  --native-lib /path/to/libhfilesdk.so \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
   --table tdr_signal_stor_20550 \
   --scenario-filter single-500mb \
   --compression GZ \
@@ -187,10 +338,6 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
   --parallelism 1 \
   --jni-xmx-mb 1024 \
   --jni-direct-memory-mb 1024 \
-  --jni-sdk-max-memory-mb 8192 \
-  --jni-sdk-compression-threads 4 \
-  --jni-sdk-compression-queue-depth 8 \
-  --jni-sdk-numeric-sort-fast-path auto \
   --java-xmx-mb 4096 \
   --java-direct-memory-mb 1024 \
   --work-dir /data/tmp/hfilesdk-perf-single \
@@ -200,9 +347,9 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 建议说明：
 
 - `--parallelism 1`：单文件场景下避免把目录批处理并行度混入延迟口径
-- `--jni-sdk-compression-threads 4`：适合 8 核左右机器做 GZip 压缩延迟基线
-- `--jni-sdk-max-memory-mb 8192`：让 JNI 侧排序/写出更接近生产预算，不被开发机默认小内存误伤
+- 该基线命令刻意不传 `--jni-sdk-*` advanced key，先验证 jar 与 native SDK 的基础链路；最高性能测试请使用上方“Linux x86 最高性能调参”里的命令。
 - `--java-xmx-mb` 建议显式大于 2 GiB，否则大文件场景更容易把结果变成 JVM 堆配置对比，而不是实现对比
+- 性能基线默认不固定 `default_timestamp_ms`，由实现使用当前时间；只有需要 JNI/Java HFile 字节级一致性对比时，才额外传 `--timestamp-ms <millis>`
 
 ### 目录吞吐基线
 
@@ -210,7 +357,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 
 ```bash
 java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
-  --native-lib /path/to/libhfilesdk.so \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
   --table tdr_signal_stor_20550 \
   --scenario-filter directory-100x010mb \
   --compression GZ \
@@ -239,13 +386,71 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 - `--jni-sdk-compression-threads 2`：与目录并行度叠加时更容易避免线程过量竞争
 - 若机器核数明显更多，可按经验把 `--cpu-set` 扩大到专属核集，再将 `--parallelism` 调到 `4~8` 区间观察吞吐拐点
 
+16 核 / 32 GiB 进程限制的目录吞吐性能优先命令：
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
+  --table tdr_signal_stor_20550 \
+  --scenario-filter directory-100x010mb \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --error-policy skip_row \
+  --block-size 65536 \
+  --cpu-set 0-15 \
+  --process-memory-mb 32768 \
+  --parallelism 4 \
+  --jni-xmx-mb 1024 \
+  --jni-direct-memory-mb 1024 \
+  --jni-sdk-max-memory-mb 0 \
+  --jni-sdk-compression-threads 2 \
+  --jni-sdk-compression-queue-depth 0 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --java-xmx-mb 8192 \
+  --java-direct-memory-mb 2048 \
+  --work-dir /data/tmp/hfilesdk-perf-directory-fast \
+  --report-json /data/tmp/hfilesdk-perf-directory-fast/report.json
+```
+
+32 核机器的目录吞吐 sweep 建议先固定 `compression_queue_depth=0`，扫描 `parallelism` 和压缩线程：
+
+```bash
+for p in 4 6 8; do
+  for t in 2 3; do
+    java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+      --native-lib "$HFILESDK_NATIVE_LIB" \
+      --table tdr_signal_stor_20550 \
+      --scenario-filter directory-100x010mb \
+      --compression GZ \
+      --encoding NONE \
+      --bloom row \
+      --error-policy skip_row \
+      --block-size 65536 \
+      --cpu-set 0-31 \
+      --process-memory-mb 65536 \
+      --parallelism "$p" \
+      --jni-xmx-mb 1024 \
+      --jni-direct-memory-mb 1024 \
+      --jni-sdk-max-memory-mb 0 \
+      --jni-sdk-compression-threads "$t" \
+      --jni-sdk-compression-queue-depth 0 \
+      --jni-sdk-numeric-sort-fast-path auto \
+      --java-xmx-mb 16384 \
+      --java-direct-memory-mb 4096 \
+      --work-dir "/data/tmp/hfilesdk-perf-dir-p${p}-t${t}" \
+      --report-json "/data/tmp/hfilesdk-perf-dir-p${p}-t${t}/report.json"
+  done
+done
+```
+
 ### 全矩阵回归
 
 在版本发布前或优化项对比前，建议跑完整矩阵而不是只跑单一场景：
 
 ```bash
 java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
-  --native-lib /path/to/libhfilesdk.so \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
   --table tdr_signal_stor_20550 \
   --compression GZ \
   --encoding NONE \
@@ -274,7 +479,7 @@ bash scripts/hfile-bulkload-perf-runner.sh \
   --env-script /opt/client/bigdata_env \
   --principal ossuser \
   --keytab /opt/client/keytab/ossuser.keytab \
-  --native-lib /path/to/libhfilesdk.so \
+  --native-lib "$HFILESDK_NATIVE_LIB" \
   --work-dir /data/tmp/hfilesdk-perf-full \
   -- \
   --table tdr_signal_stor_20550 \

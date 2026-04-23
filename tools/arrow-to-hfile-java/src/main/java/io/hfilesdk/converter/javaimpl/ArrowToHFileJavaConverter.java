@@ -298,8 +298,8 @@ public final class ArrowToHFileJavaConverter {
         options.addOption(Option.builder().longOpt("table").hasArg().argName("NAME").desc("表名，仅用于日志与元数据").build());
         options.addOption(Option.builder().longOpt("rule").hasArg().argName("RULE").desc("rowKeyRule").build());
         options.addOption(Option.builder().longOpt("cf").hasArg().argName("CF").desc("列族名，默认 cf").build());
-        options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法，默认 GZ").build());
-        options.addOption(Option.builder().longOpt("compression-level").hasArg().argName("N").desc("GZ 压缩级别，默认 1").build());
+        options.addOption(Option.builder().longOpt("compression").hasArg().argName("ALG").desc("压缩算法，默认 GZ，兼容 gzip").build());
+        options.addOption(Option.builder().longOpt("compression-level").hasArg().argName("N").desc("gzip 压缩级别，默认 1").build());
         options.addOption(Option.builder().longOpt("encoding").hasArg().argName("ENC").desc("Data Block Encoding，默认 NONE").build());
         options.addOption(Option.builder().longOpt("bloom").hasArg().argName("TYPE").desc("Bloom 类型，默认 ROW").build());
         options.addOption(Option.builder().longOpt("block-size").hasArg().argName("BYTES").desc("block size，默认 65536").build());
@@ -369,7 +369,7 @@ public final class ArrowToHFileJavaConverter {
         return switch (compression) {
             case "GZ", "GZIP" -> Compression.Algorithm.GZ;
             case "NONE" -> Compression.Algorithm.NONE;
-            default -> throw new IllegalArgumentException("不支持的压缩算法: " + rawCompression + "，当前仅支持 NONE 或 GZ");
+            default -> throw new IllegalArgumentException("不支持的压缩算法: " + rawCompression + "，当前仅支持 NONE、GZ 或 gzip");
         };
     }
 

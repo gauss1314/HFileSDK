@@ -50,7 +50,7 @@ public final class BulkLoadPerfRunner {
     private static final String DEFAULT_ERROR_POLICY = "skip_row";
     private static final int DEFAULT_BLOCK_SIZE = 65536;
     private static final String DEFAULT_WORK_DIR = "/tmp/hfilesdk-bulkload-perf";
-    private static final long DEFAULT_TIMESTAMP_MS = 1_715_678_900_123L;
+    private static final long DEFAULT_TIMESTAMP_MS = 0L;
     private static final String IMPL_JNI = "arrow-to-hfile";
     private static final String IMPL_JAVA = "arrow-to-hfile-java";
     private static final String STRATEGY_DIRECT = "DIRECT-CONVERT";
@@ -143,6 +143,7 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("bloom").hasArg().argName("TYPE").desc("Bloom 类型").build());
         options.addOption(Option.builder().longOpt("error-policy").hasArg().argName("POLICY").desc("JNI 错误策略").build());
         options.addOption(Option.builder().longOpt("block-size").hasArg().argName("BYTES").desc("HFile block size").build());
+        options.addOption(Option.builder().longOpt("timestamp-ms").hasArg().argName("MILLIS").desc("固定写入时间戳；0 或不传表示使用当前时间，字节级一致性对比时再显式指定").build());
         options.addOption(Option.builder().longOpt("cpu-set").hasArg().argName("LIST").desc("Linux taskset CPU 集合，例如 0-3 或 1,3").build());
         options.addOption(Option.builder().longOpt("process-memory-mb").hasArg().argName("MB").desc("子进程总内存硬限制，优先 cgroup v2，失败时退化为 prlimit").build());
         options.addOption(Option.builder().longOpt("jni-xmx-mb").hasArg().argName("MB").desc("JNI worker JVM -Xmx").build());
@@ -202,11 +203,12 @@ public final class BulkLoadPerfRunner {
             Math.toIntExact(parseNonNegativeLong(commandLine.getOptionValue("payload-bytes", Integer.toString(DEFAULT_PAYLOAD_BYTES)), "payload-bytes")),
             commandLine.getOptionValue("cf", DEFAULT_CF),
             rowKeyRule,
-            commandLine.getOptionValue("compression", DEFAULT_COMPRESSION),
+            normalizeCompression(commandLine.getOptionValue("compression", DEFAULT_COMPRESSION)),
             commandLine.getOptionValue("encoding", DEFAULT_ENCODING),
             commandLine.getOptionValue("bloom", DEFAULT_BLOOM),
             commandLine.getOptionValue("error-policy", DEFAULT_ERROR_POLICY),
             parsePositiveInt(commandLine.getOptionValue("block-size", Integer.toString(DEFAULT_BLOCK_SIZE)), "block-size"),
+            parseNonNegativeLong(commandLine.getOptionValue("timestamp-ms", Long.toString(DEFAULT_TIMESTAMP_MS)), "timestamp-ms"),
             commandLine.hasOption("keep-generated-files"),
             commandLine.getOptionValue("cpu-set", "").trim(),
             parseNonNegativeLong(commandLine.getOptionValue("process-memory-mb", "0"), "process-memory-mb"),
@@ -230,6 +232,18 @@ public final class BulkLoadPerfRunner {
             throw new IllegalArgumentException("jni-sdk-numeric-sort-fast-path must be one of: auto|on|off");
         }
         return normalized;
+    }
+
+    private static String normalizeCompression(String raw) {
+        String normalized = raw == null ? DEFAULT_COMPRESSION : raw.trim();
+        if (normalized.isEmpty()) {
+            normalized = DEFAULT_COMPRESSION;
+        }
+        return switch (normalized.toLowerCase(Locale.ROOT)) {
+            case "gzip", "gz" -> "GZ";
+            case "none" -> "NONE";
+            default -> throw new IllegalArgumentException("compression must be one of: GZ|gzip|NONE");
+        };
     }
 
     private static String resolveDefaultRowKeyRule(String tableName, boolean workerMode, String rawRule) {
@@ -497,7 +511,7 @@ public final class BulkLoadPerfRunner {
             .bloomType(config.bloom())
             .errorPolicy(config.errorPolicy())
             .blockSize(config.blockSize())
-            .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
+            .defaultTimestampMs(config.defaultTimestampMs())
             .maxMemoryBytes(sdkMaxMemoryBytes)
             .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
             .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
@@ -565,7 +579,7 @@ public final class BulkLoadPerfRunner {
                 .bloomType(config.bloom())
                 .errorPolicy(config.errorPolicy())
                 .blockSize(config.blockSize())
-                .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
+                .defaultTimestampMs(config.defaultTimestampMs())
                 .maxMemoryBytes(sdkMaxMemoryBytes)
                 .compressionThreads(Math.toIntExact(config.jniSdkCompressionThreads()))
                 .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
@@ -632,7 +646,7 @@ public final class BulkLoadPerfRunner {
                     .dataBlockEncoding(config.encoding())
                     .bloomType(config.bloom())
                     .blockSize(config.blockSize())
-                    .defaultTimestampMs(DEFAULT_TIMESTAMP_MS)
+                    .defaultTimestampMs(config.defaultTimestampMs())
                     .build()
             );
             resultJsons.add(result.toJson());
@@ -735,6 +749,10 @@ public final class BulkLoadPerfRunner {
         command.add(config.errorPolicy());
         command.add("--block-size");
         command.add(Integer.toString(config.blockSize()));
+        if (config.defaultTimestampMs() > 0) {
+            command.add("--timestamp-ms");
+            command.add(Long.toString(config.defaultTimestampMs()));
+        }
         if (!config.nativeLib().isBlank()) {
             command.add("--native-lib");
             command.add(config.nativeLib());
@@ -1323,6 +1341,7 @@ public final class BulkLoadPerfRunner {
         String bloom,
         String errorPolicy,
         int blockSize,
+        long defaultTimestampMs,
         boolean keepGeneratedFiles,
         String cpuSet,
         long processMemoryMb,
@@ -1567,6 +1586,8 @@ public final class BulkLoadPerfRunner {
             }
             builder.append("],\n");
             builder.append("  \"iterations\": ").append(FIXED_ITERATIONS).append(",\n");
+            builder.append("  \"compression\": \"").append(jsonEscape(config.compression())).append("\",\n");
+            builder.append("  \"encoding\": \"").append(jsonEscape(config.encoding())).append("\",\n");
             builder.append("  \"cpu_set\": \"").append(jsonEscape(config.cpuSet())).append("\",\n");
             builder.append("  \"process_memory_mb\": ").append(config.processMemoryMb()).append(",\n");
             builder.append("  \"jni_xmx_mb\": ").append(config.jniXmxMb()).append(",\n");
@@ -1575,6 +1596,7 @@ public final class BulkLoadPerfRunner {
             builder.append("  \"jni_sdk_compression_threads\": ").append(config.jniSdkCompressionThreads()).append(",\n");
             builder.append("  \"jni_sdk_compression_queue_depth\": ").append(config.jniSdkCompressionQueueDepth()).append(",\n");
             builder.append("  \"jni_sdk_numeric_sort_fast_path\": \"").append(jsonEscape(config.jniSdkNumericSortFastPath())).append("\",\n");
+            builder.append("  \"default_timestamp_ms\": ").append(config.defaultTimestampMs()).append(",\n");
             builder.append("  \"java_xmx_mb\": ").append(config.javaXmxMb()).append(",\n");
             builder.append("  \"java_direct_memory_mb\": ").append(config.javaDirectMemoryMb()).append(",\n");
             builder.append("  \"total_ms\": ").append(nanosToMillis(totalNanos)).append(",\n");

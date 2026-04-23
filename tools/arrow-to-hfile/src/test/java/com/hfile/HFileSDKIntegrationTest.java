@@ -1,6 +1,7 @@
 package com.hfile;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -74,7 +75,7 @@ public class HFileSDKIntegrationTest {
     void configureRejectsUnsupportedCompressionModes() {
         HFileSDK sdk = new HFileSDK();
         assertEquals(HFileSDK.INVALID_ARGUMENT, sdk.configure("{\"compression\":\"lz4\"}"));
-        assertTrue(sdk.getLastResult().contains("NONE or GZ"));
+        assertTrue(sdk.getLastResult().contains("NONE, GZ, or gzip"));
     }
 
     @Test
@@ -169,6 +170,18 @@ public class HFileSDKIntegrationTest {
         assertTrue(lastResult.contains("\"error_code\":0"));
         assertTrue(Files.exists(hfilePath));
         assertTrue(Files.size(hfilePath) > 0);
+    }
+
+    @Test
+    void builderOmitsDefaultTimestampUnlessExplicitlyConfigured() {
+        String defaultConfig = HFileSDK.builder().toConfigJson();
+        assertFalse(defaultConfig.contains("default_timestamp_ms"), defaultConfig);
+        assertFalse(defaultConfig.contains("\"max_memory_bytes\":0"), defaultConfig);
+
+        String fixedConfig = HFileSDK.builder()
+            .defaultTimestampMs(1_715_678_900_123L)
+            .toConfigJson();
+        assertTrue(fixedConfig.contains("\"default_timestamp_ms\":1715678900123"), fixedConfig);
     }
 
     @Test

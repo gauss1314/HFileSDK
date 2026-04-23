@@ -90,6 +90,7 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 - `--payload-bytes`：每行 `PAYLOAD` 的字节数
 - `--batch-rows`：每个 Arrow RecordBatch 行数
 - `--rule`：rowKeyRule，默认 `USER_ID,0,false,0`
+- `--timestamp-ms`：固定写入时间戳；默认 `0` 表示不配置 `default_timestamp_ms`，由实现使用当前时间，只有字节级一致性对比时才建议显式指定
 - `--cpu-set`：Linux 上通过 `taskset` 绑定 worker CPU，确保两种实现使用同一组核
 - `--process-memory-mb`：worker 进程总内存硬限制；优先 cgroup v2，失败时退化为 `prlimit`
 - `--jni-xmx-mb` / `--jni-direct-memory-mb`：JNI worker JVM 的 heap / direct memory
@@ -107,6 +108,13 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 - 纯 Java 实现不能只设置 `-Xmx`，还应同时设置 `--java-direct-memory-mb`
 - JNI 报告中的 `sdk_memory_budget_bytes` / `sdk_tracked_memory_peak_bytes` 是 SDK 内部可归因内存，不是整个 worker RSS
 - `--jni-sdk-numeric-sort-fast-path=on` 只适用于满足快路径约束的 rowkey 规则；不满足时会主动失败，便于避免“静默误配”
+
+Linux x86 最高性能起点：
+
+- 单文件延迟：`--parallelism 1`，`--jni-sdk-compression-threads` 先取绑定核数的 `1/2`，常见上限从 `8~16` 扫描，`--jni-sdk-compression-queue-depth 0` 让 SDK 自动使用 `2 * threads`
+- 目录吞吐：控制 `parallelism * (1 + compression_threads)` 不超过绑定核数的 `75%~90%`，例如 16 核先用 `--parallelism 4 --jni-sdk-compression-threads 2`
+- 纯性能压测且机器内存充足时，`--jni-sdk-max-memory-mb 0` 通常最快；生产演练建议设为进程内存扣除 JVM heap/direct 后的 `60%~70%`
+- 更完整的 Linux x86 参数表和 sweep 命令见仓库根目录 `TESTING.md`
 
 ## 输出结构
 

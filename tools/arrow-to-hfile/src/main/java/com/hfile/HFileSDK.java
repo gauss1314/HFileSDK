@@ -139,7 +139,7 @@ public class HFileSDK {
      *
      * <p>Supported JSON keys:
      * <ul>
-     *   <li>{@code compression}                — {@code "none" | "GZ"}
+     *   <li>{@code compression}                — {@code "NONE" | "GZ"}
      *                                            (also accepts {@code "gzip"} for compatibility)
      *   <li>{@code block_size}                 — data block size in bytes (default 65536)
      *   <li>{@code column_family}              — HBase column family name (default "cf")
@@ -230,20 +230,52 @@ public class HFileSDK {
          */
         public HFileSDK build() {
             HFileSDK sdk = new HFileSDK();
-            String cfg = String.format(
-                "{\"compression\":\"%s\",\"compression_level\":%d,\"block_size\":%d," +
-                "\"column_family\":\"%s\",\"data_block_encoding\":\"%s\",\"max_memory_bytes\":%d," +
-                "\"compression_threads\":%d,\"compression_queue_depth\":%d," +
-                "\"numeric_sort_fast_path\":\"%s\"," +
-                "\"default_timestamp_ms\":%d}",
-                compression, compressionLevel, blockSize, columnFamily, dataBlockEncoding,
-                maxMemoryBytes, compressionThreads, compressionQueueDepth,
-                numericSortFastPath, defaultTimestampMs);
-            int rc = sdk.configure(cfg);
+            int rc = sdk.configure(toConfigJson());
             if (rc != OK) {
                 throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());
             }
             return sdk;
+        }
+
+        String toConfigJson() {
+            StringBuilder cfg = new StringBuilder("{");
+            appendString(cfg, "compression", compression);
+            appendLong(cfg, "compression_level", compressionLevel);
+            appendLong(cfg, "block_size", blockSize);
+            appendString(cfg, "column_family", columnFamily);
+            appendString(cfg, "data_block_encoding", dataBlockEncoding);
+            if (maxMemoryBytes > 0) {
+                appendLong(cfg, "max_memory_bytes", maxMemoryBytes);
+            }
+            if (compressionThreads > 0) {
+                appendLong(cfg, "compression_threads", compressionThreads);
+            }
+            if (compressionQueueDepth > 0) {
+                appendLong(cfg, "compression_queue_depth", compressionQueueDepth);
+            }
+            if (numericSortFastPath != null && !numericSortFastPath.equalsIgnoreCase("auto")) {
+                appendString(cfg, "numeric_sort_fast_path", numericSortFastPath);
+            }
+            if (defaultTimestampMs > 0) {
+                appendLong(cfg, "default_timestamp_ms", defaultTimestampMs);
+            }
+            cfg.append('}');
+            return cfg.toString();
+        }
+
+        private static void appendString(StringBuilder cfg, String key, String value) {
+            if (value == null || value.isBlank()) return;
+            appendComma(cfg);
+            cfg.append('"').append(key).append("\":\"").append(value).append('"');
+        }
+
+        private static void appendLong(StringBuilder cfg, String key, long value) {
+            appendComma(cfg);
+            cfg.append('"').append(key).append("\":").append(value);
+        }
+
+        private static void appendComma(StringBuilder cfg) {
+            if (cfg.length() > 1) cfg.append(',');
         }
     }
 }
