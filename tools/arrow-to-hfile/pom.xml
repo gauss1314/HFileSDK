@@ -50,6 +50,10 @@
     <main.class>io.hfilesdk.converter.ArrowToHFileConverter</main.class>
     <arrow.version>16.1.0</arrow.version>
     <junit.version>5.10.2</junit.version>
+    <!-- Direct mvn invocations default to the repository CMake build dir; env vars override below. -->
+    <hfilesdk.native.dir>${project.basedir}/../../build</hfilesdk.native.dir>
+    <hfilesdk.native.lib></hfilesdk.native.lib>
+    <hfilesdk.build.dir>${project.basedir}/../../build</hfilesdk.build.dir>
   </properties>
 
   <dependencies>
@@ -115,11 +119,11 @@
         <version>3.2.5</version>
         <configuration>
           <useModulePath>false</useModulePath>
-          <argLine>-Djava.library.path=${env.HFILESDK_NATIVE_DIR} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
+          <argLine>-Djava.library.path=${hfilesdk.native.dir} --add-opens=java.base/java.nio=ALL-UNNAMED</argLine>
           <systemPropertyVariables>
-            <hfilesdk.native.dir>${env.HFILESDK_NATIVE_DIR}</hfilesdk.native.dir>
-            <hfilesdk.native.lib>${env.HFILESDK_NATIVE_LIB}</hfilesdk.native.lib>
-            <hfilesdk.build.dir>${env.HFILESDK_BUILD_DIR}</hfilesdk.build.dir>
+            <hfilesdk.native.dir>${hfilesdk.native.dir}</hfilesdk.native.dir>
+            <hfilesdk.native.lib>${hfilesdk.native.lib}</hfilesdk.native.lib>
+            <hfilesdk.build.dir>${hfilesdk.build.dir}</hfilesdk.build.dir>
           </systemPropertyVariables>
         </configuration>
       </plugin>
@@ -173,4 +177,42 @@
 
     </plugins>
   </build>
+
+  <profiles>
+    <profile>
+      <id>hfilesdk-native-dir-env</id>
+      <activation>
+        <property>
+          <name>env.HFILESDK_NATIVE_DIR</name>
+        </property>
+      </activation>
+      <properties>
+        <hfilesdk.native.dir>${env.HFILESDK_NATIVE_DIR}</hfilesdk.native.dir>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>hfilesdk-native-lib-env</id>
+      <activation>
+        <property>
+          <name>env.HFILESDK_NATIVE_LIB</name>
+        </property>
+      </activation>
+      <properties>
+        <hfilesdk.native.lib>${env.HFILESDK_NATIVE_LIB}</hfilesdk.native.lib>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>hfilesdk-build-dir-env</id>
+      <activation>
+        <property>
+          <name>env.HFILESDK_BUILD_DIR</name>
+        </property>
+      </activation>
+      <properties>
+        <hfilesdk.build.dir>${env.HFILESDK_BUILD_DIR}</hfilesdk.build.dir>
+      </properties>
+    </profile>
+  </profiles>
 </project>

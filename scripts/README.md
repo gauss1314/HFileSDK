@@ -3,6 +3,7 @@
 ## 当前脚本
 
 - `build.sh`：本地标准构建入口，按 OS 类型探测并发数，并把项目内 `.conda-hfilesdk` 作为可选本地前缀
+- `release.sh`：发布包入口，默认复用 `build.sh` 的 `build/` 目录并打包平台对应的 JNI 动态库
 - `test.sh`：本地标准测试入口，执行 `cmake` 配置、构建，再运行 `ctest --output-on-failure`
 - `coverage.sh`：覆盖率入口，按 OS 类型探测并发数，生成 `llvm-cov` 文本摘要与 HTML 报表；默认排除时间敏感的 `hfile_chaos_kill`
 - `hfile-bulkload-perf-runner.sh`：集群环境下的性能对比包装入口，可选执行 `source` + `kinit`，然后调用 `tools/hfile-bulkload-perf` fat jar
@@ -14,6 +15,7 @@ Linux / macOS:
 
 ```bash
 bash scripts/build.sh
+bash scripts/release.sh
 bash scripts/test.sh
 bash scripts/coverage.sh
 bash scripts/hfile-bulkload-perf-runner.sh --help
@@ -23,6 +25,7 @@ Windows + MSYS2 `CLANG64`:
 
 ```bash
 bash scripts/build.sh
+bash scripts/release.sh
 bash scripts/test.sh
 bash scripts/coverage.sh
 bash scripts/hfile-bulkload-perf-runner.sh --help
@@ -32,6 +35,8 @@ bash scripts/hfile-bulkload-perf-runner.sh --help
 
 ```bash
 BUILD_DIR=build-debug CMAKE_BUILD_TYPE=Debug bash scripts/build.sh
+HFILESDK_STATIC_LIB_DIRS=/opt/arrow/lib:/opt/protobuf/lib:/opt/zlib/lib bash scripts/release.sh -m static
+BUILD_DIR=build-release bash scripts/release.sh -m bundle
 BUILD_DIR=build-asan bash scripts/test.sh -DHFILE_ENABLE_ASAN=ON
 bash scripts/test.sh -- -R test_arrow_converter
 bash scripts/hfile-bulkload-perf-runner.sh --skip-login -- --help
@@ -44,6 +49,7 @@ bash scripts/hfile-bulkload-perf-runner.sh --skip-login -- --help
 - `build.sh`、`test.sh`、`coverage.sh` 既可直接用于 macOS/Linux，也可在 Windows + MSYS2 `CLANG64` Shell 中直接执行
 - `build.sh`、`test.sh`、`coverage.sh` 现在都按 OS 类型选择并发数探测逻辑，而不是仅靠 `sysctl`/`nproc` 是否存在来判断平台
 - `build.sh`、`test.sh`、`coverage.sh` 中的项目内 `.conda-hfilesdk` 也只是可选本地前缀，不是 Linux/macOS 的必需路径；脚本会优先尊重外部传入的 `CMAKE_PREFIX_PATH` / `Arrow_DIR`
+- `release.sh -m static` 用于正式 Linux 发布，找不到静态 Arrow/Protobuf 时会直接失败；需要动态依赖目录时显式使用 `-m bundle`
 - `build.sh` 会在配置前检查 `cmake`、`clang/clang++`；`test.sh` 额外检查 `ctest`；`coverage.sh` 额外检查 `llvm-cov`、`llvm-profdata`，并在 macOS 下兼容 `xcrun --find`
 - `hfile-bulkload-perf-runner.sh` 只负责环境准备与参数透传，性能矩阵、三轮统计与双实现调用均在 jar 内完成
 - Windows 当前只维护 `MSYS2 + clang/clang++` 这一条路径；建议先进入 `CLANG64` Shell，再在该环境中执行 `bash scripts/*.sh`

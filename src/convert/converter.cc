@@ -1151,7 +1151,6 @@ ConvertResult convert(const ConvertOptions& opts) {
     if (!rk_status.ok()) {
         result.error_code = ErrorCode::INVALID_ROW_KEY_RULE;
         result.error_message = rk_status.message();
-        clog::err("rowKeyRule compile failed: " + rk_status.message());
         return result;
     }
     int max_col_idx = rkb.max_col_index();

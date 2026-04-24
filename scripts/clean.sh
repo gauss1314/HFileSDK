@@ -8,6 +8,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 BUILD_DIRS=(
   "${ROOT_DIR}/build"
+  "${ROOT_DIR}/.release-build"
   "${ROOT_DIR}/build-coverage"
   "${ROOT_DIR}/build-debug"
 )

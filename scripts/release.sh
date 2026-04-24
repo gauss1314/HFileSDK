@@ -4,7 +4,7 @@
 #
 # 产出物 (默认放在 <repo>/release/ 目录):
 #   release/
-#     libhfilesdk.so            # 自包含的 JNI 共享库
+#     libhfilesdk.so/.dylib     # JNI 共享库（按平台命名）
 #     lib/                      # 运行时依赖的 .so (bundle 模式)
 #     arrow-to-hfile-*.jar      # Arrow → HFile 转换工具
 #     mock-arrow-*.jar          # 测试数据生成工具
@@ -12,11 +12,12 @@
 #
 # 两种打包模式 (默认 static):
 #
-#   static  — 把 Arrow / Protobuf / 压缩库全部静态链接进 libhfilesdk.so。
-#             需要 libarrow.a 和 libprotobuf.a 存在。
+#   static  — 把 Arrow / Protobuf / zlib / 压缩库全部静态链接进 libhfilesdk.so。
+#             需要 libarrow.a、libprotobuf.a 和 libz.a 存在。
 #             生成的 .so 仅依赖 libc / libstdc++ / libpthread，
 #             可直接 scp 到任意 Linux 机器使用。
-#             若找不到 .a 文件，打印 WARNING 并自动降级到 bundle 模式。
+#             若找不到 .a 文件，直接失败；需要动态依赖包时请显式使用
+#             -m bundle。
 #
 #   bundle  — 动态链接，但把所有运行时 .so 依赖复制到 release/lib/，
 #             并把 libhfilesdk.so 的 RPATH 设为 $ORIGIN/lib。
@@ -26,11 +27,15 @@
 #   bash scripts/release.sh [选项]
 #
 # 选项:
-#   -o DIR   输出目录           (默认: <repo>/release)
-#   -m MODE  模式: static|bundle (默认: static)
-#   -j N     编译线程数          (默认: nproc)
-#   -s       启用全部压缩编解码器 (LZ4/ZSTD/Snappy/GZip)
+#   -o DIR   输出目录             (默认: <repo>/release)
+#   -b DIR   CMake 构建目录        (默认: build，复用 scripts/build.sh)
+#   -m MODE  模式: static|bundle   (默认: static；非 Linux 自动使用 bundle)
+#   -j N     编译线程数            (默认: nproc)
+#   -s       启用全部压缩编解码器   (LZ4/ZSTD/Snappy/GZip)
 #   -h       显示帮助
+#
+# 环境变量:
+#   HFILESDK_STATIC_LIB_DIRS  static 模式额外静态库目录（冒号或分号分隔）
 # =============================================================================
 
 # 不使用 set -e：用明确的错误检查替代，确保 README 和摘要始终输出
@@ -41,19 +46,89 @@ RED='\033[0;31m'; YELLOW='\033[1;33m'; GREEN='\033[0;32m'; NC='\033[0m'
 info()    { echo -e "${GREEN}==>${NC} $*"; }
 warn()    { echo -e "${YELLOW}[WARNING]${NC} $*" >&2; }
 error()   { echo -e "${RED}[ERROR]${NC} $*" >&2; }
-step()    { echo; echo -e "${GREEN}==> [$1/5]${NC} $2"; }
+step()    { echo; echo -e "${GREEN}==> [$1/4]${NC} $2"; }
 
 # ── 路径 ──────────────────────────────────────────────────────────────────────
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RELEASE_BUILD_DIR="${ROOT_DIR}/.release-build"
+BUILD_DIR="${BUILD_DIR:-build}"
 RELEASE_DIR="${ROOT_DIR}/release"
-LOCAL_PREFIX="${ROOT_DIR}/.conda-hfilesdk"
 PLATFORM="$(uname -s)"
 
 # ── 参数解析 ──────────────────────────────────────────────────────────────────
 MODE="static"
 JOBS=""
 ENABLE_ALL_CODECS=0
+EXTRA_CMAKE_ARGS=()
+declare -a STATIC_LIB_DIRS=()
+
+native_lib_filename() {
+  case "${PLATFORM}" in
+    Darwin) echo "libhfilesdk.dylib" ;;
+    MINGW*|MSYS*|CYGWIN*) echo "hfilesdk.dll" ;;
+    *) echo "libhfilesdk.so" ;;
+  esac
+}
+
+find_built_native_lib() {
+  local dir="$1"
+  local candidate=""
+
+  candidate="$(find "${dir}" -name "${NATIVE_LIB_NAME}" 2>/dev/null | head -1)"
+  if [[ -n "${candidate}" ]]; then
+    echo "${candidate}"
+    return 0
+  fi
+
+  find "${dir}" \
+    \( -name "libhfilesdk.so" -o -name "libhfilesdk.dylib" -o -name "hfilesdk.dll" \) \
+    ! -name "*.so.*" 2>/dev/null | head -1
+}
+
+append_static_lib_dir() {
+  local dir="$1"
+  [[ -n "${dir}" && -d "${dir}" ]] || return 0
+  local existing
+  if ((${#STATIC_LIB_DIRS[@]} > 0)); then
+    for existing in "${STATIC_LIB_DIRS[@]}"; do
+      [[ "${existing}" == "${dir}" ]] && return 0
+    done
+  fi
+  STATIC_LIB_DIRS+=("${dir}")
+}
+
+append_static_prefix_lib_dirs() {
+  local prefix="$1"
+  [[ -n "${prefix}" ]] || return 0
+  append_static_lib_dir "${prefix}/lib"
+  append_static_lib_dir "${prefix}/lib64"
+  if [[ "${prefix}" == */lib/cmake/* ]]; then
+    append_static_lib_dir "${prefix%%/lib/cmake/*}/lib"
+  fi
+}
+
+append_static_lib_dir_list() {
+  local list="$1"
+  local entry
+  local -a entries=()
+  [[ -n "${list}" ]] || return 0
+  list="${list//;/:}"
+  IFS=':' read -r -a entries <<< "${list}"
+  for entry in "${entries[@]}"; do
+    append_static_lib_dir "${entry}"
+  done
+}
+
+append_static_prefix_list() {
+  local list="$1"
+  local entry
+  local -a entries=()
+  [[ -n "${list}" ]] || return 0
+  list="${list//;/:}"
+  IFS=':' read -r -a entries <<< "${list}"
+  for entry in "${entries[@]}"; do
+    append_static_prefix_lib_dirs "${entry}"
+  done
+}
 
 usage() {
   sed -n '/^# =/,/^# =/p' "${BASH_SOURCE[0]}" | grep '^#' | sed 's/^# \?//'
@@ -63,19 +138,30 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) RELEASE_DIR="$2"; shift 2 ;;
+    -b) BUILD_DIR="$2";   shift 2 ;;
     -m) MODE="$2";         shift 2 ;;
     -j) JOBS="$2";         shift 2 ;;
     -s) ENABLE_ALL_CODECS=1; shift ;;
     -h|--help) usage ;;
+    --) shift; EXTRA_CMAKE_ARGS+=("$@"); break ;;
     -*) error "Unknown option: $1"; exit 1 ;;
     *) error "Unexpected argument: $1 (use -- to pass cmake args)"; exit 1 ;;
   esac
 done
 
+NATIVE_LIB_NAME="$(native_lib_filename)"
+RELEASE_BUILD_DIR="${ROOT_DIR}/${BUILD_DIR}"
+RELEASE_NATIVE_LIB="${RELEASE_DIR}/${NATIVE_LIB_NAME}"
+
 [[ "${MODE}" == "static" || "${MODE}" == "bundle" ]] || {
   error "Invalid mode '${MODE}'. Use: static | bundle"
   exit 1
 }
+
+if [[ "${MODE}" == "static" && "${PLATFORM}" != "Linux" ]]; then
+  warn "Static release mode is Linux-only; using bundle mode on ${PLATFORM}."
+  MODE="bundle"
+fi
 
 # ── 并发数 ────────────────────────────────────────────────────────────────────
 if [[ -z "${JOBS}" ]]; then
@@ -91,39 +177,64 @@ command -v mvn   >/dev/null 2>&1 && HAVE_MVN=1
 command -v java  >/dev/null 2>&1 && HAVE_JAVA=1
 
 # ── 静态库探测 ────────────────────────────────────────────────────────────────
+append_static_lib_dir_list "${HFILESDK_STATIC_LIB_DIRS:-}"
+append_static_prefix_list "${CMAKE_PREFIX_PATH:-}"
+append_static_prefix_lib_dirs "${Arrow_DIR:-}"
+append_static_lib_dir "/usr/local/lib"
+append_static_lib_dir "/usr/lib"
+append_static_lib_dir "/usr/lib/x86_64-linux-gnu"
+append_static_lib_dir "/usr/lib64"
+append_static_lib_dir "/usr/lib/aarch64-linux-gnu"
+
 find_static_lib() {
   local name="$1"
-  local dirs=(
-    "${LOCAL_PREFIX}/lib"
-    "/usr/local/lib"
-    "/usr/lib"
-    "/usr/lib/x86_64-linux-gnu"
-    "/usr/lib64"
-    "/usr/lib/aarch64-linux-gnu"
-  )
-  for d in "${dirs[@]}"; do
-    [[ -f "${d}/lib${name}.a" ]] && { echo "${d}/lib${name}.a"; return 0; }
-  done
+  local d
+  if ((${#STATIC_LIB_DIRS[@]} > 0)); then
+    for d in "${STATIC_LIB_DIRS[@]}"; do
+      [[ -f "${d}/lib${name}.a" ]] && { echo "${d}/lib${name}.a"; return 0; }
+    done
+  fi
   return 1
+}
+
+verify_static_release_deps() {
+  [[ "${MODE}" == "static" ]] || return 0
+  command -v ldd >/dev/null 2>&1 || return 0
+
+  local unexpected
+  unexpected="$(ldd "${RELEASE_NATIVE_LIB}" 2>/dev/null \
+    | grep -E "lib(arrow|protobuf|parquet|zstd|lz4|snappy|z)\\.so" || true)"
+  if [[ -n "${unexpected}" ]]; then
+    error "Static release still depends on third-party shared libraries:"
+    echo "${unexpected}" >&2
+    STEP_ERRORS+=("static release has unexpected shared library dependencies")
+    return 1
+  fi
+  info "Static dependency check OK (no Arrow/Protobuf/compression shared libs in ldd)"
+  return 0
 }
 
 ARROW_STATIC=""
 PROTO_STATIC=""
+ZLIB_STATIC=""
 STATIC_OK=0
 
 if [[ "${MODE}" == "static" ]]; then
   if ARROW_STATIC="$(find_static_lib arrow 2>/dev/null)" && \
-     PROTO_STATIC="$(find_static_lib protobuf 2>/dev/null)"; then
+     PROTO_STATIC="$(find_static_lib protobuf 2>/dev/null)" && \
+     ZLIB_STATIC="$(find_static_lib z 2>/dev/null)"; then
     STATIC_OK=1
     info "Static libs found:"
     info "  Arrow:    ${ARROW_STATIC}"
     info "  Protobuf: ${PROTO_STATIC}"
+    info "  zlib:     ${ZLIB_STATIC}"
   else
-    warn "Static libraries not found (libarrow.a / libprotobuf.a missing)."
-    warn "Falling back to BUNDLE mode."
-    warn "To enable static mode, build Arrow/Protobuf with -DBUILD_SHARED_LIBS=OFF"
-    warn "or install static packages (e.g. apt install libarrow-dev)."
-    MODE="bundle"
+    error "Static release requires libarrow.a, libprotobuf.a, and libz.a, but one or more were not found."
+    error "Install/build static Arrow, Protobuf, and zlib libraries, or pass their directories via:"
+    error "  HFILESDK_STATIC_LIB_DIRS=/path/to/arrow/lib:/path/to/protobuf/lib:/path/to/zlib/lib bash scripts/release.sh -m static"
+    error "For a dynamic dependency package, run explicitly:"
+    error "  bash scripts/release.sh -m bundle"
+    exit 1
   fi
 fi
 
@@ -134,6 +245,8 @@ echo "║          HFileSDK Release Build                              ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 printf "║  Mode     : %-48s ║\n" "${MODE}"
 printf "║  Output   : %-48s ║\n" "${RELEASE_DIR}"
+printf "║  Build dir: %-48s ║\n" "${RELEASE_BUILD_DIR}"
+printf "║  Native   : %-48s ║\n" "${NATIVE_LIB_NAME}"
 printf "║  Jobs     : %-48s ║\n" "${JOBS}"
 printf "║  Codecs   : %-48s ║\n" "$([ ${ENABLE_ALL_CODECS} -eq 1 ] && echo 'LZ4 ZSTD Snappy GZip' || echo 'None (Compression::None only)')"
 printf "║  Maven    : %-48s ║\n" "$([ ${HAVE_MVN} -eq 1 ] && echo 'found' || echo 'NOT FOUND — JARs will be skipped')"
@@ -146,21 +259,18 @@ JAR_ATH_OK=0
 JAR_MOCK_OK=0
 STEP_ERRORS=()
 
-# ── Step 1: cmake 配置 ────────────────────────────────────────────────────────
-step 1 "Configuring cmake (build dir: .release-build)..."
+# ── Step 1: Native 构建 ───────────────────────────────────────────────────────
+step 1 "Building native SDK via scripts/build.sh (build dir: ${BUILD_DIR})..."
 
-CMAKE_ARGS=(
-  -S "${ROOT_DIR}"
-  -B "${RELEASE_BUILD_DIR}"
-  -DCMAKE_BUILD_TYPE=Release
+BUILD_CMAKE_ARGS=(
   -DHFILE_ENABLE_TESTS=OFF
   -DHFILE_ENABLE_JAVA_TESTS=OFF   # Maven not required; JAR built separately
-  -DHFILE_BUILD_JNI_LIB=ON        # always build libhfilesdk.so
+  -DHFILE_BUILD_JNI_LIB=ON        # always build the JNI shared library
 )
 
 # 压缩编解码器
 if [[ ${ENABLE_ALL_CODECS} -eq 1 ]]; then
-  CMAKE_ARGS+=(
+  BUILD_CMAKE_ARGS+=(
     -DHFILE_ENABLE_LZ4=ON
     -DHFILE_ENABLE_ZSTD=ON
     -DHFILE_ENABLE_SNAPPY=ON
@@ -168,47 +278,36 @@ if [[ ${ENABLE_ALL_CODECS} -eq 1 ]]; then
   )
 fi
 
-# 本地前缀（conda 环境）
-if [[ -d "${LOCAL_PREFIX}/lib/cmake/Arrow" ]]; then
-  CMAKE_ARGS+=("-DArrow_DIR=${LOCAL_PREFIX}/lib/cmake/Arrow")
-  CMAKE_ARGS+=("-DCMAKE_PREFIX_PATH=${LOCAL_PREFIX}")
+if ((${#EXTRA_CMAKE_ARGS[@]} > 0)); then
+  BUILD_CMAKE_ARGS+=("${EXTRA_CMAKE_ARGS[@]}")
 fi
 
-if cmake "${CMAKE_ARGS[@]}"; then
-  info "cmake configure OK"
+if BUILD_DIR="${BUILD_DIR}" CMAKE_BUILD_TYPE=Release JOBS="${JOBS}" \
+    bash "${ROOT_DIR}/scripts/build.sh" "${BUILD_CMAKE_ARGS[@]}"; then
+  info "Native build OK"
 else
-  error "cmake configure FAILED"
-  STEP_ERRORS+=("cmake configure failed")
+  error "Native build FAILED"
+  STEP_ERRORS+=("native build failed")
 fi
 
-# ── Step 2: C++ 编译 ──────────────────────────────────────────────────────────
-step 2 "Building C++ library and hfilesdk JNI bridge (${JOBS} jobs)..."
+# ── Step 2: 打包 native 库 ────────────────────────────────────────────────────
+step 2 "Packaging ${NATIVE_LIB_NAME} (mode: ${MODE})..."
 
-if [[ ${#STEP_ERRORS[@]} -eq 0 ]]; then
-  if cmake --build "${RELEASE_BUILD_DIR}" -j"${JOBS}"; then
-    info "C++ build OK"
-  else
-    error "C++ build FAILED"
-    STEP_ERRORS+=("C++ build failed")
-  fi
-else
-  warn "Skipping C++ build (cmake configure failed)"
+mkdir -p "${RELEASE_DIR}"
+rm -f "${RELEASE_NATIVE_LIB}"
+rm -rf "${RELEASE_DIR}/lib"
+if [[ "${MODE}" == "bundle" ]]; then
+  mkdir -p "${RELEASE_DIR}/lib"
 fi
 
-# ── Step 3: 打包 .so ──────────────────────────────────────────────────────────
-step 3 "Packaging libhfilesdk.so (mode: ${MODE})..."
-
-mkdir -p "${RELEASE_DIR}/lib"
-
-# 找到 cmake 生成的 libhfilesdk.so
+# 找到 build.sh/CMake 生成的 JNI 动态库
 CMAKE_SO=""
 if [[ ${#STEP_ERRORS[@]} -eq 0 ]]; then
-  CMAKE_SO="$(find "${RELEASE_BUILD_DIR}" -name "libhfilesdk.so" \
-              ! -name "*.so.*" 2>/dev/null | head -1)"
+  CMAKE_SO="$(find_built_native_lib "${RELEASE_BUILD_DIR}")"
   if [[ -z "${CMAKE_SO}" ]]; then
-    error "libhfilesdk.so not found in ${RELEASE_BUILD_DIR}"
-    error "Check that JNI headers are installed (e.g. apt install default-jdk-headless)"
-    STEP_ERRORS+=("libhfilesdk.so not found — JNI headers may be missing")
+    error "${NATIVE_LIB_NAME} not found in ${RELEASE_BUILD_DIR}"
+    error "Run BUILD_DIR=${BUILD_DIR} bash scripts/build.sh, or check that JNI headers are installed."
+    STEP_ERRORS+=("${NATIVE_LIB_NAME} not found — JNI headers may be missing")
   fi
 fi
 
@@ -233,9 +332,8 @@ if [[ -n "${CMAKE_SO}" && ${#STEP_ERRORS[@]} -eq 0 ]]; then
       fi
 
       if [[ -z "${JNI_OBJ}" ]]; then
-        warn "hfile_jni.cc.o not found — falling back to copying cmake-built .so"
-        cp -pL "${CMAKE_SO}" "${RELEASE_DIR}/libhfilesdk.so"
-        SO_OK=1
+        error "hfile_jni.cc.o not found — cannot create static release"
+        STEP_ERRORS+=("static relink: hfile_jni object missing")
       else
         # 编解码器静态库（可选）
         CODEC_FLAGS=()
@@ -259,35 +357,35 @@ if [[ -n "${CMAKE_SO}" && ${#STEP_ERRORS[@]} -eq 0 ]]; then
             ${JNI_INC} \
             "${JNI_OBJ}" \
             -Wl,--whole-archive "${HFILE_A}" -Wl,--no-whole-archive \
-            -Wl,-Bstatic "${ARROW_STATIC}" "${PROTO_STATIC}" \
+            -Wl,-Bstatic "${ARROW_STATIC}" "${PROTO_STATIC}" "${ZLIB_STATIC}" \
             "${CODEC_FLAGS[@]+"${CODEC_FLAGS[@]}"}" \
             -Wl,-Bdynamic \
-            -Wl,-soname,libhfilesdk.so \
+            -Wl,-soname,${NATIVE_LIB_NAME} \
             -Wl,--exclude-libs,ALL \
             -lpthread -lm -ldl \
-            -o "${RELEASE_DIR}/libhfilesdk.so" 2>&1; then
-          info "Static relink OK: ${RELEASE_DIR}/libhfilesdk.so"
-          SO_OK=1
+            -o "${RELEASE_NATIVE_LIB}" 2>&1; then
+          info "Static relink OK: ${RELEASE_NATIVE_LIB}"
+          if verify_static_release_deps; then
+            SO_OK=1
+          fi
         else
-          error "Static relink FAILED — falling back to cmake-built .so (dynamic)"
-          STEP_ERRORS+=("static relink failed (see above); copied dynamic .so instead")
-          cp -pL "${CMAKE_SO}" "${RELEASE_DIR}/libhfilesdk.so"
-          SO_OK=1   # we still have a usable .so
+          error "Static relink FAILED"
+          STEP_ERRORS+=("static relink failed (see above)")
         fi
       fi
     fi
 
   else
     # ── Bundle 模式 ────────────────────────────────────────────────────────
-    info "Copying cmake-built libhfilesdk.so..."
-    cp -pL "${CMAKE_SO}" "${RELEASE_DIR}/libhfilesdk.so"
+    info "Copying cmake-built ${NATIVE_LIB_NAME}..."
+    cp -pL "${CMAKE_SO}" "${RELEASE_NATIVE_LIB}"
 
     if command -v ldd >/dev/null 2>&1; then
-      info "Collecting .so runtime dependencies via ldd..."
+      info "Collecting runtime dependencies via ldd..."
       SYSTEM_LIBS="libpthread|libm|libc\b|libdl|librt|libgcc|libstdc\+\+|linux-vdso|ld-linux"
 
       # First pass: direct deps
-      ldd "${RELEASE_DIR}/libhfilesdk.so" 2>/dev/null \
+      ldd "${RELEASE_NATIVE_LIB}" 2>/dev/null \
         | grep "=>" | grep -vE "${SYSTEM_LIBS}" \
         | awk '{print $3}' | grep -v '^(' | sort -u \
         | while read -r dep_so; do
@@ -313,27 +411,31 @@ if [[ -n "${CMAKE_SO}" && ${#STEP_ERRORS[@]} -eq 0 ]]; then
             done
       done
     else
-      warn "ldd not available — runtime .so deps not collected automatically"
-      warn "Manually copy libarrow.so, libprotobuf.so etc. to ${RELEASE_DIR}/lib/"
+      warn "ldd not available — runtime dynamic library deps were not collected automatically"
+      warn "Manually copy Arrow/Protobuf runtime libraries to ${RELEASE_DIR}/lib/ if the target host does not already provide them."
     fi
 
     # 设置 RPATH=$ORIGIN/lib
     if command -v patchelf >/dev/null 2>&1; then
-      patchelf --set-rpath "\$ORIGIN/lib" "${RELEASE_DIR}/libhfilesdk.so"
+      patchelf --set-rpath "\$ORIGIN/lib" "${RELEASE_NATIVE_LIB}"
       info "RPATH patched to: \$ORIGIN/lib"
     else
       warn "patchelf not found — RPATH not patched."
       warn "Install patchelf, or run Java with:"
       warn "  -Djava.library.path=${RELEASE_DIR}"
-      warn "  and ensure LD_LIBRARY_PATH includes ${RELEASE_DIR}/lib"
+      if [[ "${PLATFORM}" == "Darwin" ]]; then
+        warn "  and ensure DYLD_LIBRARY_PATH includes ${RELEASE_DIR}/lib"
+      else
+        warn "  and ensure LD_LIBRARY_PATH includes ${RELEASE_DIR}/lib"
+      fi
     fi
 
     SO_OK=1
   fi
 fi
 
-# ── Step 4: Java JAR 构建 ─────────────────────────────────────────────────────
-step 4 "Building Java JARs..."
+# ── Step 3: Java JAR 构建 ─────────────────────────────────────────────────────
+step 3 "Building Java JARs..."
 
 build_jar() {
   local subdir="$1"
@@ -394,8 +496,8 @@ else
   fi
 fi
 
-# ── Step 5: README.md ─────────────────────────────────────────────────────────
-step 5 "Writing release/README.md..."
+# ── Step 4: README.md ─────────────────────────────────────────────────────────
+step 4 "Writing release/README.md..."
 
 BUILD_DATE="$(date '+%Y-%m-%d %H:%M:%S')"
 GIT_HASH=""
@@ -415,7 +517,7 @@ MOCK_JAR="$(basename "$(find "${RELEASE_DIR}" -maxdepth 1 \
 if [[ "${MODE}" == "bundle" ]]; then
 DEPLOY_NOTE="## 部署说明（Bundle 模式）
 
-\`libhfilesdk.so\` 的 RPATH 已设置为 \`\$ORIGIN/lib\`，运行时会优先在同目录的 \`lib/\`
+\`${NATIVE_LIB_NAME}\` 的 RPATH 已设置为 \`\$ORIGIN/lib\`，运行时会优先在同目录的 \`lib/\`
 子目录查找 Arrow、Protobuf 等依赖，无需目标机器预装这些库。
 
 **只需把整个 \`release/\` 目录整体拷贝到目标机器即可：**
@@ -427,7 +529,7 @@ scp -r release/ user@target-host:/opt/hfilesdk/
 目录结构：
 \`\`\`
 /opt/hfilesdk/
-  libhfilesdk.so      ← JNI 库（RPATH 指向 lib/）
+  ${NATIVE_LIB_NAME}      ← JNI 库（RPATH 指向 lib/）
   lib/
     libarrow.so.*     ← 自动找到
     libprotobuf.so.*
@@ -438,13 +540,13 @@ scp -r release/ user@target-host:/opt/hfilesdk/
 else
 DEPLOY_NOTE="## 部署说明（Static 模式）
 
-\`libhfilesdk.so\` 已静态链接 Arrow、Protobuf 等依赖，仅依赖系统的
+\`${NATIVE_LIB_NAME}\` 已静态链接 Arrow、Protobuf 等依赖，仅依赖系统的
 \`libc\` / \`libstdc++\` / \`libpthread\`，任意 Linux glibc 2.17+ 系统均可运行。
 
 **直接拷贝所需文件：**
 
 \`\`\`bash
-scp release/libhfilesdk.so release/${ATH_JAR} release/${MOCK_JAR} user@target-host:/opt/hfilesdk/
+scp release/${NATIVE_LIB_NAME} release/${ATH_JAR} release/${MOCK_JAR} user@target-host:/opt/hfilesdk/
 \`\`\`"
 fi
 
@@ -459,8 +561,8 @@ cat > "${RELEASE_DIR}/README.md" << READMEEOF
 
 | 文件 | 说明 |
 |------|------|
-| \`libhfilesdk.so\` | C++ HFile 写入库（JNI 共享库），Java 通过 JNI 调用 |
-| \`lib/\` | 运行时 .so 依赖（bundle 模式专用） |
+| \`${NATIVE_LIB_NAME}\` | C++ HFile 写入库（JNI 共享库），Java 通过 JNI 调用 |
+| \`lib/\` | 运行时动态库依赖（bundle 模式专用） |
 | \`${ATH_JAR}\` | Arrow IPC Stream → HFile v3 转换工具 |
 | \`${MOCK_JAR}\` | Arrow 格式测试数据生成工具 |
 
@@ -504,9 +606,9 @@ java -jar ${MOCK_JAR} --help
 使用 \`${ATH_JAR}\` 把 Arrow 文件转换为 HBase HFile v3：
 
 \`\`\`bash
-# 方式一：通过 --native-lib 直接指定 .so 路径
+# 方式一：通过 --native-lib 直接指定 native 库路径
 java -jar ${ATH_JAR} \\
-  --native-lib \$(pwd)/libhfilesdk.so \\
+  --native-lib \$(pwd)/${NATIVE_LIB_NAME} \\
   --arrow      /data/tdr_20550.arrow \\
   --hfile      /staging/tdr_signal_stor_20550/cf/tdr_20550.hfile \\
   --table      tdr_signal_stor_20550 \\
@@ -514,7 +616,7 @@ java -jar ${ATH_JAR} \\
   --cf         cf
 
 # 方式二：通过环境变量（适合脚本化场景）
-export HFILESDK_NATIVE_LIB=\$(pwd)/libhfilesdk.so
+export HFILESDK_NATIVE_LIB=\$(pwd)/${NATIVE_LIB_NAME}
 java -jar ${ATH_JAR} \\
   --arrow /data/tdr_20550.arrow \\
   --hfile /staging/tdr_signal_stor_20550/cf/tdr_20550.hfile \\
@@ -567,7 +669,7 @@ import io.hfilesdk.converter.*;
 
 // 应用启动时加载 native 库（一次）
 ArrowToHFileConverter converter =
-    ArrowToHFileConverter.withNativeLib("/opt/hfilesdk/libhfilesdk.so");
+    ArrowToHFileConverter.withNativeLib("/opt/hfilesdk/${NATIVE_LIB_NAME}");
 
 // 每次转换
 ConvertResult result = converter.convertOrThrow(
@@ -589,7 +691,7 @@ System.out.println(result.summary());
 
 - **OS**：Linux x86-64（glibc 2.17+）或 macOS 12+
 - **Java**：JDK 21+（运行 JAR 工具必须）
-- **权限**：写入 libhfilesdk.so 所在目录（无需 root）
+- **权限**：写入 ${NATIVE_LIB_NAME} 所在目录（无需 root）
 READMEEOF
 
 info "README.md written: ${RELEASE_DIR}/README.md"
@@ -604,15 +706,14 @@ echo "Output: ${RELEASE_DIR}/"
 echo
 
 # 列出产出文件
-SO_FILE="${RELEASE_DIR}/libhfilesdk.so"
-if [[ -f "${SO_FILE}" ]]; then
-  SO_SIZE="$(du -sh "${SO_FILE}" 2>/dev/null | cut -f1)"
-  echo -e "  ${GREEN}✓${NC}  libhfilesdk.so  (${SO_SIZE})"
+if [[ -f "${RELEASE_NATIVE_LIB}" ]]; then
+  SO_SIZE="$(du -sh "${RELEASE_NATIVE_LIB}" 2>/dev/null | cut -f1)"
+  echo -e "  ${GREEN}✓${NC}  ${NATIVE_LIB_NAME}  (${SO_SIZE})"
 else
-  echo -e "  ${RED}✗${NC}  libhfilesdk.so  MISSING"
+  echo -e "  ${RED}✗${NC}  ${NATIVE_LIB_NAME}  MISSING"
 fi
 
-LIB_COUNT="$(find "${RELEASE_DIR}/lib" -name "*.so*" 2>/dev/null | wc -l)"
+LIB_COUNT="$(find "${RELEASE_DIR}/lib" \( -name "*.so*" -o -name "*.dylib*" -o -name "*.dll" \) 2>/dev/null | wc -l)"
 if [[ ${LIB_COUNT} -gt 0 ]]; then
   echo -e "  ${GREEN}✓${NC}  lib/ (${LIB_COUNT} shared libs bundled)"
 fi
@@ -645,11 +746,11 @@ else
   if [[ "${MODE}" == "bundle" ]]; then
     echo "  scp -r ${RELEASE_DIR}/ user@host:/opt/hfilesdk/"
   else
-    echo "  scp ${RELEASE_DIR}/libhfilesdk.so ${RELEASE_DIR}/*.jar user@host:/opt/hfilesdk/"
+    echo "  scp ${RELEASE_NATIVE_LIB} ${RELEASE_DIR}/*.jar user@host:/opt/hfilesdk/"
   fi
   echo
   echo "Quick test:"
   echo "  java -jar ${RELEASE_DIR}/${MOCK_JAR} --output /tmp/test.arrow --size 1"
-  echo "  java -jar ${RELEASE_DIR}/${ATH_JAR}  --native-lib ${RELEASE_DIR}/libhfilesdk.so \\"
+  echo "  java -jar ${RELEASE_DIR}/${ATH_JAR}  --native-lib ${RELEASE_NATIVE_LIB} \\"
   echo "       --arrow /tmp/test.arrow --hfile /tmp/test.hfile --rule 'REFID,0,false,15'"
 fi
