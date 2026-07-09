@@ -1107,8 +1107,6 @@ ConvertResult convert(const ConvertOptions& opts) {
         } else {
             row_key = sort_index[i].row_key;
         }
-        cells.clear();
-
         size_t j = i;
         if (used_numeric_sort_path && sort_index[i].has_numeric_sort_key) {
             auto suffix = sort_index[i].row_key;
