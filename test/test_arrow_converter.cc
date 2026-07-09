@@ -1022,3 +1022,67 @@ TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall) {
     EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
     fs::remove_all(dir);
 }
+
+TEST(ArrowConverter, ConvertSupportsSingleCellJoinedRowValue) {
+    arrow::Int64Builder refid_builder;
+    arrow::Int64Builder time_builder;
+    arrow::StringBuilder sigstore_builder;
+    arrow::Int64Builder bitmap_builder;
+
+    ARROW_EXPECT_OK(refid_builder.Append(421261797228550));
+    ARROW_EXPECT_OK(time_builder.Append(1606986226));
+    ARROW_EXPECT_OK(sigstore_builder.Append("cs,53202"));
+    ARROW_EXPECT_OK(bitmap_builder.Append(4));
+
+    std::shared_ptr<arrow::Array> refid_arr, time_arr, sigstore_arr, bitmap_arr;
+    ARROW_EXPECT_OK(refid_builder.Finish(&refid_arr));
+    ARROW_EXPECT_OK(time_builder.Finish(&time_arr));
+    ARROW_EXPECT_OK(sigstore_builder.Finish(&sigstore_arr));
+    ARROW_EXPECT_OK(bitmap_builder.Finish(&bitmap_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("REFID", arrow::int64()),
+        arrow::field("TIME", arrow::int64()),
+        arrow::field("SIGSTORE", arrow::utf8()),
+        arrow::field("BIT_MAP", arrow::int64()),
+    });
+    auto batch = arrow::RecordBatch::Make(
+        schema, 1, {refid_arr, time_arr, sigstore_arr, bitmap_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "dfx_hbase_tdr_siganl_stor";
+    opts.row_key_rule = "REFID,0,false,0";
+    opts.column_family = "value";
+    opts.default_timestamp = 1234;
+    opts.writer_opts.column_family = "value";
+    opts.writer_opts.compression = Compression::None;
+    opts.single_cell_row_value = true;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_EQ(result.kv_written_count, 1);
+
+    auto file_bytes = read_file(hfile_path);
+    auto blocks = scan_blocks(file_bytes);
+    std::string data_blocks;
+    for (const auto& block : blocks) {
+        if (block.magic != "DATABLK*") continue;
+        data_blocks.append(
+            reinterpret_cast<const char*>(block.payload.data()),
+            block.payload.size());
+    }
+
+    EXPECT_NE(data_blocks.find("value"), std::string::npos);
+    EXPECT_NE(data_blocks.find("421261797228550|1606986226|cs,53202|4|"),
+              std::string::npos);
+    EXPECT_EQ(data_blocks.find("SIGSTORE"), std::string::npos);
+
+    fs::remove_all(dir);
+}

@@ -47,6 +47,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Comparator;
@@ -158,7 +159,8 @@ public final class ArrowToHFileJavaConverter {
                             storedBatches,
                             projectedSchema,
                             sortIndex,
-                            options.defaultTimestampMs()
+                            options.defaultTimestampMs(),
+                            options
                         );
                     } finally {
                         writer.close();
@@ -273,6 +275,9 @@ public final class ArrowToHFileJavaConverter {
                 .bloomType(commandLine.getOptionValue("bloom", "ROW"))
                 .blockSize(parsePositiveInt(commandLine.getOptionValue("block-size", "65536"), "block-size"))
                 .defaultTimestampMs(parseNonNegativeLong(commandLine.getOptionValue("timestamp-ms", "0"), "timestamp-ms"))
+                .singleCellRowValue(commandLine.hasOption("single-cell-row-value"))
+                .rowValueDelimiter(commandLine.getOptionValue("row-value-delimiter", "|"))
+                .rowValueTrailingDelimiter(!commandLine.hasOption("no-row-value-trailing-delimiter"))
                 .excludedColumns(parseCsv(commandLine.getOptionValue("exclude-cols", "")))
                 .excludedPrefixes(parseCsv(commandLine.getOptionValue("exclude-prefix", "")))
                 .build();
@@ -304,6 +309,9 @@ public final class ArrowToHFileJavaConverter {
         options.addOption(Option.builder().longOpt("bloom").hasArg().argName("TYPE").desc("Bloom 类型，默认 ROW").build());
         options.addOption(Option.builder().longOpt("block-size").hasArg().argName("BYTES").desc("block size，默认 65536").build());
         options.addOption(Option.builder().longOpt("timestamp-ms").hasArg().argName("MILLIS").desc("固定写入时间戳，默认 0=使用当前时间").build());
+        options.addOption(Option.builder().longOpt("single-cell-row-value").desc("每行只写一个空 qualifier cell，value 为过滤后所有列按顺序拼接").build());
+        options.addOption(Option.builder().longOpt("row-value-delimiter").hasArg().argName("DELIM").desc("single-cell-row-value 的列分隔符，默认 |").build());
+        options.addOption(Option.builder().longOpt("no-row-value-trailing-delimiter").desc("single-cell-row-value 不追加尾部分隔符").build());
         options.addOption(Option.builder().longOpt("exclude-cols").hasArg().argName("COL1,COL2").desc("排除列名").build());
         options.addOption(Option.builder().longOpt("exclude-prefix").hasArg().argName("PFX1,PFX2").desc("排除列名前缀").build());
         options.addOption(Option.builder().longOpt("help").desc("显示帮助").build());
@@ -527,7 +535,8 @@ public final class ArrowToHFileJavaConverter {
                                         List<VectorSchemaRoot> storedBatches,
                                         ProjectedSchema projectedSchema,
                                         List<SortEntry> sortIndex,
-                                        long defaultTimestampMs) throws IOException {
+                                        long defaultTimestampMs,
+                                        JavaConvertOptions options) throws IOException {
         long kvWritten = 0L;
         List<GroupedCell> cells = new ArrayList<>();
 
@@ -537,33 +546,70 @@ public final class ArrowToHFileJavaConverter {
             cells.clear();
 
             int next = index;
-            while (next < sortIndex.size() && Bytes.equals(sortIndex.get(next).rowKey(), rowKey)) {
-                SortEntry entry = sortIndex.get(next);
+            if (options.singleCellRowValue()) {
+                SortEntry entry = sortIndex.get(index);
                 VectorSchemaRoot batchRoot = storedBatches.get(entry.batchIndex());
-                for (ProjectedField field : projectedSchema.qualifierFields()) {
-                    byte[] value = extractValueBytes(batchRoot.getVector(field.sourceIndex()), entry.rowIndex());
-                    if (value.length == 0) {
+                long timestamp = defaultTimestampMs > 0 ? defaultTimestampMs : System.currentTimeMillis();
+                writer.append(new KeyValue(
+                    rowKey,
+                    columnFamily,
+                    new byte[0],
+                    timestamp,
+                    buildJoinedRowValue(batchRoot, projectedSchema, entry.rowIndex(), options)
+                ));
+                kvWritten++;
+                while (next < sortIndex.size() && Bytes.equals(sortIndex.get(next).rowKey(), rowKey)) {
+                    next++;
+                }
+            } else {
+                while (next < sortIndex.size() && Bytes.equals(sortIndex.get(next).rowKey(), rowKey)) {
+                    SortEntry entry = sortIndex.get(next);
+                    VectorSchemaRoot batchRoot = storedBatches.get(entry.batchIndex());
+                    for (ProjectedField field : projectedSchema.qualifierFields()) {
+                        byte[] value = extractValueBytes(batchRoot.getVector(field.sourceIndex()), entry.rowIndex());
+                        if (value.length == 0) {
+                            continue;
+                        }
+                        cells.add(new GroupedCell(field.name(), field.qualifier(), value));
+                    }
+                    next++;
+                }
+
+                cells.sort(Comparator.comparing(GroupedCell::name));
+                String previousQualifier = null;
+                long timestamp = defaultTimestampMs > 0 ? defaultTimestampMs : System.currentTimeMillis();
+                for (GroupedCell cell : cells) {
+                    if (cell.name().equals(previousQualifier)) {
                         continue;
                     }
-                    cells.add(new GroupedCell(field.name(), field.qualifier(), value));
+                    writer.append(new KeyValue(rowKey, columnFamily, cell.qualifier(), timestamp, cell.value()));
+                    kvWritten++;
+                    previousQualifier = cell.name();
                 }
-                next++;
-            }
-
-            cells.sort(Comparator.comparing(GroupedCell::name));
-            String previousQualifier = null;
-            long timestamp = defaultTimestampMs > 0 ? defaultTimestampMs : System.currentTimeMillis();
-            for (GroupedCell cell : cells) {
-                if (cell.name().equals(previousQualifier)) {
-                    continue;
-                }
-                writer.append(new KeyValue(rowKey, columnFamily, cell.qualifier(), timestamp, cell.value()));
-                kvWritten++;
-                previousQualifier = cell.name();
             }
             index = next;
         }
         return kvWritten;
+    }
+
+
+    private static byte[] buildJoinedRowValue(VectorSchemaRoot batchRoot,
+                                              ProjectedSchema projectedSchema,
+                                              int rowIndex,
+                                              JavaConvertOptions options) {
+        StringBuilder builder = new StringBuilder();
+        List<ProjectedField> fields = projectedSchema.visibleFields();
+        for (int index = 0; index < fields.size(); index++) {
+            if (index > 0) {
+                builder.append(options.rowValueDelimiter());
+            }
+            ProjectedField field = fields.get(index);
+            builder.append(extractStringValue(batchRoot.getVector(field.sourceIndex()), rowIndex));
+        }
+        if (options.rowValueTrailingDelimiter()) {
+            builder.append(options.rowValueDelimiter());
+        }
+        return builder.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     private static void closeBatches(List<VectorSchemaRoot> storedBatches) {

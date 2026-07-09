@@ -56,6 +56,9 @@ public final class ConvertOptions {
     private final int    compressionQueueDepth;
     private final String numericSortFastPath;
     private final long   defaultTimestampMs;
+    private final boolean singleCellRowValue;
+    private final String rowValueDelimiter;
+    private final boolean rowValueTrailingDelimiter;
 
     // ── Column exclusion ──────────────────────────────────────────────────────
     private final List<String> excludedColumns;
@@ -82,6 +85,9 @@ public final class ConvertOptions {
         this.compressionQueueDepth  = (int) requireNonNegative(b.compressionQueueDepth, "compressionQueueDepth");
         this.numericSortFastPath    = normalizeNumericSortFastPath(b.numericSortFastPath);
         this.defaultTimestampMs     = requireNonNegative(b.defaultTimestampMs, "defaultTimestampMs");
+        this.singleCellRowValue     = b.singleCellRowValue;
+        this.rowValueDelimiter      = b.rowValueDelimiter;
+        this.rowValueTrailingDelimiter = b.rowValueTrailingDelimiter;
         this.excludedColumns        = Collections.unmodifiableList(new ArrayList<>(b.excludedColumns));
         this.excludedColumnPrefixes = Collections.unmodifiableList(new ArrayList<>(b.excludedColumnPrefixes));
         this.nativeLibPath          = b.nativeLibPath;
@@ -126,6 +132,9 @@ public final class ConvertOptions {
     public int          compressionQueueDepth()    { return compressionQueueDepth; }
     public String       numericSortFastPath()      { return numericSortFastPath; }
     public long         defaultTimestampMs()       { return defaultTimestampMs; }
+    public boolean      singleCellRowValue()       { return singleCellRowValue; }
+    public String       rowValueDelimiter()        { return rowValueDelimiter; }
+    public boolean      rowValueTrailingDelimiter(){ return rowValueTrailingDelimiter; }
     public List<String> excludedColumns()          { return excludedColumns; }
     public List<String> excludedColumnPrefixes()   { return excludedColumnPrefixes; }
     public String       nativeLibPath()            { return nativeLibPath; }
@@ -168,6 +177,15 @@ public final class ConvertOptions {
         if (defaultTimestampMs > 0) {
             if (sb.length() > 1) sb.append(',');
             sb.append("\"default_timestamp_ms\":").append(defaultTimestampMs);
+        }
+        if (singleCellRowValue) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"single_cell_row_value\":1");
+        }
+        appendStr(sb, "row_value_delimiter", rowValueDelimiter);
+        if (!rowValueTrailingDelimiter) {
+            if (sb.length() > 1) sb.append(',');
+            sb.append("\"row_value_trailing_delimiter\":0");
         }
         appendStrArray(sb, "excluded_columns",         excludedColumns);
         appendStrArray(sb, "excluded_column_prefixes", excludedColumnPrefixes);
@@ -217,6 +235,9 @@ public final class ConvertOptions {
         private int    compressionQueueDepth;
         private String numericSortFastPath = "auto";
         private long   defaultTimestampMs;
+        private boolean singleCellRowValue;
+        private String rowValueDelimiter = "|";
+        private boolean rowValueTrailingDelimiter = true;
         private final ArrayList<String> excludedColumns        = new ArrayList<>();
         private final ArrayList<String> excludedColumnPrefixes = new ArrayList<>();
         private String nativeLibPath;
@@ -259,6 +280,10 @@ public final class ConvertOptions {
         public Builder compressionQueueDepth(int v){ compressionQueueDepth = v; return this; }
         public Builder numericSortFastPath(String v){ numericSortFastPath = v; return this; }
         public Builder defaultTimestampMs(long v)  { defaultTimestampMs = v; return this; }
+        /** Emit one empty-qualifier cell whose value is all filtered columns joined in schema order. */
+        public Builder singleCellRowValue(boolean v) { singleCellRowValue = v; return this; }
+        public Builder rowValueDelimiter(String v) { rowValueDelimiter = v; return this; }
+        public Builder rowValueTrailingDelimiter(boolean v) { rowValueTrailingDelimiter = v; return this; }
 
         /**
          * Exclude one column by exact name from HBase KV output.
