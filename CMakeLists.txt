@@ -502,8 +502,9 @@ add_test(
     --mode kill-during-write
     --output-dir ${CMAKE_BINARY_DIR}/chaos/kill
     --verify-no-corrupt-files
-    --rows 50000
-    --value-size 2048
+    --rows 200000
+    --value-size 4096
+    --poll-timeout-ms 10000
 )
 
 add_test(

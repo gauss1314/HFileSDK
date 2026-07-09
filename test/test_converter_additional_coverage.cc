@@ -214,7 +214,7 @@ TEST(ConverterAdditionalCoverage, ConvertWithHotPathAndCompressionPipelineSuccee
     EXPECT_EQ(result.error_code, ErrorCode::OK);
     EXPECT_EQ(result.numeric_sort_fast_path_mode, NumericSortFastPathMode::Off);
     EXPECT_FALSE(result.numeric_sort_fast_path_used);
-    EXPECT_EQ(result.kv_written_count, 11);
+    EXPECT_EQ(result.kv_written_count, 1);
     EXPECT_TRUE(fs::exists(hfile_path));
 
     fs::remove_all(dir);

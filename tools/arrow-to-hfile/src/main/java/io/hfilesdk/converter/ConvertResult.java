@@ -35,7 +35,7 @@ public final class ConvertResult {
     /**
      * Number of HBase row keys that were produced by more than one Arrow source
      * row (rowKeyRule collisions).  When this is non-zero, some source data was
-     * silently dropped (first-in-sort-order wins for each qualifier).
+     * silently dropped (the first source row in sort order wins).
      *
      * <p>Non-zero here is a signal to review the rowKeyRule for uniqueness.
      * Each collision emits exactly ONE WARN log line (not one per column).
@@ -122,7 +122,7 @@ public final class ConvertResult {
     /**
      * Returns {@code true} if there were row key collisions (multiple Arrow rows
      * mapped to the same HBase row key).  When true, some source data was silently
-     * dropped (first-in-sort-order wins per qualifier).  Review the rowKeyRule.
+     * dropped (the first source row in sort order wins).  Review the rowKeyRule.
      */
     public boolean hasDuplicateKeys() { return duplicateKeyCount > 0; }
 

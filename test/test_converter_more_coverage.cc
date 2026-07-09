@@ -199,7 +199,7 @@ TEST(ConverterMoreCoverage, ConvertCoversWideScalarTypesAndFallbackValues) {
 
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
-    EXPECT_EQ(result.kv_written_count, 20);
+    EXPECT_EQ(result.kv_written_count, 1);
     EXPECT_GT(result.hfile_size_bytes, 0);
     EXPECT_TRUE(fs::exists(hfile_path));
 
@@ -240,7 +240,7 @@ TEST(ConverterMoreCoverage, ConvertDirectLargeStringFastPathSkipsNullAndEmptyRow
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
     EXPECT_EQ(result.arrow_rows_read, 3);
-    EXPECT_EQ(result.kv_written_count, 2);
+    EXPECT_EQ(result.kv_written_count, 1);
     EXPECT_EQ(result.kv_skipped_count, 2);
 
     fs::remove_all(dir);

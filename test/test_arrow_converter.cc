@@ -83,6 +83,14 @@ struct BlockView {
     std::span<const uint8_t> payload;
 };
 
+struct DecodedCell {
+    std::string row;
+    std::string family;
+    std::string qualifier;
+    int64_t timestamp{0};
+    std::string value;
+};
+
 static std::vector<uint8_t> read_file(const fs::path& path) {
     std::ifstream in(path, std::ios::binary);
     return std::vector<uint8_t>(
@@ -107,6 +115,114 @@ static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
         offset += kBlockHeaderSize + on_disk_size_without_header;
     }
     return blocks;
+}
+
+static std::vector<DecodedCell> decode_data_block_cells(const std::vector<uint8_t>& data) {
+    std::vector<DecodedCell> cells;
+    for (const auto& block : scan_blocks(data)) {
+        if (block.magic != "DATABLK*") continue;
+
+        const uint8_t* p = block.payload.data();
+        const uint8_t* end = p + block.payload.size();
+        while (p + 8 <= end) {
+            const uint32_t key_len = read_be32(p);
+            const uint32_t value_len = read_be32(p + 4);
+            const uint8_t* key = p + 8;
+            const uint8_t* value = key + key_len;
+            if (value + value_len + 2 > end) break;
+
+            const uint16_t row_len = read_be16(key);
+            const uint8_t* row = key + 2;
+            const uint8_t family_len = *(row + row_len);
+            const uint8_t* family = row + row_len + 1;
+            const uint8_t* qualifier = family + family_len;
+            const size_t qualifier_len =
+                key_len - 2 - row_len - 1 - family_len - 8 - 1;
+            const uint8_t* timestamp = qualifier + qualifier_len;
+
+            DecodedCell cell;
+            cell.row.assign(reinterpret_cast<const char*>(row), row_len);
+            cell.family.assign(reinterpret_cast<const char*>(family), family_len);
+            cell.qualifier.assign(reinterpret_cast<const char*>(qualifier), qualifier_len);
+            cell.timestamp = static_cast<int64_t>(read_be64(timestamp));
+            cell.value.assign(reinterpret_cast<const char*>(value), value_len);
+            cells.push_back(std::move(cell));
+
+            const uint16_t tags_len = read_be16(value + value_len);
+            p = value + value_len + 2 + tags_len;
+        }
+    }
+    return cells;
+}
+
+TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow) {
+    arrow::Int64Builder bit_map_builder;
+    arrow::Int64Builder refid_builder;
+    arrow::StringBuilder sigstore_builder;
+    arrow::Int64Builder time_builder;
+
+    ARROW_EXPECT_OK(bit_map_builder.Append(4));
+    ARROW_EXPECT_OK(refid_builder.Append(87580202874LL));
+    ARROW_EXPECT_OK(sigstore_builder.Append("dfx_hbase_sigstor-47820208578"));
+    ARROW_EXPECT_OK(time_builder.Append(1783451782LL));
+
+    ARROW_EXPECT_OK(bit_map_builder.Append(5));
+    ARROW_EXPECT_OK(refid_builder.Append(87580202875LL));
+    ARROW_EXPECT_OK(sigstore_builder.Append("sig2"));
+    ARROW_EXPECT_OK(time_builder.AppendNull());
+
+    std::shared_ptr<arrow::Array> bit_map_arr, refid_arr, sigstore_arr, time_arr;
+    ARROW_EXPECT_OK(bit_map_builder.Finish(&bit_map_arr));
+    ARROW_EXPECT_OK(refid_builder.Finish(&refid_arr));
+    ARROW_EXPECT_OK(sigstore_builder.Finish(&sigstore_arr));
+    ARROW_EXPECT_OK(time_builder.Finish(&time_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("BIT_MAP", arrow::int64()),
+        arrow::field("REFID", arrow::int64()),
+        arrow::field("SIGSTORE", arrow::utf8()),
+        arrow::field("TIME", arrow::int64()),
+    });
+    auto batch = arrow::RecordBatch::Make(
+        schema, 2, {bit_map_arr, refid_arr, sigstore_arr, time_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "dfx_hbase_tdr_siganl_stor";
+    opts.row_key_rule = "REFID,1,false,0";
+    opts.column_family = "value";
+    opts.default_timestamp = 1715678900123LL;
+    opts.writer_opts.column_family = "value";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::None;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_EQ(result.kv_written_count, 2);
+    EXPECT_EQ(result.kv_skipped_count, 0);
+
+    auto cells = decode_data_block_cells(read_file(hfile_path));
+    ASSERT_EQ(cells.size(), 2);
+    EXPECT_EQ(cells[0].row, "87580202874");
+    EXPECT_EQ(cells[0].family, "value");
+    EXPECT_TRUE(cells[0].qualifier.empty());
+    EXPECT_EQ(cells[0].timestamp, 1715678900123LL);
+    EXPECT_EQ(cells[0].value,
+              "4|87580202874|dfx_hbase_sigstor-47820208578|1783451782");
+
+    EXPECT_EQ(cells[1].row, "87580202875");
+    EXPECT_EQ(cells[1].family, "value");
+    EXPECT_TRUE(cells[1].qualifier.empty());
+    EXPECT_EQ(cells[1].timestamp, 1715678900123LL);
+    EXPECT_EQ(cells[1].value, "5|87580202875|sig2|");
+
+    fs::remove_all(dir);
 }
 
 TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
@@ -151,7 +267,7 @@ TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
     EXPECT_EQ(result.duplicate_key_count, 1);
-    EXPECT_EQ(result.kv_written_count, 3);
+    EXPECT_EQ(result.kv_written_count, 1);
     EXPECT_EQ(result.kv_skipped_count, 1);
     EXPECT_TRUE(fs::exists(hfile_path));
 
@@ -200,8 +316,8 @@ TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey) {
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
     EXPECT_EQ(result.duplicate_key_count, 1);
-    EXPECT_EQ(result.kv_written_count, 2);
-    EXPECT_EQ(result.kv_skipped_count, 2);
+    EXPECT_EQ(result.kv_written_count, 1);
+    EXPECT_EQ(result.kv_skipped_count, 1);
 
     fs::remove_all(dir);
 }
@@ -239,7 +355,7 @@ TEST(ArrowConverter, ConvertSupportsLargeStringColumns) {
 
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
-    EXPECT_EQ(result.kv_written_count, 2);
+    EXPECT_EQ(result.kv_written_count, 1);
 
     fs::remove_all(dir);
 }
@@ -370,7 +486,7 @@ TEST(ArrowConverter, ConvertAcceptsLongHashRowKeyRule) {
 
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
-    EXPECT_EQ(result.kv_written_count, 4);
+    EXPECT_EQ(result.kv_written_count, 2);
     EXPECT_TRUE(fs::exists(hfile_path));
     fs::remove_all(dir);
 }
@@ -563,9 +679,12 @@ TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
     ASSERT_NE(row1_pos, std::string::npos);
     ASSERT_NE(row2_pos, std::string::npos);
     EXPECT_LT(row1_pos, row2_pos);
-    EXPECT_EQ(decompressed_data_blocks.find("payload"), std::string::npos);
-    EXPECT_EQ(decompressed_data_blocks.find("_hoodie_commit_time"), std::string::npos);
-    EXPECT_NE(decompressed_data_blocks.find("city"), std::string::npos);
+    EXPECT_EQ(decompressed_data_blocks.find("drop-1"), std::string::npos);
+    EXPECT_EQ(decompressed_data_blocks.find("drop-2"), std::string::npos);
+    EXPECT_EQ(decompressed_data_blocks.find("meta-1"), std::string::npos);
+    EXPECT_EQ(decompressed_data_blocks.find("meta-2"), std::string::npos);
+    EXPECT_NE(decompressed_data_blocks.find("sh"), std::string::npos);
+    EXPECT_NE(decompressed_data_blocks.find("hz"), std::string::npos);
 
     fs::remove_all(dir);
 }

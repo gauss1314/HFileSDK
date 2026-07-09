@@ -49,7 +49,7 @@ public class HFileSDKIntegrationTest {
 
         String lastResult = sdk.getLastResult();
         assertTrue(lastResult.contains("\"error_code\":0"));
-        assertTrue(lastResult.contains("\"kv_written_count\":4"));
+        assertTrue(lastResult.contains("\"kv_written_count\":2"));
         assertTrue(lastResult.contains("\"arrow_rows_read\":2"));
         assertTrue(Files.exists(hfilePath));
         assertTrue(Files.size(hfilePath) > 0);
@@ -294,7 +294,7 @@ public class HFileSDKIntegrationTest {
 
         String lastResult = sdk.getLastResult();
         assertTrue(lastResult.contains("\"error_code\":0"));
-        assertTrue(lastResult.contains("\"kv_written_count\":4"));
+        assertTrue(lastResult.contains("\"kv_written_count\":2"));
         assertTrue(Files.exists(hfilePath));
     }
 

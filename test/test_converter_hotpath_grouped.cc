@@ -107,8 +107,8 @@ TEST(ConverterHotPathGrouped, DuplicateRowsUseGroupedWriterPathWithProfiling) {
     auto result = convert(opts);
     EXPECT_EQ(result.error_code, ErrorCode::OK);
     EXPECT_EQ(result.duplicate_key_count, 1);
-    EXPECT_EQ(result.kv_written_count, 3);
-    EXPECT_EQ(result.kv_skipped_count, 2);
+    EXPECT_EQ(result.kv_written_count, 1);
+    EXPECT_EQ(result.kv_skipped_count, 1);
     EXPECT_TRUE(fs::exists(hfile_path));
 
     fs::remove_all(dir);

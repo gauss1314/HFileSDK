@@ -13,7 +13,7 @@ import java.util.List;
  * {@code _hoodie_record_key}, {@code _hoodie_partition_path},
  * {@code _hoodie_file_name}）。这些列不应写入 HBase，否则：
  * <ol>
- *   <li>它们会变成无意义的 HBase qualifier，浪费存储空间</li>
+ *   <li>它们会进入拼接后的 HBase value，浪费存储空间</li>
  *   <li>它们导致列顺序偏移，使 rowKeyRule 中基于数字索引的列引用全部错位</li>
  * </ol>
  * 使用前缀一次性排除：

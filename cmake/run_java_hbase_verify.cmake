@@ -55,14 +55,14 @@ execute_process(
   COMMAND java -jar "${HFILE_VERIFY_JAR}"
           --hfile "${HFILE_HFILE_PATH}"
           --expect-major-version 3
-          --expect-entry-count 4
+          --expect-entry-count 2
           --expect-compression NONE
           --expect-encoding NONE
-          --expect-rows row1,row1,row2,row2
-          --expect-families cf,cf,cf,cf
-          --expect-qualifiers id,value,id,value
-          --expect-values row1,value1,row2,value2
-          --expect-types Put,Put,Put,Put
+          --expect-rows row1,row2
+          --expect-families cf,cf
+          --expect-qualifiers ,
+          --expect-values "row1|value1,row2|value2"
+          --expect-types Put,Put
   WORKING_DIRECTORY "${HFILE_VERIFY_MODULE_DIR}"
   RESULT_VARIABLE HFILE_VERIFY_STATUS
 )

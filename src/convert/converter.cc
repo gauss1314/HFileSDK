@@ -16,6 +16,7 @@
 #include <arrow/util/byte_size.h>
 
 #include <algorithm>
+#include <array>
 #include <deque>
 #include <unordered_set>
 #include <vector>
@@ -72,7 +73,7 @@ static int map_pass1_status_to_error_code(const Status& s) {
 /// Build the set of column indices that should be excluded from HBase KV output.
 /// Row key segments always reference columns by index from the *original* Arrow
 /// schema, so exclusions never affect row key construction — only the second pass
-/// that writes qualifiers skips these columns.
+/// that builds the pipe-delimited cell value skips these columns.
 ///
 /// Logs one INFO line listing the excluded column names.
 // ─── Column exclusion helpers ─────────────────────────────────────────────────
@@ -160,20 +161,9 @@ struct SortEntry {
     int32_t     row_idx;     // row within that batch
 };
 
-struct PendingCell {
-    std::string_view     qualifier;
-    const arrow::Array*  column;
-    int32_t              row_idx;
-};
-
 struct BatchColumnRef {
-    std::string_view     qualifier;
+    std::string_view     name;
     const arrow::Array*  column;
-};
-
-struct ValueScratch {
-    std::array<uint8_t, 16> inline_bytes{};
-    std::vector<uint8_t> heap_bytes;
 };
 
 struct Pass2Profile {
@@ -191,14 +181,7 @@ static std::span<const uint8_t> as_bytes(std::string_view s) {
     return {reinterpret_cast<const uint8_t*>(s.data()), s.size()};
 }
 
-static Status scalar_to_bytes(const arrow::Array& arr,
-                              int64_t row,
-                              std::vector<uint8_t>* out);
-
-static Status scalar_to_bytes_view(const arrow::Array& arr,
-                                   int64_t row,
-                                   ValueScratch* scratch,
-                                   std::span<const uint8_t>* out);
+static constexpr std::array<uint8_t, 1> kEmptyQualifierBytes{0};
 
 static bool try_extract_nonnegative_numeric_sort_key(const arrow::Array& arr,
                                                      int64_t row,
@@ -452,151 +435,98 @@ static Status scalar_to_string(const arrow::Array& arr, int64_t row, std::string
     }
 }
 
-// ─── Arrow scalar → materialized bytes fallback ───────────────────────────────
+static void append_base64(std::string_view bytes, std::string* out) {
+    static constexpr char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    size_t i = 0;
+    while (i + 3 <= bytes.size()) {
+        const uint32_t block =
+            (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 1])) << 8) |
+             static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 2]));
+        out->push_back(kAlphabet[(block >> 18) & 0x3f]);
+        out->push_back(kAlphabet[(block >> 12) & 0x3f]);
+        out->push_back(kAlphabet[(block >> 6) & 0x3f]);
+        out->push_back(kAlphabet[block & 0x3f]);
+        i += 3;
+    }
 
-static Status scalar_to_bytes(const arrow::Array& arr, int64_t row, std::vector<uint8_t>* out) {
+    const size_t remaining = bytes.size() - i;
+    if (remaining == 1) {
+        const uint32_t block =
+            static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16;
+        out->push_back(kAlphabet[(block >> 18) & 0x3f]);
+        out->push_back(kAlphabet[(block >> 12) & 0x3f]);
+        out->push_back('=');
+        out->push_back('=');
+    } else if (remaining == 2) {
+        const uint32_t block =
+            (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i])) << 16) |
+            (static_cast<uint32_t>(static_cast<unsigned char>(bytes[i + 1])) << 8);
+        out->push_back(kAlphabet[(block >> 18) & 0x3f]);
+        out->push_back(kAlphabet[(block >> 12) & 0x3f]);
+        out->push_back(kAlphabet[(block >> 6) & 0x3f]);
+        out->push_back('=');
+    }
+}
+
+// Arrow scalar -> UTF-8 text for the single value: column:value cell.
+static Status scalar_to_value_string(const arrow::Array& arr, int64_t row, std::string* out) {
     out->clear();
     if (arr.IsNull(row)) return Status::OK();
 
-    auto s = arr.GetScalar(row);
-    if (s.ok()) {
-        auto str = s.ValueOrDie()->ToString();
-        out->assign(str.begin(), str.end());
-        return Status::OK();
-    }
-    return Status::InvalidArg("cannot materialize Arrow scalar: " + s.status().ToString());
-}
-
-static Status scalar_to_bytes_view(const arrow::Array& arr,
-                                   int64_t row,
-                                   ValueScratch* scratch,
-                                   std::span<const uint8_t>* out) {
-    *out = {};
-    if (arr.IsNull(row)) return Status::OK();
-
     using T = arrow::Type;
-    auto t = arr.type_id();
-
-    switch (t) {
+    switch (arr.type_id()) {
     case T::STRING: {
         auto& sa = static_cast<const arrow::StringArray&>(arr);
         auto sv = sa.GetView(row);
-        *out = {
-            reinterpret_cast<const uint8_t*>(sv.data()),
-            static_cast<size_t>(sv.size())
-        };
+        out->assign(sv.data(), sv.size());
         return Status::OK();
     }
     case T::LARGE_STRING: {
         auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
         auto sv = sa.GetView(row);
-        *out = {
-            reinterpret_cast<const uint8_t*>(sv.data()),
-            static_cast<size_t>(sv.size())
-        };
+        out->assign(sv.data(), sv.size());
         return Status::OK();
     }
     case T::BINARY: {
         auto& ba = static_cast<const arrow::BinaryArray&>(arr);
         auto sv = ba.GetView(row);
-        *out = {
-            reinterpret_cast<const uint8_t*>(sv.data()),
-            static_cast<size_t>(sv.size())
-        };
+        append_base64(std::string_view(sv.data(), sv.size()), out);
         return Status::OK();
     }
     case T::LARGE_BINARY: {
         auto& ba = static_cast<const arrow::LargeBinaryArray&>(arr);
         auto sv = ba.GetView(row);
-        *out = {
-            reinterpret_cast<const uint8_t*>(sv.data()),
-            static_cast<size_t>(sv.size())
-        };
+        append_base64(std::string_view(sv.data(), sv.size()), out);
         return Status::OK();
     }
-    case T::BOOL:
-        scratch->inline_bytes[0] =
-            static_cast<uint8_t>(static_cast<const arrow::BooleanArray&>(arr).Value(row) ? 1 : 0);
-        *out = {scratch->inline_bytes.data(), 1};
-        return Status::OK();
-    case T::INT8:
-        scratch->inline_bytes[0] = static_cast<uint8_t>(
-            static_cast<const arrow::Int8Array&>(arr).Value(row));
-        *out = {scratch->inline_bytes.data(), 1};
-        return Status::OK();
-    case T::UINT8:
-        scratch->inline_bytes[0] =
-            static_cast<const arrow::UInt8Array&>(arr).Value(row);
-        *out = {scratch->inline_bytes.data(), 1};
-        return Status::OK();
-    case T::INT16: {
-        uint16_t value = static_cast<uint16_t>(
-            static_cast<const arrow::Int16Array&>(arr).Value(row));
-        write_be16(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 2};
-        return Status::OK();
-    }
-    case T::UINT16: {
-        uint16_t value = static_cast<const arrow::UInt16Array&>(arr).Value(row);
-        write_be16(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 2};
-        return Status::OK();
-    }
-    case T::INT32: {
-        uint32_t value = static_cast<uint32_t>(
-            static_cast<const arrow::Int32Array&>(arr).Value(row));
-        write_be32(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 4};
-        return Status::OK();
-    }
-    case T::UINT32: {
-        uint32_t value = static_cast<const arrow::UInt32Array&>(arr).Value(row);
-        write_be32(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 4};
-        return Status::OK();
-    }
-    case T::FLOAT: {
-        float value = static_cast<const arrow::FloatArray&>(arr).Value(row);
-        uint32_t bits;
-        std::memcpy(&bits, &value, sizeof(bits));
-        write_be32(scratch->inline_bytes.data(), bits);
-        *out = {scratch->inline_bytes.data(), 4};
-        return Status::OK();
-    }
-    case T::INT64: {
-        uint64_t value = static_cast<uint64_t>(
-            static_cast<const arrow::Int64Array&>(arr).Value(row));
-        write_be64(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 8};
-        return Status::OK();
-    }
-    case T::UINT64: {
-        uint64_t value = static_cast<const arrow::UInt64Array&>(arr).Value(row);
-        write_be64(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 8};
-        return Status::OK();
-    }
-    case T::DOUBLE: {
-        double value = static_cast<const arrow::DoubleArray&>(arr).Value(row);
-        uint64_t bits;
-        std::memcpy(&bits, &value, sizeof(bits));
-        write_be64(scratch->inline_bytes.data(), bits);
-        *out = {scratch->inline_bytes.data(), 8};
-        return Status::OK();
-    }
+    case T::INT8:   *out = std::to_string(static_cast<const arrow::Int8Array&>(arr).Value(row)); return Status::OK();
+    case T::INT16:  *out = std::to_string(static_cast<const arrow::Int16Array&>(arr).Value(row)); return Status::OK();
+    case T::INT32:  *out = std::to_string(static_cast<const arrow::Int32Array&>(arr).Value(row)); return Status::OK();
+    case T::INT64:  *out = std::to_string(static_cast<const arrow::Int64Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT8:  *out = std::to_string(static_cast<const arrow::UInt8Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT16: *out = std::to_string(static_cast<const arrow::UInt16Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT32: *out = std::to_string(static_cast<const arrow::UInt32Array&>(arr).Value(row)); return Status::OK();
+    case T::UINT64: *out = std::to_string(static_cast<const arrow::UInt64Array&>(arr).Value(row)); return Status::OK();
+    case T::FLOAT:  *out = std::to_string(static_cast<const arrow::FloatArray&>(arr).Value(row)); return Status::OK();
+    case T::DOUBLE: *out = std::to_string(static_cast<const arrow::DoubleArray&>(arr).Value(row)); return Status::OK();
+    case T::BOOL:   *out = static_cast<const arrow::BooleanArray&>(arr).Value(row) ? "1" : "0"; return Status::OK();
     case T::TIMESTAMP: {
         auto& ta = static_cast<const arrow::TimestampArray&>(arr);
         auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
-        uint64_t value = static_cast<uint64_t>(
-            normalize_timestamp_to_millis(ta.Value(row), unit));
-        write_be64(scratch->inline_bytes.data(), value);
-        *out = {scratch->inline_bytes.data(), 8};
+        *out = std::to_string(normalize_timestamp_to_millis(ta.Value(row), unit));
         return Status::OK();
     }
-    default:
-        HFILE_RETURN_IF_ERROR(scalar_to_bytes(arr, row, &scratch->heap_bytes));
-        *out = {scratch->heap_bytes.data(), scratch->heap_bytes.size()};
+    default: {
+        auto scalar = arr.GetScalar(row);
+        if (!scalar.ok()) {
+            return Status::InvalidArg(
+                "cannot materialize Arrow scalar as text: " + scalar.status().ToString());
+        }
+        *out = scalar.ValueOrDie()->ToString();
         return Status::OK();
+    }
     }
 }
 
@@ -968,7 +898,42 @@ static std::vector<int> build_sorted_column_order(
     return order;
 }
 
-static Status append_single_row_cells(
+static Status build_joined_row_value(
+        const std::vector<BatchColumnRef>&  columns,
+        int32_t                             row_idx,
+        std::string_view                    row_key,
+        std::string*                        row_value,
+        Pass2Profile*                       profile = nullptr) {
+    row_value->clear();
+    std::string field_value;
+    bool first = true;
+
+    for (const auto& column_ref : columns) {
+        if (!first) row_value->push_back('|');
+        first = false;
+
+        const auto materialize_start = profile != nullptr
+            ? std::chrono::steady_clock::now()
+            : std::chrono::steady_clock::time_point{};
+        auto value_status = scalar_to_value_string(
+            *column_ref.column, row_idx, &field_value);
+        if (profile) {
+            profile->materialize_ns += std::chrono::steady_clock::now() - materialize_start;
+            ++profile->materialized_cells;
+        }
+        if (!value_status.ok()) {
+            return Status::InvalidArg(
+                "Cell skipped (" + std::string(row_key) + "/" +
+                std::string(column_ref.name) + "): " + value_status.message());
+        }
+        if (!field_value.empty()) {
+            row_value->append(field_value);
+        }
+    }
+    return Status::OK();
+}
+
+static Status append_row_value_cell(
         HFileWriter&                        writer,
         const std::vector<BatchColumnRef>&  columns,
         int32_t                             row_idx,
@@ -978,137 +943,35 @@ static Status append_single_row_cells(
         int64_t*                            kv_written,
         int64_t*                            kv_skipped,
         Pass2Profile*                       profile = nullptr) {
+    (void)kv_skipped;
     int64_t ts = default_ts > 0 ? default_ts
                 : std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
 
-    auto row_bytes = as_bytes(row_key);
-    auto cf_bytes = as_bytes(cf);
-    ValueScratch value_scratch;
-    std::span<const uint8_t> value_bytes;
-    KeyValue kv;
-    kv.row = row_bytes;
-    kv.family = cf_bytes;
-    kv.timestamp = ts;
-    kv.key_type = KeyType::Put;
-    bool appended_in_row = false;
-
-    for (const auto& column_ref : columns) {
-        if (column_ref.column->IsNull(row_idx)) continue;
-
-        const auto materialize_start = profile != nullptr
-            ? std::chrono::steady_clock::now()
-            : std::chrono::steady_clock::time_point{};
-        auto value_status = scalar_to_bytes_view(
-            *column_ref.column, row_idx, &value_scratch, &value_bytes);
-        if (profile) {
-            profile->materialize_ns += std::chrono::steady_clock::now() - materialize_start;
-        }
-        if (!value_status.ok()) {
-            clog::warn("Cell skipped (" + std::string(row_key) + "/" +
-                       std::string(column_ref.qualifier) + "): " +
-                       value_status.message());
-            if (kv_skipped) ++(*kv_skipped);
-            continue;
-        }
-        if (value_bytes.empty()) continue;
-        if (profile) ++profile->materialized_cells;
-
-        kv.qualifier = as_bytes(column_ref.qualifier);
-        kv.value = value_bytes;
-        const auto append_start = profile != nullptr
-            ? std::chrono::steady_clock::now()
-            : std::chrono::steady_clock::time_point{};
-        auto s = appended_in_row
-            ? writer.append_trusted_same_row(kv)
-            : writer.append_trusted_new_row(kv);
-        if (profile) {
-            profile->append_ns += std::chrono::steady_clock::now() - append_start;
-            ++profile->appended_cells;
-        }
-        if (!s.ok()) return s;
-        appended_in_row = true;
-        if (kv_written) ++(*kv_written);
-    }
-    return Status::OK();
-}
-
-// ─── Write KVs for one row in sorted qualifier order ─────────────────────────
-
-static Status append_grouped_row_cells(
-        HFileWriter&                        writer,
-        std::vector<PendingCell>&           cells,
-        std::string_view                    row_key,
-        const std::string&                  cf,
-        int64_t                             default_ts,
-        size_t                              source_row_count,   // how many Arrow rows mapped here
-        int64_t*                            kv_written,
-        int64_t*                            kv_skipped,
-        Pass2Profile*                       profile = nullptr) {
-    std::sort(cells.begin(), cells.end(),
-              [](const PendingCell& a, const PendingCell& b) {
-                  return a.qualifier < b.qualifier;
-              });
-    (void)source_row_count;  // available for future per-qualifier logging if needed
-
-    int64_t ts = default_ts > 0 ? default_ts
-                : std::chrono::duration_cast<std::chrono::milliseconds>(
-                      std::chrono::system_clock::now().time_since_epoch()).count();
+    std::string row_value;
+    HFILE_RETURN_IF_ERROR(build_joined_row_value(
+        columns, row_idx, row_key, &row_value, profile));
 
     auto row_bytes = as_bytes(row_key);
     auto cf_bytes = as_bytes(cf);
-    ValueScratch value_scratch;
-    std::span<const uint8_t> value_bytes;
-    std::string_view committed_qualifier;
-    bool has_committed_qualifier = false;
     KeyValue kv;
     kv.row = row_bytes;
     kv.family = cf_bytes;
+    kv.qualifier = {kEmptyQualifierBytes.data(), 0};
     kv.timestamp = ts;
     kv.key_type = KeyType::Put;
-    bool appended_in_row = false;
+    kv.value = as_bytes(row_value);
 
-    for (const auto& cell : cells) {
-        if (has_committed_qualifier && committed_qualifier == cell.qualifier) {
-            if (kv_skipped) ++(*kv_skipped);
-            continue;
-        }
-
-        const auto materialize_start = profile != nullptr
-            ? std::chrono::steady_clock::now()
-            : std::chrono::steady_clock::time_point{};
-        auto value_status = scalar_to_bytes_view(
-            *cell.column, cell.row_idx, &value_scratch, &value_bytes);
-        if (profile) {
-            profile->materialize_ns += std::chrono::steady_clock::now() - materialize_start;
-        }
-        if (!value_status.ok()) {
-            clog::warn("Cell skipped (" + std::string(row_key) + "/" + std::string(cell.qualifier) +
-                       "): " + value_status.message());
-            if (kv_skipped) ++(*kv_skipped);
-            continue;
-        }
-        if (value_bytes.empty()) continue;
-        if (profile) ++profile->materialized_cells;
-
-        kv.qualifier = as_bytes(cell.qualifier);
-        kv.value = value_bytes;
-        const auto append_start = profile != nullptr
-            ? std::chrono::steady_clock::now()
-            : std::chrono::steady_clock::time_point{};
-        auto s = appended_in_row
-            ? writer.append_trusted_same_row(kv)
-            : writer.append_trusted_new_row(kv);
-        if (profile) {
-            profile->append_ns += std::chrono::steady_clock::now() - append_start;
-            ++profile->appended_cells;
-        }
-        if (!s.ok()) return s;
-        appended_in_row = true;
-        if (kv_written) ++(*kv_written);
-        committed_qualifier = cell.qualifier;
-        has_committed_qualifier = true;
+    const auto append_start = profile != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    auto s = writer.append_trusted_new_row(kv);
+    if (profile) {
+        profile->append_ns += std::chrono::steady_clock::now() - append_start;
+        ++profile->appended_cells;
     }
+    if (!s.ok()) return s;
+    if (kv_written) ++(*kv_written);
     return Status::OK();
 }
 
@@ -1313,7 +1176,6 @@ ConvertResult convert(const ConvertOptions& opts) {
     Pass2Profile* pass2_profile_ptr =
         hotpath_profiling_enabled() ? &pass2_profile : nullptr;
     std::string numeric_row_key_storage;
-    std::vector<PendingCell> cells;
     std::vector<std::vector<BatchColumnRef>> sorted_batch_columns;
     sorted_batch_columns.reserve(batches.size());
     std::vector<int> sorted_column_order;
@@ -1344,7 +1206,6 @@ ConvertResult convert(const ConvertOptions& opts) {
         } else {
             row_key = sort_index[i].row_key;
         }
-        cells.clear();
 
         size_t j = i;
         if (used_numeric_sort_path && sort_index[i].has_numeric_sort_key) {
@@ -1362,8 +1223,8 @@ ConvertResult convert(const ConvertOptions& opts) {
         size_t  source_rows = j - i;   // Arrow rows that mapped to this HBase row key
 
         // Log ONE group-level warning when multiple source rows collapsed into one
-        // HBase row.  This replaces the old per-qualifier warn that fired N times
-        // (once per column) for every collision, flooding the log.
+        // HBase row.  Emit one warning per collision group instead of one per
+        // column, keeping logs readable on skewed inputs.
         if (source_rows > 1) {
             // Truncate key for readability — raw bytes may not be printable.
             std::string display_key = row_key.size() > 64
@@ -1377,39 +1238,19 @@ ConvertResult convert(const ConvertOptions& opts) {
             ++result.duplicate_key_count;
         }
 
-        Status s;
-        if (source_rows == 1) {
-            const auto& entry = sort_index[i];
-            s = append_single_row_cells(
-                *writer,
-                sorted_batch_columns[static_cast<size_t>(entry.batch_idx)],
-                entry.row_idx,
-                row_key,
-                opts.column_family,
-                opts.default_timestamp,
-                &kv_written,
-                &kv_skipped,
-                pass2_profile_ptr);
-        } else {
-            for (size_t k = i; k < j; ++k) {
-                const auto& entry = sort_index[k];
-                const auto& batch_columns =
-                    sorted_batch_columns[static_cast<size_t>(entry.batch_idx)];
-                if (cells.capacity() < cells.size() + batch_columns.size())
-                    cells.reserve(cells.size() + batch_columns.size());
-                for (const auto& column_ref : batch_columns) {
-                    const auto* column = column_ref.column;
-                    if (column->IsNull(entry.row_idx)) continue;
-                    cells.push_back({column_ref.qualifier, column, entry.row_idx});
-                }
-            }
-            s = append_grouped_row_cells(*writer, cells, row_key,
-                                         opts.column_family,
-                                         opts.default_timestamp,
-                                         source_rows,
-                                         &kv_written,
-                                         &kv_skipped,
-                                         pass2_profile_ptr);
+        const auto& entry = sort_index[i];
+        Status s = append_row_value_cell(
+            *writer,
+            sorted_batch_columns[static_cast<size_t>(entry.batch_idx)],
+            entry.row_idx,
+            row_key,
+            opts.column_family,
+            opts.default_timestamp,
+            &kv_written,
+            &kv_skipped,
+            pass2_profile_ptr);
+        if (source_rows > 1) {
+            kv_skipped += static_cast<int64_t>(source_rows - 1);
         }
         if (!s.ok()) {
             // Only SORT_ORDER_VIOLATION is fatal — it indicates a logic bug

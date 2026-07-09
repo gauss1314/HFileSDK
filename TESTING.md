@@ -110,7 +110,7 @@ bash scripts/coverage.sh
 | 模块 | 已覆盖场景 | 对应用例 |
 |---|---|---|
 | convert() 输入校验 | 空路径、缺失 Arrow 文件、损坏 stream、非法 row key rule、内存超限 | `test_arrow_converter` |
-| convert() 结果路径 | 重复 row key、重复 qualifier、LargeString、空 row key 全过滤、进度回调 | `test_arrow_converter` |
+| convert() 结果路径 | 重复 row key、空 qualifier 单 value、LargeString、空 row key 全过滤、进度回调 | `test_arrow_converter` |
 
 ### RowKey 规则与分区
 

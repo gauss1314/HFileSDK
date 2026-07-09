@@ -1,18 +1,18 @@
 package io.hfilesdk.converter.javaimpl;
 
 import org.apache.arrow.memory.RootAllocator;
-import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
 import org.apache.arrow.vector.FieldVector;
 import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
-import org.apache.arrow.vector.IntVector;
-import org.apache.arrow.vector.SmallIntVector;
-import org.apache.arrow.vector.TinyIntVector;
-import org.apache.arrow.vector.UInt1Vector;
-import org.apache.arrow.vector.UInt2Vector;
-import org.apache.arrow.vector.UInt4Vector;
-import org.apache.arrow.vector.UInt8Vector;
+import org.apache.arrow.vector.TimeStampMicroVector;
+import org.apache.arrow.vector.TimeStampMicroTZVector;
+import org.apache.arrow.vector.TimeStampMilliVector;
+import org.apache.arrow.vector.TimeStampMilliTZVector;
+import org.apache.arrow.vector.TimeStampNanoVector;
+import org.apache.arrow.vector.TimeStampNanoTZVector;
+import org.apache.arrow.vector.TimeStampSecVector;
+import org.apache.arrow.vector.TimeStampSecTZVector;
 import org.apache.arrow.vector.VarBinaryVector;
 import org.apache.arrow.vector.VarCharVector;
 import org.apache.arrow.vector.VectorLoader;
@@ -58,6 +58,7 @@ public final class ArrowToHFileJavaConverter {
 
     private static final String RANDOM_DIGITS = "$RND$";
     private static final int RANDOM_SEED_RANGE = 9;
+    private static final byte[] EMPTY_QUALIFIER = new byte[0];
     public JavaConvertResult convert(JavaConvertOptions options) {
         long start = System.nanoTime();
         long sortStart = System.nanoTime();
@@ -443,59 +444,6 @@ public final class ArrowToHFileJavaConverter {
             .build();
     }
 
-    private static byte[] extractValueBytes(FieldVector vector, int rowIndex) {
-        if (vector.isNull(rowIndex)) {
-            return new byte[0];
-        }
-        if (vector instanceof VarCharVector varCharVector) {
-            return varCharVector.get(rowIndex);
-        }
-        if (vector instanceof VarBinaryVector varBinaryVector) {
-            return varBinaryVector.get(rowIndex);
-        }
-        if (vector instanceof BigIntVector bigIntVector) {
-            return Bytes.toBytes(bigIntVector.get(rowIndex));
-        }
-        if (vector instanceof IntVector intVector) {
-            return Bytes.toBytes(intVector.get(rowIndex));
-        }
-        if (vector instanceof SmallIntVector smallIntVector) {
-            return Bytes.toBytes(smallIntVector.get(rowIndex));
-        }
-        if (vector instanceof TinyIntVector tinyIntVector) {
-            return new byte[]{tinyIntVector.get(rowIndex)};
-        }
-        if (vector instanceof UInt8Vector uint8Vector) {
-            return Bytes.toBytes(uint8Vector.get(rowIndex));
-        }
-        if (vector instanceof UInt4Vector uint4Vector) {
-            return Bytes.toBytes(uint4Vector.get(rowIndex));
-        }
-        if (vector instanceof UInt2Vector uint2Vector) {
-            return Bytes.toBytes((short) uint2Vector.get(rowIndex));
-        }
-        if (vector instanceof UInt1Vector uint1Vector) {
-            return new byte[]{(byte) uint1Vector.get(rowIndex)};
-        }
-        if (vector instanceof Float8Vector float8Vector) {
-            return Bytes.toBytes(float8Vector.get(rowIndex));
-        }
-        if (vector instanceof Float4Vector float4Vector) {
-            return Bytes.toBytes(float4Vector.get(rowIndex));
-        }
-        if (vector instanceof BitVector bitVector) {
-            return Bytes.toBytes(bitVector.get(rowIndex) != 0);
-        }
-        Object value = vector.getObject(rowIndex);
-        if (value == null) {
-            return new byte[0];
-        }
-        if (value instanceof byte[] bytes) {
-            return bytes;
-        }
-        return Bytes.toBytes(String.valueOf(value));
-    }
-
     private static String extractStringValue(FieldVector vector, int rowIndex) {
         if (vector.isNull(rowIndex)) {
             return "";
@@ -506,8 +454,56 @@ public final class ArrowToHFileJavaConverter {
         if (vector instanceof VarBinaryVector varBinaryVector) {
             return Base64.getEncoder().encodeToString(varBinaryVector.get(rowIndex));
         }
+        if (vector instanceof BitVector bitVector) {
+            return bitVector.get(rowIndex) != 0 ? "1" : "0";
+        }
+        if (vector instanceof Float4Vector float4Vector) {
+            return String.format(Locale.ROOT, "%.6f", float4Vector.get(rowIndex));
+        }
+        if (vector instanceof Float8Vector float8Vector) {
+            return String.format(Locale.ROOT, "%.6f", float8Vector.get(rowIndex));
+        }
+        if (vector instanceof TimeStampSecVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex) * 1000L);
+        }
+        if (vector instanceof TimeStampSecTZVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex) * 1000L);
+        }
+        if (vector instanceof TimeStampMilliVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex));
+        }
+        if (vector instanceof TimeStampMilliTZVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex));
+        }
+        if (vector instanceof TimeStampMicroVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex) / 1000L);
+        }
+        if (vector instanceof TimeStampMicroTZVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex) / 1000L);
+        }
+        if (vector instanceof TimeStampNanoVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex) / 1_000_000L);
+        }
+        if (vector instanceof TimeStampNanoTZVector tsVector) {
+            return Long.toString(tsVector.get(rowIndex) / 1_000_000L);
+        }
         Object value = vector.getObject(rowIndex);
         return value == null ? "" : String.valueOf(value);
+    }
+
+    private static byte[] buildJoinedRowValue(ProjectedSchema projectedSchema,
+                                              VectorSchemaRoot batchRoot,
+                                              int rowIndex) {
+        StringBuilder builder = new StringBuilder(128);
+        boolean first = true;
+        for (ProjectedField field : projectedSchema.valueFields()) {
+            if (!first) {
+                builder.append('|');
+            }
+            first = false;
+            builder.append(extractStringValue(batchRoot.getVector(field.sourceIndex()), rowIndex));
+        }
+        return Bytes.toBytes(builder.toString());
     }
 
     private static VectorSchemaRoot cloneBatch(VectorSchemaRoot sourceRoot, RootAllocator allocator) throws IOException {
@@ -529,38 +525,21 @@ public final class ArrowToHFileJavaConverter {
                                         List<SortEntry> sortIndex,
                                         long defaultTimestampMs) throws IOException {
         long kvWritten = 0L;
-        List<GroupedCell> cells = new ArrayList<>();
 
         for (int index = 0; index < sortIndex.size();) {
             SortEntry current = sortIndex.get(index);
             byte[] rowKey = current.rowKey();
-            cells.clear();
 
             int next = index;
             while (next < sortIndex.size() && Bytes.equals(sortIndex.get(next).rowKey(), rowKey)) {
-                SortEntry entry = sortIndex.get(next);
-                VectorSchemaRoot batchRoot = storedBatches.get(entry.batchIndex());
-                for (ProjectedField field : projectedSchema.qualifierFields()) {
-                    byte[] value = extractValueBytes(batchRoot.getVector(field.sourceIndex()), entry.rowIndex());
-                    if (value.length == 0) {
-                        continue;
-                    }
-                    cells.add(new GroupedCell(field.name(), field.qualifier(), value));
-                }
                 next++;
             }
 
-            cells.sort(Comparator.comparing(GroupedCell::name));
-            String previousQualifier = null;
             long timestamp = defaultTimestampMs > 0 ? defaultTimestampMs : System.currentTimeMillis();
-            for (GroupedCell cell : cells) {
-                if (cell.name().equals(previousQualifier)) {
-                    continue;
-                }
-                writer.append(new KeyValue(rowKey, columnFamily, cell.qualifier(), timestamp, cell.value()));
-                kvWritten++;
-                previousQualifier = cell.name();
-            }
+            VectorSchemaRoot batchRoot = storedBatches.get(current.batchIndex());
+            byte[] value = buildJoinedRowValue(projectedSchema, batchRoot, current.rowIndex());
+            writer.append(new KeyValue(rowKey, columnFamily, EMPTY_QUALIFIER, timestamp, value));
+            kvWritten++;
             index = next;
         }
         return kvWritten;
@@ -575,13 +554,11 @@ public final class ArrowToHFileJavaConverter {
         }
     }
 
-    private record ProjectedField(String name, byte[] qualifier, int sourceIndex) {}
-
-    private record GroupedCell(String name, byte[] qualifier, byte[] value) {}
+    private record ProjectedField(String name, int sourceIndex) {}
 
     private record SortEntry(byte[] rowKey, int batchIndex, int rowIndex) {}
 
-    private record ProjectedSchema(List<ProjectedField> visibleFields, List<ProjectedField> qualifierFields) {
+    private record ProjectedSchema(List<ProjectedField> visibleFields, List<ProjectedField> valueFields) {
         private static ProjectedSchema from(VectorSchemaRoot root, JavaConvertOptions options) {
             List<ProjectedField> visibleFields = new ArrayList<>();
             List<FieldVector> vectors = root.getFieldVectors();
@@ -590,15 +567,15 @@ public final class ArrowToHFileJavaConverter {
                 if (isExcluded(vector.getName(), options)) {
                     continue;
                 }
-                visibleFields.add(new ProjectedField(vector.getName(), Bytes.toBytes(vector.getName()), sourceIndex));
+                visibleFields.add(new ProjectedField(vector.getName(), sourceIndex));
             }
             if (visibleFields.isEmpty()) {
                 throw new IllegalArgumentException("过滤后没有可写入的列");
             }
-            List<ProjectedField> qualifierFields = visibleFields.stream()
+            List<ProjectedField> valueFields = visibleFields.stream()
                 .sorted(Comparator.comparing(ProjectedField::name))
                 .toList();
-            return new ProjectedSchema(List.copyOf(visibleFields), qualifierFields);
+            return new ProjectedSchema(List.copyOf(visibleFields), valueFields);
         }
 
         private int fieldCount() {

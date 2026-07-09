@@ -357,7 +357,7 @@ void test_sort_invariant(){
 // ─── B-13 regression: duplicate col_index in rule → concat (dedup is in converter)
 void test_b13_duplicate_col_index_produces_concat() {
     // Two segments referencing the same Arrow column index is valid at the rule
-    // level — the converter's GroupedCell dedup handles actual HBase qualifier dedup.
+    // level; row-key uniqueness is validated at the converter row-group level.
     auto [b, s] = RowKeyBuilder::compile("A,0,false,0#B,0,false,0");
     EXPECT(s.ok());
     auto f = split_row_value("hello");

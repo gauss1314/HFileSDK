@@ -42,7 +42,7 @@ struct ConvertOptions {
 
     // ── Column filtering ──────────────────────────────────────────────────
     /// Column names to exclude from HBase KV output (exact match, case-sensitive).
-    /// These columns are NOT written as HBase qualifiers.
+    /// These columns are NOT included in the pipe-delimited HBase cell value.
     /// Does NOT affect row key construction — row key segments reference columns
     /// by index (from the original Arrow schema) which remains unchanged.
     ///

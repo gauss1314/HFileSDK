@@ -271,7 +271,7 @@ SortEntry 列表（全量 row key 索引）
 排好序的 SortEntry 列表
         │
         │ 第二遍：按排序顺序，读对应 batch 的 row，
-        │         列值序列化为 Big-Endian bytes → KV → 写入 HFile
+        │         列值文本化并用 | 拼接 → 空 qualifier KV → 写入 HFile
         ▼
 HFile v3（原子写入：.tmp → fsync → rename）
 ```
@@ -418,21 +418,21 @@ flowchart LR
 
 1. **第一遍**：流式读取所有 RecordBatch，为每行生成 row key，收集 `SortEntry{rowKey, batchIdx, rowIdx}`，所有 batch 保留在内存。
 2. **排序**：`std::stable_sort` 按 row key 字典序升序。
-3. **第二遍**：按排序顺序，从内存中的 batch 读取对应行，列值序列化后写入 HFile（qualifier 按字母序排列，保证 HBase 排序正确性）。
+3. **第二遍**：按排序顺序，从内存中的 batch 读取对应行，按列名升序将列值文本化并用 `|` 拼成单个 HBase value，写入 qualifier 为空的单个 KV。
 
 **内存占用**：所有 batch 保留在内存，同时存储 sort index（每条 ~40 字节 + row key 长度）。对于 1GB Arrow 文件约需 1–3 GB 内存。如果内存紧张可考虑外排序（当前未实现）。
 
 ### 4.4 Arrow 类型序列化规则
 
-| Arrow 类型 | rowValue 字符串化 | HBase Value 字节 |
-|-----------|-----------------|-----------------|
-| Int8/16/32/64 | `std::to_string()` | Big-Endian 固定字节 |
-| UInt8/16/32/64 | `std::to_string()` | Big-Endian 固定字节 |
-| Float/Double | `std::to_string()` | IEEE 754 Big-Endian |
-| Boolean | `"1"` / `"0"` | 1B: 0x01/0x00 |
-| String/LargeString | 原始 UTF-8 | UTF-8 字节（零拷贝） |
-| Binary | 不支持作 row key 字段 | 原始字节 |
-| Timestamp | `std::to_string(ms)` | Int64 BE（毫秒） |
+| Arrow 类型 | rowValue / HBase Value 文本化 |
+|-----------|-----------------------------|
+| Int8/16/32/64 | `std::to_string()` |
+| UInt8/16/32/64 | `std::to_string()` |
+| Float/Double | `std::to_string()` |
+| Boolean | `"1"` / `"0"` |
+| String/LargeString | 原始 UTF-8 |
+| Binary/LargeBinary | Base64 |
+| Timestamp | `std::to_string(ms)` |
 
 ---
 
