@@ -16,6 +16,9 @@ public final class JavaConvertOptions {
     private final String bloomType;
     private final int blockSize;
     private final long defaultTimestampMs;
+    private final boolean singleCellRowValue;
+    private final String rowValueDelimiter;
+    private final boolean rowValueTrailingDelimiter;
     private final List<String> excludedColumns;
     private final List<String> excludedPrefixes;
 
@@ -33,6 +36,9 @@ public final class JavaConvertOptions {
         this.bloomType = builder.bloomType == null || builder.bloomType.isBlank() ? "ROW" : builder.bloomType;
         this.blockSize = builder.blockSize <= 0 ? 65536 : builder.blockSize;
         this.defaultTimestampMs = requireNonNegative(builder.defaultTimestampMs, "defaultTimestampMs");
+        this.singleCellRowValue = builder.singleCellRowValue;
+        this.rowValueDelimiter = builder.rowValueDelimiter == null ? "|" : builder.rowValueDelimiter;
+        this.rowValueTrailingDelimiter = builder.rowValueTrailingDelimiter;
         this.excludedColumns = List.copyOf(builder.excludedColumns);
         this.excludedPrefixes = List.copyOf(builder.excludedPrefixes);
     }
@@ -85,6 +91,18 @@ public final class JavaConvertOptions {
         return defaultTimestampMs;
     }
 
+    public boolean singleCellRowValue() {
+        return singleCellRowValue;
+    }
+
+    public String rowValueDelimiter() {
+        return rowValueDelimiter;
+    }
+
+    public boolean rowValueTrailingDelimiter() {
+        return rowValueTrailingDelimiter;
+    }
+
     public List<String> excludedColumns() {
         return excludedColumns;
     }
@@ -126,6 +144,9 @@ public final class JavaConvertOptions {
         private String bloomType = "ROW";
         private int blockSize = 65536;
         private long defaultTimestampMs;
+        private boolean singleCellRowValue;
+        private String rowValueDelimiter = "|";
+        private boolean rowValueTrailingDelimiter = true;
         private final List<String> excludedColumns = new ArrayList<>();
         private final List<String> excludedPrefixes = new ArrayList<>();
 
@@ -183,6 +204,21 @@ public final class JavaConvertOptions {
 
         public Builder defaultTimestampMs(long defaultTimestampMs) {
             this.defaultTimestampMs = defaultTimestampMs;
+            return this;
+        }
+
+        public Builder singleCellRowValue(boolean singleCellRowValue) {
+            this.singleCellRowValue = singleCellRowValue;
+            return this;
+        }
+
+        public Builder rowValueDelimiter(String rowValueDelimiter) {
+            this.rowValueDelimiter = rowValueDelimiter;
+            return this;
+        }
+
+        public Builder rowValueTrailingDelimiter(boolean rowValueTrailingDelimiter) {
+            this.rowValueTrailingDelimiter = rowValueTrailingDelimiter;
             return this;
         }
 

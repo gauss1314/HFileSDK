@@ -60,6 +60,14 @@ struct ConvertOptions {
     std::string column_family   = "cf";    // all KVs go into this CF
     int64_t     default_timestamp = 0;     // 0 = use current time
 
+    // When enabled, emit one HBase cell per Arrow row instead of one cell per
+    // Arrow column. The cell qualifier is empty and the value is built by
+    // joining every filtered Arrow column value in schema order. This matches
+    // schemas whose XML declares a single family such as column=value:.
+    bool        single_cell_row_value = false;
+    std::string row_value_delimiter = "|";
+    bool        row_value_trailing_delimiter = true;
+
     // ── HFile write options ───────────────────────────────────────────────
     WriterOptions writer_opts;
 

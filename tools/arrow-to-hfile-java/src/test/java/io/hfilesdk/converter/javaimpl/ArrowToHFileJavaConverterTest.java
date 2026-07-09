@@ -107,6 +107,73 @@ final class ArrowToHFileJavaConverterTest {
     }
 
     @Test
+    void convertsSingleCellRowValueLikeNativeConverter() throws Exception {
+        java.nio.file.Path tempDir = Files.createTempDirectory("arrow-to-hfile-java-single-cell-test");
+        java.nio.file.Path arrowFile = tempDir.resolve("input.arrow");
+        java.nio.file.Path hfile = tempDir.resolve("output.hfile");
+
+        try (RootAllocator allocator = new RootAllocator(Long.MAX_VALUE);
+             BigIntVector refid = new BigIntVector("REFID", allocator);
+             BigIntVector time = new BigIntVector("TIME", allocator);
+             VarCharVector sigstore = new VarCharVector("SIGSTORE", allocator);
+             BigIntVector bitmap = new BigIntVector("BIT_MAP", allocator);
+             VectorSchemaRoot root = new VectorSchemaRoot(java.util.List.of(refid, time, sigstore, bitmap));
+             ArrowStreamWriter writer = new ArrowStreamWriter(root, null, Channels.newChannel(Files.newOutputStream(arrowFile)))) {
+
+            refid.allocateNew();
+            time.allocateNew();
+            sigstore.allocateNew();
+            bitmap.allocateNew();
+
+            refid.setSafe(0, 421261797228550L);
+            time.setSafe(0, 1606986226L);
+            sigstore.setSafe(0, "cs,53202".getBytes(StandardCharsets.UTF_8));
+            bitmap.setSafe(0, 4L);
+
+            refid.setValueCount(1);
+            time.setValueCount(1);
+            sigstore.setValueCount(1);
+            bitmap.setValueCount(1);
+            root.setRowCount(1);
+
+            writer.start();
+            writer.writeBatch();
+            writer.end();
+        }
+
+        JavaConvertResult result = new ArrowToHFileJavaConverter().convert(
+            JavaConvertOptions.builder()
+                .arrowPath(arrowFile.toString())
+                .hfilePath(hfile.toString())
+                .tableName("dfx_hbase_tdr_siganl_stor")
+                .rowKeyRule("REFID,0,false,0")
+                .columnFamily("value")
+                .compression("NONE")
+                .defaultTimestampMs(1_715_678_900_123L)
+                .singleCellRowValue(true)
+                .build()
+        );
+
+        assertTrue(result.isSuccess(), result.summary());
+        assertEquals(1L, result.kvWrittenCount);
+
+        Configuration conf = new Configuration();
+        FileSystem fs = new RawLocalFileSystem();
+        fs.initialize(java.net.URI.create("file:///"), conf);
+        try (HFile.Reader reader = HFile.createReader(fs, new Path(hfile.toString()), new CacheConfig(conf), true, conf)) {
+            assertEquals(1L, reader.getEntries());
+            HFileScanner scanner = reader.getScanner(conf, false, false);
+            assertTrue(scanner.seekTo());
+            Cell cell = scanner.getCell();
+            assertEquals("421261797228550", new String(cell.getRowArray(), cell.getRowOffset(), cell.getRowLength(), StandardCharsets.UTF_8));
+            assertEquals("value", new String(cell.getFamilyArray(), cell.getFamilyOffset(), cell.getFamilyLength(), StandardCharsets.UTF_8));
+            assertEquals("", new String(cell.getQualifierArray(), cell.getQualifierOffset(), cell.getQualifierLength(), StandardCharsets.UTF_8));
+            assertEquals("421261797228550|1606986226|cs,53202|4|",
+                new String(cell.getValueArray(), cell.getValueOffset(), cell.getValueLength(), StandardCharsets.UTF_8));
+        }
+    }
+
+    @Test
     void rejectsUnsupportedDataBlockEncoding() throws Exception {
         java.nio.file.Path tempDir = Files.createTempDirectory("arrow-to-hfile-java-encoding-test");
         java.nio.file.Path arrowFile = tempDir.resolve("input.arrow");

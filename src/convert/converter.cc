@@ -1033,6 +1033,57 @@ static Status append_single_row_cells(
     return Status::OK();
 }
 
+
+static Status build_joined_row_value(
+        const std::vector<BatchColumnRef>& columns,
+        int32_t row_idx,
+        const std::string& delimiter,
+        bool trailing_delimiter,
+        std::string* out) {
+    out->clear();
+    std::string field;
+    for (size_t i = 0; i < columns.size(); ++i) {
+        if (i > 0) out->append(delimiter);
+        if (!columns[i].column->IsNull(row_idx)) {
+            HFILE_RETURN_IF_ERROR(scalar_to_string(*columns[i].column, row_idx, &field));
+            out->append(field);
+        }
+    }
+    if (trailing_delimiter) out->append(delimiter);
+    return Status::OK();
+}
+
+static Status append_single_row_joined_value_cell(
+        HFileWriter& writer,
+        const std::vector<BatchColumnRef>& columns,
+        int32_t row_idx,
+        std::string_view row_key,
+        const std::string& cf,
+        int64_t default_ts,
+        const std::string& delimiter,
+        bool trailing_delimiter,
+        int64_t* kv_written) {
+    int64_t ts = default_ts > 0 ? default_ts
+                : std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch()).count();
+
+    std::string value;
+    HFILE_RETURN_IF_ERROR(build_joined_row_value(
+        columns, row_idx, delimiter, trailing_delimiter, &value));
+
+    KeyValue kv;
+    kv.row = as_bytes(row_key);
+    kv.family = as_bytes(cf);
+    kv.qualifier = {};
+    kv.timestamp = ts;
+    kv.key_type = KeyType::Put;
+    kv.value = as_bytes(value);
+    auto s = writer.append_trusted_new_row(kv);
+    if (!s.ok()) return s;
+    if (kv_written) ++(*kv_written);
+    return Status::OK();
+}
+
 // ─── Write KVs for one row in sorted qualifier order ─────────────────────────
 
 static Status append_grouped_row_cells(
@@ -1318,7 +1369,15 @@ ConvertResult convert(const ConvertOptions& opts) {
     sorted_batch_columns.reserve(batches.size());
     std::vector<int> sorted_column_order;
     if (!batches.empty()) {
-        sorted_column_order = build_sorted_column_order(batches.front()->schema());
+        if (opts.single_cell_row_value) {
+            auto schema = batches.front()->schema();
+            sorted_column_order.resize(static_cast<size_t>(schema->num_fields()));
+            for (int c = 0; c < schema->num_fields(); ++c) {
+                sorted_column_order[static_cast<size_t>(c)] = c;
+            }
+        } else {
+            sorted_column_order = build_sorted_column_order(batches.front()->schema());
+        }
     }
     for (const auto& batch : batches)
         sorted_batch_columns.push_back(build_sorted_columns(batch, sorted_column_order));
@@ -1378,7 +1437,22 @@ ConvertResult convert(const ConvertOptions& opts) {
         }
 
         Status s;
-        if (source_rows == 1) {
+        if (opts.single_cell_row_value) {
+            const auto& entry = sort_index[i];
+            s = append_single_row_joined_value_cell(
+                *writer,
+                sorted_batch_columns[static_cast<size_t>(entry.batch_idx)],
+                entry.row_idx,
+                row_key,
+                opts.column_family,
+                opts.default_timestamp,
+                opts.row_value_delimiter,
+                opts.row_value_trailing_delimiter,
+                &kv_written);
+            if (source_rows > 1) {
+                kv_skipped += static_cast<int64_t>(source_rows - 1);
+            }
+        } else if (source_rows == 1) {
             const auto& entry = sort_index[i];
             s = append_single_row_cells(
                 *writer,

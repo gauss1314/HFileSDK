@@ -37,6 +37,9 @@ struct InstanceState {
     ConvertResult last_result;
     std::string   last_result_json{"{}"};
     int64_t       default_timestamp_ms{0};
+    bool          single_cell_row_value{false};
+    std::string   row_value_delimiter{"|"};
+    bool          row_value_trailing_delimiter{true};
     // Column exclusion settings (set via configure())
     std::vector<std::string> excluded_columns;
     std::vector<std::string> excluded_column_prefixes;
@@ -137,6 +140,9 @@ struct InstanceSnapshot {
     hfile::WriterOptions     writer_opts;
     hfile::NumericSortFastPathMode numeric_sort_fast_path;
     int64_t                  default_timestamp_ms;
+    bool                     single_cell_row_value;
+    std::string              row_value_delimiter;
+    bool                     row_value_trailing_delimiter;
     std::vector<std::string> excluded_columns;
     std::vector<std::string> excluded_column_prefixes;
 };
@@ -147,6 +153,9 @@ static InstanceSnapshot get_instance_snapshot(JNIEnv* env, jobject obj) {
         s.writer_opts,
         s.numeric_sort_fast_path,
         s.default_timestamp_ms,
+        s.single_cell_row_value,
+        s.row_value_delimiter,
+        s.row_value_trailing_delimiter,
         s.excluded_columns,
         s.excluded_column_prefixes
     };
@@ -233,6 +242,9 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
         opts.writer_opts  = snap.writer_opts;
         opts.numeric_sort_fast_path = snap.numeric_sort_fast_path;
         opts.default_timestamp = snap.default_timestamp_ms;
+        opts.single_cell_row_value = snap.single_cell_row_value;
+        opts.row_value_delimiter = snap.row_value_delimiter;
+        opts.row_value_trailing_delimiter = snap.row_value_trailing_delimiter;
         opts.excluded_columns         = snap.excluded_columns;
         opts.excluded_column_prefixes = snap.excluded_column_prefixes;
 
@@ -313,6 +325,9 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         auto next_opts = state.writer_opts;
         auto next_numeric_sort_fast_path = state.numeric_sort_fast_path;
         auto next_default_timestamp_ms = state.default_timestamp_ms;
+        auto next_single_cell_row_value = state.single_cell_row_value;
+        auto next_row_value_delimiter = state.row_value_delimiter;
+        auto next_row_value_trailing_delimiter = state.row_value_trailing_delimiter;
         auto next_excluded_columns = state.excluded_columns;
         auto next_excluded_column_prefixes = state.excluded_column_prefixes;
         auto fail_config = [&](std::string message) {
@@ -346,6 +361,9 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             "compression_queue_depth",
             "numeric_sort_fast_path",
             "default_timestamp_ms",
+            "single_cell_row_value",
+            "row_value_delimiter",
+            "row_value_trailing_delimiter",
             // Column exclusion — used for Hudi / CDC metadata columns
             "excluded_columns",          // ["col1","col2",...]  exact names
             "excluded_column_prefixes"   // ["_hoodie","_cdc_"]  prefix match
@@ -443,6 +461,20 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             next_default_timestamp_ms = *ts;
         }
 
+        if (auto enabled = hfile::jni::config_int(cfg, "single_cell_row_value")) {
+            if (*enabled != 0 && *enabled != 1)
+                return fail_config("single_cell_row_value must be 0 or 1");
+            next_single_cell_row_value = (*enabled != 0);
+        }
+        if (auto delimiter = hfile::jni::config_string(cfg, "row_value_delimiter")) {
+            next_row_value_delimiter = *delimiter;
+        }
+        if (auto trailing = hfile::jni::config_int(cfg, "row_value_trailing_delimiter")) {
+            if (*trailing != 0 && *trailing != 1)
+                return fail_config("row_value_trailing_delimiter must be 0 or 1");
+            next_row_value_trailing_delimiter = (*trailing != 0);
+        }
+
         // ── Column exclusion ──────────────────────────────────────────────────
         // These are stored on InstanceState, not on WriterOptions, because they
         // are a converter-level concept (applied at Arrow → HFile mapping time).
@@ -456,6 +488,9 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         state.writer_opts = std::move(next_opts);
         state.numeric_sort_fast_path = next_numeric_sort_fast_path;
         state.default_timestamp_ms = next_default_timestamp_ms;
+        state.single_cell_row_value = next_single_cell_row_value;
+        state.row_value_delimiter = std::move(next_row_value_delimiter);
+        state.row_value_trailing_delimiter = next_row_value_trailing_delimiter;
         state.excluded_columns = std::move(next_excluded_columns);
         state.excluded_column_prefixes = std::move(next_excluded_column_prefixes);
         state.last_result = {};
