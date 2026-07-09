@@ -45,11 +45,11 @@ import org.apache.hadoop.io.compress.zlib.ZlibCompressor;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
@@ -529,41 +529,44 @@ public final class ArrowToHFileJavaConverter {
                                         List<SortEntry> sortIndex,
                                         long defaultTimestampMs) throws IOException {
         long kvWritten = 0L;
-        List<GroupedCell> cells = new ArrayList<>();
+        byte[] emptyQualifier = new byte[0];
 
         for (int index = 0; index < sortIndex.size();) {
             SortEntry current = sortIndex.get(index);
             byte[] rowKey = current.rowKey();
-            cells.clear();
 
             int next = index;
             while (next < sortIndex.size() && Bytes.equals(sortIndex.get(next).rowKey(), rowKey)) {
-                SortEntry entry = sortIndex.get(next);
-                VectorSchemaRoot batchRoot = storedBatches.get(entry.batchIndex());
-                for (ProjectedField field : projectedSchema.qualifierFields()) {
-                    byte[] value = extractValueBytes(batchRoot.getVector(field.sourceIndex()), entry.rowIndex());
-                    if (value.length == 0) {
-                        continue;
-                    }
-                    cells.add(new GroupedCell(field.name(), field.qualifier(), value));
-                }
                 next++;
             }
 
-            cells.sort(Comparator.comparing(GroupedCell::name));
-            String previousQualifier = null;
+            VectorSchemaRoot batchRoot = storedBatches.get(current.batchIndex());
+            byte[] value = buildMergedRowValue(
+                batchRoot,
+                projectedSchema.visibleFields(),
+                current.rowIndex()
+            );
             long timestamp = defaultTimestampMs > 0 ? defaultTimestampMs : System.currentTimeMillis();
-            for (GroupedCell cell : cells) {
-                if (cell.name().equals(previousQualifier)) {
-                    continue;
-                }
-                writer.append(new KeyValue(rowKey, columnFamily, cell.qualifier(), timestamp, cell.value()));
-                kvWritten++;
-                previousQualifier = cell.name();
-            }
+            writer.append(new KeyValue(rowKey, columnFamily, emptyQualifier, timestamp, value));
+            kvWritten++;
             index = next;
         }
         return kvWritten;
+    }
+
+    private static byte[] buildMergedRowValue(VectorSchemaRoot batchRoot,
+                                              List<ProjectedField> fields,
+                                              int rowIndex) {
+        StringBuilder builder = new StringBuilder();
+        boolean firstField = true;
+        for (ProjectedField field : fields) {
+            if (!firstField) {
+                builder.append('|');
+            }
+            builder.append(extractStringValue(batchRoot.getVector(field.sourceIndex()), rowIndex));
+            firstField = false;
+        }
+        return builder.toString().getBytes(StandardCharsets.UTF_8);
     }
 
     private static void closeBatches(List<VectorSchemaRoot> storedBatches) {
@@ -577,11 +580,9 @@ public final class ArrowToHFileJavaConverter {
 
     private record ProjectedField(String name, byte[] qualifier, int sourceIndex) {}
 
-    private record GroupedCell(String name, byte[] qualifier, byte[] value) {}
-
     private record SortEntry(byte[] rowKey, int batchIndex, int rowIndex) {}
 
-    private record ProjectedSchema(List<ProjectedField> visibleFields, List<ProjectedField> qualifierFields) {
+    private record ProjectedSchema(List<ProjectedField> visibleFields) {
         private static ProjectedSchema from(VectorSchemaRoot root, JavaConvertOptions options) {
             List<ProjectedField> visibleFields = new ArrayList<>();
             List<FieldVector> vectors = root.getFieldVectors();
@@ -595,10 +596,7 @@ public final class ArrowToHFileJavaConverter {
             if (visibleFields.isEmpty()) {
                 throw new IllegalArgumentException("过滤后没有可写入的列");
             }
-            List<ProjectedField> qualifierFields = visibleFields.stream()
-                .sorted(Comparator.comparing(ProjectedField::name))
-                .toList();
-            return new ProjectedSchema(List.copyOf(visibleFields), qualifierFields);
+            return new ProjectedSchema(List.copyOf(visibleFields));
         }
 
         private int fieldCount() {

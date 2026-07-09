@@ -88,7 +88,7 @@ final class ArrowToHFileJavaConverterTest {
         FileSystem fs = new RawLocalFileSystem();
         fs.initialize(java.net.URI.create("file:///"), conf);
         try (HFile.Reader reader = HFile.createReader(fs, new Path(hfile.toString()), new CacheConfig(conf), true, conf)) {
-            assertEquals(6L, reader.getEntries());
+            assertEquals(2L, reader.getEntries());
             assertEquals(Compression.Algorithm.GZ, reader.getFileContext().getCompression());
             assertEquals(DataBlockEncoding.NONE, reader.getFileContext().getDataBlockEncoding());
             assertNotNull(reader.getGeneralBloomFilterMetadata());
@@ -96,7 +96,8 @@ final class ArrowToHFileJavaConverterTest {
             assertTrue(scanner.seekTo());
             Cell firstCell = scanner.getCell();
             assertEquals("user-0001", new String(firstCell.getRowArray(), firstCell.getRowOffset(), firstCell.getRowLength(), StandardCharsets.UTF_8));
-            assertEquals("EVENT_TIME", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
+            assertEquals("", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
+            assertEquals("user-0001|1001|payload-a", new String(firstCell.getValueArray(), firstCell.getValueOffset(), firstCell.getValueLength(), StandardCharsets.UTF_8));
             assertEquals(1_715_678_900_123L, firstCell.getTimestamp());
 
             HFileInfo fileInfo = ((HFileReaderImpl) reader).getHFileInfo();
