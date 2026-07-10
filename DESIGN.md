@@ -1,8 +1,8 @@
-# HFileSDK 详细设计文档 v4.0
+# HFileSDK 详细设计文档 v4.1
 
 > C++ 高性能 HFile Writer SDK — 适配 HBase 2.6.1 Bulk Load
 
-**版本**: v4.0 | **日期**: 2026-03-28 | **基于实现**: 全部模块已完成并通过测试
+**版本**: v4.1 | **日期**: 2026-07-10 | **基于实现**: 全部模块已完成并通过测试
 
 ---
 
@@ -14,6 +14,7 @@
 | v2.0 | 修复 6 个致命设计缺陷（Bulk Load 全流程、单 CF 约束、Region 分裂、HDFS I/O、Cell Tags、PB Trailer、FileInfo 完整字段） |
 | v3.0 | 与实际代码对齐：更新所有已实现模块的精确描述，记录 10 个经代码审查发现并修复的 Bug，更新平台支持矩阵 |
 | **v4.0** | **架构升级**：JNI 接口层、Arrow IPC Stream 文件读取、RowKeyRule 规则引擎、SDK 内部 AutoSort（两遍扫描）；删除 rowValue 参数 |
+| **v4.1** | **Value 布局修订**：单个 HBase value 仍由 Arrow 列值文本化后用 `|` 拼接，但列顺序改为过滤后的 Arrow Schema 原始自然顺序，不再按列名升序排序 |
 
 ---
 
@@ -271,7 +272,8 @@ SortEntry 列表（全量 row key 索引）
 排好序的 SortEntry 列表
         │
         │ 第二遍：按排序顺序，读对应 batch 的 row，
-        │         列值文本化并用 | 拼接 → 空 qualifier KV → 写入 HFile
+        │         按过滤后的 Arrow Schema 原始顺序将列值文本化并用 | 拼接
+        │         → 空 qualifier KV → 写入 HFile
         ▼
 HFile v3（原子写入：.tmp → fsync → rename）
 ```
@@ -418,7 +420,7 @@ flowchart LR
 
 1. **第一遍**：流式读取所有 RecordBatch，为每行生成 row key，收集 `SortEntry{rowKey, batchIdx, rowIdx}`，所有 batch 保留在内存。
 2. **排序**：`std::stable_sort` 按 row key 字典序升序。
-3. **第二遍**：按排序顺序，从内存中的 batch 读取对应行，按列名升序将列值文本化并用 `|` 拼成单个 HBase value，写入 qualifier 为空的单个 KV。
+3. **第二遍**：按排序顺序，从内存中的 batch 读取对应行，按过滤后的 Arrow Schema 原始自然列顺序将列值文本化并用 `|` 拼成单个 HBase value，写入 qualifier 为空的单个 KV。
 
 **内存占用**：所有 batch 保留在内存，同时存储 sort index（每条 ~40 字节 + row key 长度）。对于 1GB Arrow 文件约需 1–3 GB 内存。如果内存紧张可考虑外排序（当前未实现）。
 

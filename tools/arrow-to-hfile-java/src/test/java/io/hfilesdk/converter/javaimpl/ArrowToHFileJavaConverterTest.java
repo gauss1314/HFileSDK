@@ -99,7 +99,7 @@ final class ArrowToHFileJavaConverterTest {
             assertEquals("user-0001", new String(firstCell.getRowArray(), firstCell.getRowOffset(), firstCell.getRowLength(), StandardCharsets.UTF_8));
             assertEquals("", new String(firstCell.getQualifierArray(), firstCell.getQualifierOffset(), firstCell.getQualifierLength(), StandardCharsets.UTF_8));
             assertEquals(1_715_678_900_123L, firstCell.getTimestamp());
-            assertEquals("1001|payload-a|user-0001",
+            assertEquals("user-0001|1001|payload-a",
                 new String(firstCell.getValueArray(), firstCell.getValueOffset(), firstCell.getValueLength(), StandardCharsets.UTF_8));
 
             HFileInfo fileInfo = ((HFileReaderImpl) reader).getHFileInfo();

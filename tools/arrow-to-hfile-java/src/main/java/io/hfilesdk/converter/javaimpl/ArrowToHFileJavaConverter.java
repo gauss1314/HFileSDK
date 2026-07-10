@@ -49,7 +49,6 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Random;
@@ -572,10 +571,7 @@ public final class ArrowToHFileJavaConverter {
             if (visibleFields.isEmpty()) {
                 throw new IllegalArgumentException("过滤后没有可写入的列");
             }
-            List<ProjectedField> valueFields = visibleFields.stream()
-                .sorted(Comparator.comparing(ProjectedField::name))
-                .toList();
-            return new ProjectedSchema(List.copyOf(visibleFields), valueFields);
+            return new ProjectedSchema(List.copyOf(visibleFields), List.copyOf(visibleFields));
         }
 
         private int fieldCount() {
