@@ -2,6 +2,7 @@
 #include <hfile/writer.h>
 #include <hfile/types.h>
 #include "codec/compressor.h"
+#include "codec/compression_executor.h"
 #include "meta/trailer_builder.h"
 
 #include <filesystem>
@@ -12,6 +13,7 @@
 #include <limits>
 #include <map>
 #include <span>
+#include <future>
 
 namespace fs = std::filesystem;
 using namespace hfile;
@@ -368,6 +370,426 @@ TEST(HFileWriter, CompressionPipelineMatchesSynchronousOutput) {
     fs::remove(async_path);
 }
 
+TEST(HFileWriter, CompressionPipelineReusesSingleSlotForOversizedBlock) {
+    auto sync_path = tmp_path("pipeline_oversized_sync");
+    auto async_path = tmp_path("pipeline_oversized_async");
+
+    auto make_writer = [](const fs::path& path, uint32_t threads) {
+        return HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::None)
+            .set_block_size(512)
+            .set_file_create_time_ms(1'715'678'900'123LL)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_compression_threads(threads)
+            .set_compression_queue_depth(threads == 0 ? 0 : 1)
+            .build();
+    };
+
+    auto [sync_writer, sync_status] = make_writer(sync_path, 0);
+    auto [async_writer, async_status] = make_writer(async_path, 2);
+    ASSERT_TRUE(sync_status.ok()) << sync_status.message();
+    ASSERT_TRUE(async_status.ok()) << async_status.message();
+
+    std::string value(256 * 1024, '\0');
+    uint32_t state = 0x12345678u;
+    for (char& byte : value) {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        byte = static_cast<char>(state & 0xffu);
+    }
+
+    std::vector<uint8_t> rk, fam, q, v;
+    auto kv = make_kv(rk, fam, q, v, "row000001", "q", 100, value);
+    ASSERT_TRUE(sync_writer->append_trusted(kv).ok());
+    ASSERT_TRUE(async_writer->append_trusted(kv).ok());
+    ASSERT_TRUE(sync_writer->finish().ok());
+    ASSERT_TRUE(async_writer->finish().ok());
+    EXPECT_EQ(read_file(sync_path), read_file(async_path));
+
+    fs::remove(sync_path);
+    fs::remove(async_path);
+}
+
+TEST(HFileWriter, CompressionExecutorIsSharedAcrossConcurrentWriters) {
+    auto golden_path = tmp_path("shared_executor_golden");
+    auto write_fixture = [](const fs::path& path, uint32_t threads) {
+        auto [writer, status] = HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::Row)
+            .set_block_size(512)
+            .set_file_create_time_ms(1'715'678'900'123LL)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_compression_threads(threads)
+            .set_compression_queue_depth(threads == 0 ? 0 : 4)
+            .build();
+        if (!status.ok()) return status;
+
+        std::vector<uint8_t> rk, fam, q, v;
+        for (int row = 0; row < 2000; ++row) {
+            char row_buf[32];
+            std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+            auto kv = make_kv(
+                rk, fam, q, v, row_buf, "q", 100,
+                std::string(128, static_cast<char>('a' + (row % 26))));
+            auto append_status = writer->append_trusted_new_row(kv);
+            if (!append_status.ok()) return append_status;
+        }
+        return writer->finish();
+    };
+
+    ASSERT_TRUE(write_fixture(golden_path, 0).ok());
+    const auto golden = read_file(golden_path);
+
+    constexpr size_t kWriterCount = 4;
+    std::array<fs::path, kWriterCount> paths;
+    std::array<std::future<Status>, kWriterCount> futures;
+    for (size_t i = 0; i < kWriterCount; ++i) {
+        paths[i] = tmp_path("shared_executor_" + std::to_string(i));
+        futures[i] = std::async(std::launch::async, [&, i]() {
+            return write_fixture(paths[i], 2);
+        });
+    }
+    for (size_t i = 0; i < kWriterCount; ++i) {
+        const auto status = futures[i].get();
+        ASSERT_TRUE(status.ok()) << status.message();
+        EXPECT_EQ(golden, read_file(paths[i]));
+    }
+
+    const auto& executor = codec::CompressionExecutor::instance();
+    EXPECT_LE(executor.worker_count(), 2u);
+    EXPECT_LE(executor.worker_count(), executor.worker_limit());
+
+    fs::remove(golden_path);
+    for (const auto& path : paths) fs::remove(path);
+}
+
+TEST(HFileWriter, CompressionPipelineHonorsSmallBudgetWithBackpressure) {
+    auto sync_path = tmp_path("pipeline_budget_sync");
+    auto async_path = tmp_path("pipeline_budget_async");
+
+    auto make_writer = [](const fs::path& path, uint32_t threads,
+                          size_t memory_budget) {
+        return HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::None)
+            .set_block_size(512)
+            .set_file_create_time_ms(1'715'678'900'123LL)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_max_memory(memory_budget)
+            .set_compression_threads(threads)
+            .set_compression_queue_depth(threads == 0 ? 0 : 8)
+            .build();
+    };
+
+    auto [sync_writer, sync_status] = make_writer(sync_path, 0, 0);
+    constexpr size_t kPipelineBudget = 24 * 1024;
+    auto [async_writer, async_status] =
+        make_writer(async_path, 2, kPipelineBudget);
+    ASSERT_TRUE(sync_status.ok()) << sync_status.message();
+    ASSERT_TRUE(async_status.ok()) << async_status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int row = 0; row < 2000; ++row) {
+        char row_buf[32];
+        std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+        std::string value(96, '\0');
+        for (size_t i = 0; i < value.size(); ++i) {
+            value[i] = static_cast<char>(
+                (row * 131 + static_cast<int>(i) * 17) & 0xff);
+        }
+        auto kv = make_kv(rk, fam, q, v, row_buf, "q", 100, value);
+        ASSERT_TRUE(sync_writer->append_trusted_new_row(kv).ok());
+        ASSERT_TRUE(async_writer->append_trusted_new_row(kv).ok());
+    }
+    ASSERT_TRUE(sync_writer->finish().ok());
+    ASSERT_TRUE(async_writer->finish().ok());
+    EXPECT_LE(async_writer->stats().memory_budget_peak_bytes,
+              kPipelineBudget);
+    EXPECT_EQ(read_file(sync_path), read_file(async_path));
+
+    fs::remove(sync_path);
+    fs::remove(async_path);
+}
+
+TEST(HFileWriter, CompressionPipelineFinishFailureIsTerminalAndAbortsOutput) {
+    auto path = tmp_path("pipeline_terminal_failure");
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::GZip)
+        .set_compression_level(1)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .set_block_size(512)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+        .set_max_memory(5 * 1024)
+        .set_compression_threads(1)
+        .set_compression_queue_depth(1)
+        .build();
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    auto kv = make_kv(rk, fam, q, v, "row000001", "q", 100,
+                      std::string(64, 'v'));
+    ASSERT_TRUE(writer->append_trusted_new_row(kv).ok());
+
+    const Status first_finish = writer->finish();
+    ASSERT_FALSE(first_finish.ok());
+    EXPECT_NE(first_finish.message().find("MemoryBudget:"), std::string::npos);
+    EXPECT_FALSE(fs::exists(path));
+
+    const Status second_finish = writer->finish();
+    EXPECT_EQ(second_finish.code(), first_finish.code());
+    EXPECT_EQ(second_finish.message(), first_finish.message());
+
+    const Status append_after_failure = writer->append_trusted_new_row(kv);
+    EXPECT_EQ(append_after_failure.code(), first_finish.code());
+    EXPECT_EQ(append_after_failure.message(), first_finish.message());
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST(HFileWriter, EncoderGrowthBudgetFailureIsTerminal) {
+    auto path = tmp_path("encoder_growth_budget");
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::GZip)
+        .set_compression_level(1)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .set_block_size(512)
+        .set_file_create_time_ms(1'715'678'900'123LL)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+        .set_max_memory(16 * 1024)
+        .set_compression_threads(1)
+        .set_compression_queue_depth(1)
+        .build();
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    auto oversized = make_kv(rk, fam, q, v, "row000001", "q", 100,
+                             std::string(64 * 1024, 'x'));
+    const Status oversized_status = writer->append_trusted_new_row(oversized);
+    ASSERT_FALSE(oversized_status.ok());
+    EXPECT_NE(oversized_status.message().find("MemoryBudget:"),
+              std::string::npos);
+    EXPECT_EQ(writer->entry_count(), 0u);
+
+    auto small = make_kv(rk, fam, q, v, "row000002", "q", 100,
+                         std::string(64, 'v'));
+    const Status append_after_failure = writer->append_trusted_new_row(small);
+    EXPECT_EQ(append_after_failure.code(), oversized_status.code());
+    EXPECT_EQ(append_after_failure.message(), oversized_status.message());
+
+    const Status finish_after_failure = writer->finish();
+    EXPECT_EQ(finish_after_failure.code(), oversized_status.code());
+    EXPECT_EQ(finish_after_failure.message(), oversized_status.message());
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST(HFileWriter, AppendExceptionIsTerminalAndAbortsOutput) {
+    auto path = tmp_path("append_exception_terminal");
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_bloom_type(BloomType::None)
+        .set_error_policy(ErrorPolicy::Strict)
+        .set_error_callback([](const RowError&) {
+            throw std::runtime_error("callback failure");
+        })
+        .build();
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    KeyValue invalid;
+    const Status first = writer->append(invalid);
+    ASSERT_FALSE(first.ok());
+    EXPECT_EQ(first.code(), Status::Code::Internal);
+    EXPECT_NE(first.message().find("callback failure"), std::string::npos);
+    EXPECT_FALSE(fs::exists(path));
+
+    const Status repeated = writer->finish();
+    EXPECT_EQ(repeated.code(), first.code());
+    EXPECT_EQ(repeated.message(), first.message());
+}
+
+TEST(HFileWriter, TerminalAbortReleasesSubmittedPipelineBudgetExactlyOnce) {
+    auto path = tmp_path("pipeline_terminal_submitted_budget");
+    constexpr size_t kBudget = 64 * 1024;
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::GZip)
+        .set_compression_level(1)
+        .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
+        .set_block_size(512)
+        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+        .set_max_memory(kBudget)
+        .set_compression_threads(1)
+        .set_compression_queue_depth(8)
+        .build();
+    ASSERT_TRUE(status.ok()) << status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int row = 0; row < 200; ++row) {
+        char row_buf[32];
+        std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+        auto kv = make_kv(rk, fam, q, v, row_buf, "q", 100,
+                          std::string(128, 'v'));
+        ASSERT_TRUE(writer->append_trusted_new_row(kv).ok());
+    }
+
+    auto oversized = make_kv(rk, fam, q, v, "row999999", "q", 100,
+                             std::string(128 * 1024, 'x'));
+    const Status failure = writer->append_trusted_new_row(oversized);
+    ASSERT_FALSE(failure.ok());
+    EXPECT_NE(failure.message().find("MemoryBudget:"), std::string::npos);
+    EXPECT_FALSE(fs::exists(path));
+
+    const WriterStats after_abort = writer->stats();
+    EXPECT_EQ(after_abort.memory_budget_used_bytes, 0u);
+    EXPECT_LE(after_abort.memory_budget_peak_bytes, kBudget);
+
+    const Status repeat = writer->finish();
+    EXPECT_EQ(repeat.code(), failure.code());
+    EXPECT_EQ(repeat.message(), failure.message());
+}
+
+TEST(HFileWriter, CompressionPipelineBoundsPoolAcrossGrowingBlocks) {
+    auto sync_path = tmp_path("pipeline_growing_sync");
+    auto async_path = tmp_path("pipeline_growing_async");
+    auto make_writer = [](const fs::path& path, uint32_t threads) {
+        return HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::None)
+            .set_block_size(512)
+            .set_file_create_time_ms(1'715'678'900'123LL)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_compression_threads(threads)
+            .set_compression_queue_depth(threads == 0 ? 0 : 1)
+            .build();
+    };
+
+    auto [sync_writer, sync_status] = make_writer(sync_path, 0);
+    auto [async_writer, async_status] = make_writer(async_path, 1);
+    ASSERT_TRUE(sync_status.ok()) << sync_status.message();
+    ASSERT_TRUE(async_status.ok()) << async_status.message();
+
+    std::vector<uint8_t> rk, fam, q, v;
+    for (int row = 0; row < 16; ++row) {
+        char row_buf[32];
+        std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+        std::string value(static_cast<size_t>(row + 1) * 4096,
+                          static_cast<char>('a' + row));
+        auto kv = make_kv(rk, fam, q, v, row_buf, "q", 100, value);
+        ASSERT_TRUE(sync_writer->append_trusted_new_row(kv).ok());
+        ASSERT_TRUE(async_writer->append_trusted_new_row(kv).ok());
+    }
+    ASSERT_TRUE(sync_writer->finish().ok());
+    ASSERT_TRUE(async_writer->finish().ok());
+    EXPECT_EQ(read_file(sync_path), read_file(async_path));
+
+    fs::remove(sync_path);
+    fs::remove(async_path);
+}
+
+TEST(HFileWriter, RejectsInvalidGZipCompressionLevel) {
+    auto path = tmp_path("invalid_compression_level");
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::GZip)
+        .set_compression_level(10)
+        .build();
+    EXPECT_EQ(writer, nullptr);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("compression_level"), std::string::npos);
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST(HFileWriter, RejectsUnboundedCompressionQueueDepth) {
+    auto path = tmp_path("invalid_compression_queue_depth");
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::GZip)
+        .set_compression_threads(1)
+        .set_compression_queue_depth(4097)
+        .build();
+    EXPECT_EQ(writer, nullptr);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("compression_queue_depth"),
+              std::string::npos);
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST(HFileWriter, FastModeOpenFailureRemovesFinalPath) {
+    auto path = tmp_path("fast_open_failure_cleanup");
+    auto [writer, status] = HFileWriter::builder()
+        .set_path(path.string())
+        .set_column_family("cf")
+        .set_compression(Compression::None)
+        .set_block_size(128)
+        .set_fsync_policy(FsyncPolicy::Fast)
+        .set_max_memory(1)
+        .build();
+    EXPECT_EQ(writer, nullptr);
+    EXPECT_FALSE(status.ok());
+    EXPECT_NE(status.message().find("MemoryBudget:"), std::string::npos);
+    EXPECT_FALSE(fs::exists(path));
+}
+
+TEST(HFileWriter, CompressionPipelineDestructorWaitsForSharedTasks) {
+    auto path = tmp_path("pipeline_shared_executor_abort");
+    {
+        auto [writer, status] = HFileWriter::builder()
+            .set_path(path.string())
+            .set_column_family("cf")
+            .set_compression(Compression::GZip)
+            .set_compression_level(1)
+            .set_data_block_encoding(Encoding::None)
+            .set_bloom_type(BloomType::None)
+            .set_block_size(256)
+            .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+            .set_compression_threads(2)
+            .set_compression_queue_depth(16)
+            .build();
+        ASSERT_TRUE(status.ok()) << status.message();
+
+        std::vector<uint8_t> rk, fam, q, v;
+        for (int row = 0; row < 2000; ++row) {
+            char row_buf[32];
+            std::snprintf(row_buf, sizeof(row_buf), "row%06d", row);
+            auto kv = make_kv(
+                rk, fam, q, v, row_buf, "q", 100,
+                std::string(128, static_cast<char>('a' + (row % 26))));
+            ASSERT_TRUE(writer->append_trusted_new_row(kv).ok());
+        }
+        // Intentionally omit finish(). Destruction must wait for every task
+        // that escaped to the process-wide executor before slot memory dies.
+    }
+    EXPECT_FALSE(fs::exists(path));
+}
+
 TEST(HFileWriter, CompressionPipelineMatchesSynchronousOutputAcrossMultipleBloomFlushes) {
     auto sync_path = tmp_path("pipeline_sync_multi_bloom");
     auto async_path = tmp_path("pipeline_async_multi_bloom");
@@ -673,8 +1095,11 @@ TEST(HFileWriter, AutoSortRespectsMemoryBudget) {
         .set_column_family("cf")
         .set_compression(Compression::None)
         .set_data_block_encoding(Encoding::None)
+        .set_bloom_type(BloomType::None)
         .set_block_size(128)
-        .set_max_memory(66000)
+        // NONE needs no compression buffer. Leave enough for the ~4 KiB
+        // encoder, but not for a 4 KiB cell plus AutoSort vector growth.
+        .set_max_memory(8 * 1024)
         .build();
     ASSERT_TRUE(s.ok());
 

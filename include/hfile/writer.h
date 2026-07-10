@@ -24,6 +24,8 @@ struct WriterStats {
     uint32_t leaf_index_block_count{0};
     uint32_t bloom_chunk_flush_count{0};
     uint32_t load_on_open_block_count{0};
+    size_t memory_budget_used_bytes{0};
+    size_t memory_budget_peak_bytes{0};
 };
 
 /// Single-file, single-CF HFile v3 writer.
@@ -146,8 +148,11 @@ public:
         Builder& set_disk_check_interval(size_t bytes);
         Builder& set_max_open_files(int n);
 
-        /// Build and open the writer.  Returns error if path can't be opened.
-        std::pair<std::unique_ptr<HFileWriter>, Status> build();
+        /// Build and open the writer. Returns error if path can't be opened.
+        /// When provided, failure_stats captures reservations made before an
+        /// initialization failure for production diagnostics.
+        std::pair<std::unique_ptr<HFileWriter>, Status> build(
+            WriterStats* failure_stats = nullptr);
 
     private:
         std::string    path_;

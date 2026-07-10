@@ -78,8 +78,8 @@ Throughput: 612.4 MB/s
 | `--bloom TYPE` | | `row` | Bloom Filter：`none`/`row`/`rowcol` |
 | `--block-size BYTES` | | `65536` | 数据块大小（字节） |
 | `--max-memory-mb MB` | | `0` | C++ SDK 内部软内存预算，单位 MiB；`0` 表示不限制 |
-| `--compression-threads N` | | `0` | C++ SDK 数据块压缩后台线程数；`0` 表示关闭压缩流水线 |
-| `--compression-queue-depth N` | | `0` | C++ SDK 压缩流水线最大 in-flight block 数；`0` 表示自动 |
+| `--compression-threads N` | | `0` | 进程级共享 C++ 压缩 worker 数；多个 Writer 不会按文件数重复创建，`0` 表示同步压缩 |
+| `--compression-queue-depth N` | | `0` | C++ SDK 压缩流水线最大 in-flight block 数；`0` 表示自动，显式值范围 `1～4096` |
 | `--numeric-sort-fast-path MODE` | | `auto` | 数值 rowkey 排序快路径：`auto`/`on`/`off` |
 | `--fsync-policy` | | `safe` | Fsync 策略：`safe`/`fast`/`paranoid` |
 | `--error-policy` | | `skip_row` | 行错误策略：`strict`/`skip_row`/`skip_batch` |
@@ -90,6 +90,7 @@ Throughput: 612.4 MB/s
 
 - `--max-memory-mb` 会通过 JNI `configure()` 下发为 `max_memory_bytes`，控制 SDK 内部 `MemoryBudget`
 - `--compression-threads` / `--compression-queue-depth` 会通过 JNI `configure()` 下发为 `compression_threads` / `compression_queue_depth`
+- 多个并发 Writer 共用进程级压缩池：P 个任务同为 T 时总压缩 worker 为 T；队列深度仍按 Writer 计算，内存约随 `P * queue_depth` 增长
 - `--numeric-sort-fast-path` 会通过 JNI `configure()` 下发为 `numeric_sort_fast_path`
 - `numeric_sort_fast_path` 是按 rowkey 规则形态启用的通用优化，不绑定任何具体表名
 - 只有在 rowkey 的首段满足“直接数值/时间戳列、左侧 `0` 补齐、非 reverse/right-pad”时才可能命中
@@ -156,26 +157,25 @@ mvn install -q
 ```java
 import io.hfilesdk.converter.*;
 
-// 应用启动时加载 native 库（只需一次）
-ArrowToHFileConverter converter =
-    ArrowToHFileConverter.withNativeLib("/opt/hfilesdk/libhfilesdk.so");
+// 应用生命周期内复用 converter；配置相同的连续调用会复用 native session。
+try (ArrowToHFileConverter converter =
+         ArrowToHFileConverter.withNativeLib("/opt/hfilesdk/libhfilesdk.so")) {
+    ConvertResult result = converter.convert(
+        ConvertOptions.builder()
+            .arrowPath("/data/events.arrow")
+            .hfilePath("/staging/cf/events.hfile")
+            .tableName("events_table")
+            .rowKeyRule("STARTTIME,0,false,10#IMSI,1,true,15")
+            .columnFamily("cf")
+            .compression("GZ")
+            .build());
 
-// 每次转换
-ConvertResult result = converter.convert(
-    ConvertOptions.builder()
-        .arrowPath("/data/events.arrow")
-        .hfilePath("/staging/cf/events.hfile")
-        .tableName("events_table")
-        .rowKeyRule("STARTTIME,0,false,10#IMSI,1,true,15")
-        .columnFamily("cf")
-        .compression("GZ")
-        .build());
-
-if (!result.isSuccess()) {
-    throw new ConvertException(result);
+    if (!result.isSuccess()) {
+        throw new ConvertException(result);
+    }
+    log.info("Converted: {}", result.summary());
+    log.info("Throughput: {:.1f} MB/s", result.throughputMbps());
 }
-log.info("Converted: {}", result.summary());
-log.info("Throughput: {:.1f} MB/s", result.throughputMbps());
 ```
 
 #### 异常方式（convertOrThrow）
@@ -231,6 +231,11 @@ public class ArrowToHFileService {
                 .columnFamily(columnFamily)
                 .build());
     }
+
+    @PreDestroy
+    public void close() {
+        converter.close();
+    }
 }
 ```
 
@@ -244,27 +249,28 @@ hfilesdk:
 #### 批量转换（线程安全）
 
 ```java
-// ArrowToHFileConverter 实例是线程安全的：
-// 每次 convert() 调用创建独立的 HFileSDK C++ 对象，互不干扰。
+// ArrowToHFileConverter 实例是线程安全且可复用的：
+// 每个 worker 线程持有独立 prepared native session；配置不变时不重复 configure。
 
 ExecutorService pool = Executors.newFixedThreadPool(4);
-ArrowToHFileConverter converter =
-    ArrowToHFileConverter.withNativeLib("/opt/hfilesdk/libhfilesdk.so");
+try (ArrowToHFileConverter converter =
+         ArrowToHFileConverter.withNativeLib("/opt/hfilesdk/libhfilesdk.so")) {
+    List<Future<ConvertResult>> futures = files.stream()
+        .map(arrowFile -> pool.submit(() ->
+            converter.convert(ConvertOptions.builder()
+                .arrowPath(arrowFile.toString())
+                .hfilePath(outputDir + "/" + arrowFile.getFileName())
+                .rowKeyRule("ID,0,false,0")
+                .build())))
+        .toList();
 
-List<Future<ConvertResult>> futures = files.stream()
-    .map(arrowFile -> pool.submit(() ->
-        converter.convert(ConvertOptions.builder()
-            .arrowPath(arrowFile.toString())
-            .hfilePath(outputDir + "/" + arrowFile.getFileName())
-            .rowKeyRule("ID,0,false,0")
-            .build())))
-    .toList();
-
-for (Future<ConvertResult> f : futures) {
-    ConvertResult r = f.get();
-    if (!r.isSuccess()) log.error("Failed: {}", r.summary());
-    else                log.info("OK: {}", r.summary());
+    for (Future<ConvertResult> f : futures) {
+        ConvertResult r = f.get();
+        if (!r.isSuccess()) log.error("Failed: {}", r.summary());
+        else                log.info("OK: {}", r.summary());
+    }
 }
+pool.shutdown();
 ```
 
 ---

@@ -117,11 +117,13 @@ struct WriterOptions {
     // ── Resource governance [Production] ──────────────────────────────────
     /// Maximum memory the writer may consume across buffers / AutoSort staging (0 = unlimited).
     size_t       max_memory_bytes  = 0;
-    /// Number of background threads used to compress data blocks.
-    /// 0 = disabled (fully synchronous current behavior).
+    /// Target process-wide shared background compression worker count and this
+    /// writer's maximum submitted compression tasks. Multiple writers using T
+    /// share T workers rather than creating P*T threads. 0 = synchronous.
     uint32_t     compression_threads = 0;
     /// Maximum number of compressed/unwritten data blocks allowed in flight.
-    /// 0 = auto (currently clamp(compression_threads * 4, 4, 64)).
+    /// 0 = auto (currently clamp(compression_threads * 4, 4, 64)); explicit
+    /// values are capped at 4096 to keep untrusted configuration bounded.
     uint32_t     compression_queue_depth = 0;
     /// Minimum free disk space required; writing stops if below this (0 = disabled).
     size_t       min_free_disk_bytes = 512ULL * 1024 * 1024;  // 512 MB

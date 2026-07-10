@@ -2,6 +2,7 @@
 
 #include "block/data_block_encoder.h"
 #include "codec/compressor.h"
+#include "codec/compression_executor.h"
 #include "checksum/crc32c.h"
 #include "index/block_index_writer.h"
 #include "bloom/compound_bloom_filter_writer.h"
@@ -17,7 +18,6 @@
 #include <cstring>
 #include <algorithm>
 #include <condition_variable>
-#include <deque>
 #include <stdexcept>
 #include <filesystem>
 #include <chrono>
@@ -25,8 +25,8 @@
 #include <cstdio>   // stderr logging (no external dep)
 #include <limits>
 #include <mutex>
-#include <optional>
-#include <thread>
+#include <type_traits>
+#include <utility>
 
 #if !defined(_WIN32) && !defined(_WIN64)
 #  include <sys/statvfs.h>
@@ -61,24 +61,69 @@ uint32_t effective_compression_queue_depth(const WriterOptions& opts) noexcept {
     return static_cast<uint32_t>(std::clamp<uint64_t>(target, 4u, 64u));
 }
 
-struct QueuedCompressedBlock {
-    uint64_t sequence{0};
-    size_t uncompressed_size{0};
-    std::vector<uint8_t> raw_payload;
-    std::vector<uint8_t> index_key;
-    size_t ready_bloom_chunk_count{0};
-    uint32_t raw_crc32{0};
-    bool has_raw_crc32{false};
+struct ReusablePipelineBuffer {
+    // bytes.size() is the writable capacity exposed to the codec.  It is kept
+    // at its high-water mark while the buffer is in the writer-local pool so a
+    // later block neither reallocates nor value-initializes it again.
+    memory::AlignedByteBuffer bytes;
     size_t budget_bytes{0};
+
+    ReusablePipelineBuffer() noexcept = default;
+    ReusablePipelineBuffer(const ReusablePipelineBuffer&) = delete;
+    ReusablePipelineBuffer& operator=(const ReusablePipelineBuffer&) = delete;
+
+    ReusablePipelineBuffer(ReusablePipelineBuffer&& other) noexcept
+        : bytes{std::move(other.bytes)},
+          budget_bytes{std::exchange(other.budget_bytes, 0)} {
+        other.reset_unbudgeted();
+    }
+
+    ReusablePipelineBuffer& operator=(
+            ReusablePipelineBuffer&& other) noexcept {
+        if (this != &other) {
+            // Every assignment target is either empty or has first transferred
+            // its ownership to a local discard value. Keep this assertion close
+            // to the ownership primitive so future pool changes cannot silently
+            // leak a MemoryBudget reservation.
+            assert(bytes.empty() && budget_bytes == 0);
+            bytes = std::move(other.bytes);
+            budget_bytes = std::exchange(other.budget_bytes, 0);
+            other.reset_unbudgeted();
+        }
+        return *this;
+    }
+
+    void reset_unbudgeted() noexcept {
+        assert(budget_bytes == 0);
+        memory::AlignedByteBuffer empty;
+        bytes.swap(empty);
+    }
 };
 
-struct ReadyCompressedBlock {
+static_assert(std::is_nothrow_move_constructible_v<ReusablePipelineBuffer>);
+static_assert(std::is_nothrow_move_assignable_v<ReusablePipelineBuffer>);
+
+enum class CompressionSlotState : uint8_t {
+    Free,
+    Pending,
+    Submitted,
+    Ready,
+    Writing,
+};
+
+struct CompressionPipelineSlot {
+    HFileWriterImpl* owner{nullptr};
+    CompressionSlotState state{CompressionSlotState::Free};
     uint64_t sequence{0};
     size_t uncompressed_size{0};
-    std::vector<uint8_t> compressed_payload;
+    size_t compressed_size{0};
+    ReusablePipelineBuffer raw;
+    ReusablePipelineBuffer compressed;
     std::vector<uint8_t> index_key;
     size_t ready_bloom_chunk_count{0};
-    size_t budget_bytes{0};
+    size_t transient_budget_bytes{0};
+    uint32_t raw_crc32{0};
+    bool has_raw_crc32{false};
     std::chrono::nanoseconds compress_ns{0};
     bool success{true};
     std::string error_message;
@@ -313,7 +358,6 @@ public:
             opts_.disk_check_interval_bytes > 0 &&
             opts_.min_free_disk_bytes > 0;
         hotpath_profile_enabled_ = hotpath_profiling_enabled();
-        compression_queue_depth_ = effective_compression_queue_depth(opts_);
     }
 
     /// Destructor: if the writer was opened but finish() never succeeded,
@@ -321,13 +365,7 @@ public:
     ~HFileWriterImpl() {
         shutdown_compression_workers();
         if (opened_ && !finished_) {
-            if (atomic_writer_) {
-                atomic_writer_->abort();   // close + delete temp file
-            } else if (plain_writer_) {
-                plain_writer_->close();
-                std::error_code ec;
-                std::filesystem::remove(path_, ec);
-            }
+            abort_partial_output();
             log::warn("Partial HFile deleted: " + path_);
         }
     }
@@ -355,23 +393,63 @@ public:
             plain_writer_ = io::BlockWriter::open_file(path_);
             writer_ = plain_writer_.get();    // BlockWriter* view
         }
+        if (writer_ == nullptr)
+            return Status::IoError("failed to open HFile output");
+        // From this point every failing initialization path must remove the
+        // opened temp/final file. The implementation destructor performs that
+        // cleanup even when open() returns before full initialization.
+        opened_ = true;
 
-        encoder_    = block::DataBlockEncoder::create(opts_.data_block_encoding,
-                                                      opts_.block_size);
+        const size_t encoder_initial_bytes = opts_.block_size >
+                std::numeric_limits<size_t>::max() - 4096
+            ? opts_.block_size
+            : opts_.block_size + 4096;
+        if (budget_) {
+            auto budget_status = budget_->reserve(encoder_initial_bytes);
+            if (!budget_status.ok()) return budget_status;
+        }
+        try {
+            encoder_ = block::DataBlockEncoder::create(
+                opts_.data_block_encoding, opts_.block_size);
+        } catch (...) {
+            if (budget_) budget_->release(encoder_initial_bytes);
+            return Status::Internal("Data block encoder allocation failed");
+        }
+        if (budget_) {
+            encoder_active_buffer_budget_bytes_ = encoder_initial_bytes;
+        }
         compressor_ = codec::Compressor::create(opts_.compression,
                                                  opts_.compression_level);
         if (opts_.compression != Compression::None &&
             opts_.compression_threads > 0) {
-            compression_threads_ = opts_.compression_threads;
+            const auto& shared_executor = codec::CompressionExecutor::instance();
+            compression_threads_ = std::min(
+                opts_.compression_threads, shared_executor.worker_limit());
+            WriterOptions effective_opts = opts_;
+            effective_opts.compression_threads = compression_threads_;
+            compression_queue_depth_ = effective_compression_queue_depth(effective_opts);
             start_compression_workers();
         }
         const std::string bloom_comparator =
             opts_.bloom_type == BloomType::RowCol
                 ? std::string(kCellComparatorImpl)
                 : std::string();
-        bloom_      = std::make_unique<bloom::CompoundBloomFilterWriter>(
-                          opts_.bloom_type, opts_.bloom_error_rate, 1'000'000,
-                          bloom_comparator);
+        const size_t bloom_budget_bytes =
+            bloom::CompoundBloomFilterWriter::resident_memory_reservation(
+                opts_.bloom_type);
+        if (budget_) {
+            auto bloom_budget_status = budget_->reserve(bloom_budget_bytes);
+            if (!bloom_budget_status.ok()) return bloom_budget_status;
+        }
+        try {
+            bloom_ = std::make_unique<bloom::CompoundBloomFilterWriter>(
+                opts_.bloom_type, opts_.bloom_error_rate, 1'000'000,
+                bloom_comparator);
+        } catch (...) {
+            if (budget_) budget_->release(bloom_budget_bytes);
+            return Status::Internal("Bloom filter allocation failed");
+        }
+        fixed_budget_bytes_ += budget_ ? bloom_budget_bytes : 0;
         std::span<const uint8_t> cf_bytes{
             reinterpret_cast<const uint8_t*>(opts_.column_family.data()),
             opts_.column_family.size()
@@ -380,27 +458,42 @@ public:
         first_kv_in_block_.family.assign(cf_bytes.begin(), cf_bytes.end());
         prev_block_last_kv_.family.assign(cf_bytes.begin(), cf_bytes.end());
 
-        if (!compression_pipeline_enabled()) {
-            compress_buf_.resize(compressor_->max_compressed_size(opts_.block_size + 65536));
+        if (!compression_pipeline_enabled() &&
+            opts_.compression != Compression::None) {
+            const size_t required =
+                compressor_->max_compressed_size(opts_.block_size + 65536);
             if (budget_) {
-                fixed_budget_bytes_ = compress_buf_.size();
-                auto s = budget_->reserve(fixed_budget_bytes_);
+                auto s = budget_->reserve(required);
                 if (!s.ok()) return s;
             }
+            try {
+                compress_buf_.resize(required);
+            } catch (...) {
+                if (budget_) budget_->release(required);
+                return Status::Internal("Compression buffer allocation failed");
+            }
+            fixed_budget_bytes_ = budget_ ? required : 0;
         }
         start_time_ = std::chrono::steady_clock::now();
-        opened_     = true;
 
         log::info("HFile started: path=" + path_ + " cf=" + opts_.column_family);
         if (compression_pipeline_enabled()) {
-            log::info("Compression pipeline enabled: threads=" +
+            const auto& shared_executor = codec::CompressionExecutor::instance();
+            log::info("Compression pipeline enabled: requested_threads=" +
+                      std::to_string(opts_.compression_threads) +
+                      " effective_threads=" +
                       std::to_string(compression_threads_) +
+                      " shared_workers=" +
+                      std::to_string(shared_executor.worker_count()) +
+                      " cpu_limit=" +
+                      std::to_string(shared_executor.worker_limit()) +
                       " queue_depth=" + std::to_string(compression_queue_depth_));
         }
         return Status::OK();
     }
 
     Status append(const KeyValue& kv) {
+        if (!terminal_error_.ok()) return terminal_error_;
         if (finished_)
             return Status::InvalidArg("append() called after finish()");
         // ── Input validation ──────────────────────────────────────────────
@@ -435,8 +528,8 @@ public:
 
         if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
             auto owned = sanitize_owned_kv(kv, opts_);
-            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
-            return Status::OK();
+            return handle_append_status(
+                buffer_auto_sorted_kv(std::move(owned)));
         }
 
         KeyValue effective = kv;
@@ -446,22 +539,23 @@ public:
             effective.memstore_ts = 0;
             effective.has_memstore_ts = false;
         }
-        return append_materialized_kv(
+        return handle_append_status(append_materialized_kv(
             effective, true, true,
             opts_.sort_mode == WriterOptions::SortMode::PreSortedVerified,
             false,
             false,
-            false);
+            false));
     }
 
     Status append_trusted(const KeyValue& kv) {
+        if (!terminal_error_.ok()) return terminal_error_;
         if (finished_)
             return Status::InvalidArg("append() called after finish()");
 
         if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
             auto owned = sanitize_owned_kv(kv, opts_);
-            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
-            return Status::OK();
+            return handle_append_status(
+                buffer_auto_sorted_kv(std::move(owned)));
         }
 
         KeyValue effective = kv;
@@ -471,17 +565,19 @@ public:
             effective.memstore_ts = 0;
             effective.has_memstore_ts = false;
         }
-        return append_materialized_kv(effective, true, true, false, false, false, false);
+        return handle_append_status(
+            append_materialized_kv(effective, true, true, false, false, false, false));
     }
 
     Status append_trusted_new_row(const KeyValue& kv) {
+        if (!terminal_error_.ok()) return terminal_error_;
         if (finished_)
             return Status::InvalidArg("append() called after finish()");
 
         if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
             auto owned = sanitize_owned_kv(kv, opts_);
-            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
-            return Status::OK();
+            return handle_append_status(
+                buffer_auto_sorted_kv(std::move(owned)));
         }
 
         KeyValue effective = kv;
@@ -491,17 +587,19 @@ public:
             effective.memstore_ts = 0;
             effective.has_memstore_ts = false;
         }
-        return append_materialized_kv(effective, true, true, false, false, false, true);
+        return handle_append_status(
+            append_materialized_kv(effective, true, true, false, false, false, true));
     }
 
     Status append_trusted_same_row(const KeyValue& kv) {
+        if (!terminal_error_.ok()) return terminal_error_;
         if (finished_)
             return Status::InvalidArg("append() called after finish()");
 
         if (opts_.sort_mode == WriterOptions::SortMode::AutoSort) {
             auto owned = sanitize_owned_kv(kv, opts_);
-            HFILE_RETURN_IF_ERROR(buffer_auto_sorted_kv(std::move(owned)));
-            return Status::OK();
+            return handle_append_status(
+                buffer_auto_sorted_kv(std::move(owned)));
         }
 
         KeyValue effective = kv;
@@ -511,11 +609,34 @@ public:
             effective.memstore_ts = 0;
             effective.has_memstore_ts = false;
         }
-        return append_materialized_kv(effective, true, true, false, true, true, false);
+        return handle_append_status(
+            append_materialized_kv(effective, true, true, false, true, true, false));
     }
 
     Status finish() {
         if (finished_) return Status::OK();
+        if (!terminal_error_.ok()) return terminal_error_;
+        try {
+            auto status = finish_impl();
+            if (!status.ok()) return enter_terminal_error(std::move(status));
+            return status;
+        } catch (const std::exception& e) {
+            if (finished_) return Status::OK();
+            try {
+                return enter_terminal_error(Status::Internal(
+                    std::string("writer finish failed: ") + e.what()));
+            } catch (...) {
+                return enter_terminal_error(
+                    Status::Internal("writer finish failed"));
+            }
+        } catch (...) {
+            if (finished_) return Status::OK();
+            return enter_terminal_error(
+                Status::Internal("writer finish failed: unknown exception"));
+        }
+    }
+
+    Status finish_impl() {
         // NOTE: do NOT set finished_ = true here.
         // We only set it after all I/O succeeds, so that:
         //   (a) a failed finish() can be detected by the destructor, which
@@ -676,10 +797,64 @@ public:
         stats.leaf_index_block_count = leaf_index_block_count_;
         stats.bloom_chunk_flush_count = bloom_chunk_flush_count_;
         stats.load_on_open_block_count = load_on_open_block_count_;
+        stats.memory_budget_used_bytes = budget_ ? budget_->used() : 0;
+        stats.memory_budget_peak_bytes = budget_ ? budget_->peak() : 0;
         return stats;
     }
 
+    Status fail_append_exception(const char* message) {
+        try {
+            return enter_terminal_error(Status::Internal(
+                std::string("writer append failed: ") +
+                (message != nullptr ? message : "unknown exception")));
+        } catch (...) {
+            return enter_terminal_error(
+                Status::Internal("writer append failed"));
+        }
+    }
+
 private:
+    void abort_partial_output() noexcept {
+        if (output_aborted_ || finished_) return;
+        output_aborted_ = true;
+        try {
+            if (atomic_writer_) {
+                atomic_writer_->abort();
+            } else if (plain_writer_) {
+                (void)plain_writer_->close();
+                std::error_code ec;
+                std::filesystem::remove(path_, ec);
+            }
+        } catch (...) {
+            // Destruction/error handling must never let an exception escape.
+        }
+    }
+
+    Status enter_terminal_error(Status status) {
+        if (terminal_error_.ok()) {
+            terminal_error_ = std::move(status);
+            shutdown_compression_workers();
+            abort_partial_output();
+        }
+        return terminal_error_;
+    }
+
+    Status handle_append_status(Status status) {
+        if (status.ok()) return status;
+        if (status.code() == Status::Code::InvalidArg &&
+            status.message().starts_with("MemoryBudget:")) {
+            return enter_terminal_error(std::move(status));
+        }
+        switch (status.code()) {
+        case Status::Code::IoError:
+        case Status::Code::Corruption:
+        case Status::Code::Internal:
+            return enter_terminal_error(std::move(status));
+        default:
+            return status;
+        }
+    }
+
     bool compression_pipeline_enabled() const noexcept {
         return compression_threads_ > 0;
     }
@@ -693,10 +868,145 @@ private:
             if (reserve_status.ok()) {
                 return Status::OK();
             }
+            // Idle reusable buffers still own quota. Drop them before deciding
+            // that a strict budget cannot make forward progress.
+            reclaim_free_pipeline_buffers();
+            reserve_status = budget_->reserve(bytes);
+            if (reserve_status.ok()) {
+                return Status::OK();
+            }
             if (!compression_pipeline_enabled() || compression_inflight_blocks_ == 0) {
                 return reserve_status;
             }
             HFILE_RETURN_IF_ERROR(drain_one_compressed_block(true));
+        }
+    }
+
+    void release_pipeline_buffer_budget(
+            ReusablePipelineBuffer& buffer) noexcept {
+        if (budget_) budget_->release(buffer.budget_bytes);
+        buffer.budget_bytes = 0;
+    }
+
+    // compression_mu_ must be held. The backing vector is pre-sized once and
+    // never grows, so this function is allocation-free in worker/destructor
+    // paths. When full, retain the larger buffers because they satisfy more
+    // future requests and release the displaced buffer's MemoryBudget quota.
+    void return_pipeline_buffer_locked(
+            ReusablePipelineBuffer buffer) noexcept {
+        if (buffer.bytes.empty()) {
+            release_pipeline_buffer_budget(buffer);
+            return;
+        }
+        if (free_pipeline_buffer_count_ < free_pipeline_buffers_.size()) {
+            free_pipeline_buffers_[free_pipeline_buffer_count_++] =
+                std::move(buffer);
+            return;
+        }
+
+        if (free_pipeline_buffer_count_ == 0) {
+            release_pipeline_buffer_budget(buffer);
+            return;
+        }
+        size_t smallest = 0;
+        for (size_t idx = 1; idx < free_pipeline_buffer_count_; ++idx) {
+            if (free_pipeline_buffers_[idx].bytes.size() <
+                free_pipeline_buffers_[smallest].bytes.size()) {
+                smallest = idx;
+            }
+        }
+        if (buffer.bytes.size() <=
+            free_pipeline_buffers_[smallest].bytes.size()) {
+            release_pipeline_buffer_budget(buffer);
+            return;
+        }
+
+        ReusablePipelineBuffer discarded =
+            std::move(free_pipeline_buffers_[smallest]);
+        free_pipeline_buffers_[smallest] = std::move(buffer);
+        release_pipeline_buffer_budget(discarded);
+    }
+
+    void release_reusable_buffer(ReusablePipelineBuffer buffer) {
+        std::lock_guard<std::mutex> lock(compression_mu_);
+        return_pipeline_buffer_locked(std::move(buffer));
+    }
+
+    void reclaim_free_pipeline_buffers() {
+        std::lock_guard<std::mutex> lock(compression_mu_);
+        for (size_t idx = 0; idx < free_pipeline_buffer_count_; ++idx) {
+            release_pipeline_buffer_budget(free_pipeline_buffers_[idx]);
+            free_pipeline_buffers_[idx].reset_unbudgeted();
+        }
+        free_pipeline_buffer_count_ = 0;
+    }
+
+    Status acquire_pipeline_buffer(size_t required,
+                                   ReusablePipelineBuffer* out) {
+        if (required == 0) {
+            *out = {};
+            return Status::OK();
+        }
+
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(compression_mu_);
+                size_t best = free_pipeline_buffer_count_;
+                size_t best_size = std::numeric_limits<size_t>::max();
+                for (size_t i = 0; i < free_pipeline_buffer_count_; ++i) {
+                    const size_t candidate_size =
+                        free_pipeline_buffers_[i].bytes.size();
+                    if (candidate_size >= required && candidate_size < best_size) {
+                        best = i;
+                        best_size = candidate_size;
+                    }
+                }
+                if (best < free_pipeline_buffer_count_) {
+                    *out = std::move(free_pipeline_buffers_[best]);
+                    --free_pipeline_buffer_count_;
+                    if (best != free_pipeline_buffer_count_) {
+                        free_pipeline_buffers_[best] =
+                            std::move(free_pipeline_buffers_[
+                                free_pipeline_buffer_count_]);
+                    }
+                    free_pipeline_buffers_[free_pipeline_buffer_count_] = {};
+                    return Status::OK();
+                }
+            }
+
+            if (budget_) {
+                auto reserve_status = budget_->reserve(required);
+                if (!reserve_status.ok()) {
+                    // Retained free buffers count against the same strict
+                    // budget.  Drop them before forcing an in-flight block to
+                    // drain; a returned large-enough buffer may avoid any new
+                    // allocation on the next iteration.
+                    reclaim_free_pipeline_buffers();
+                    reserve_status = budget_->reserve(required);
+                }
+                if (!reserve_status.ok()) {
+                    if (!compression_pipeline_enabled() ||
+                        compression_inflight_blocks_ == 0) {
+                        return reserve_status;
+                    }
+                    HFILE_RETURN_IF_ERROR(drain_one_compressed_block(true));
+                    continue;
+                }
+            }
+
+            ReusablePipelineBuffer created;
+            created.budget_bytes = budget_ ? required : 0;
+            try {
+                created.bytes.resize(required);
+            } catch (const std::bad_alloc&) {
+                if (budget_) budget_->release(created.budget_bytes);
+                return Status::Internal("Compression pipeline buffer allocation failed");
+            } catch (...) {
+                if (budget_) budget_->release(created.budget_bytes);
+                return Status::Internal("Compression pipeline buffer allocation failed");
+            }
+            *out = std::move(created);
+            return Status::OK();
         }
     }
 
@@ -717,105 +1027,259 @@ private:
         return Status::OK();
     }
 
-    void compression_worker_loop() {
-        auto local_compressor = codec::Compressor::create(
-            opts_.compression, opts_.compression_level);
-        for (;;) {
-            QueuedCompressedBlock queued;
-            {
-                std::unique_lock<std::mutex> lock(compression_mu_);
-                compression_cv_.wait(lock, [&] {
-                    return compression_stop_requested_ || !compression_pending_blocks_.empty();
-                });
-                if (compression_stop_requested_ && compression_pending_blocks_.empty()) {
-                    return;
-                }
-                queued = std::move(compression_pending_blocks_.front());
-                compression_pending_blocks_.pop_front();
-            }
+    Status ensure_sync_compress_capacity(size_t raw_size) {
+        const size_t required = compressor_->max_compressed_size(raw_size);
+        if (compress_buf_.size() >= required) return Status::OK();
 
-            ReadyCompressedBlock ready;
-            ready.sequence = queued.sequence;
-            ready.uncompressed_size = queued.uncompressed_size;
-            ready.index_key = std::move(queued.index_key);
-            ready.ready_bloom_chunk_count = queued.ready_bloom_chunk_count;
-            ready.budget_bytes = queued.budget_bytes;
-            ready.success = true;
-
-            if (opts_.compression == Compression::None) {
-                ready.compressed_payload = std::move(queued.raw_payload);
-            } else {
-                const auto compress_start = std::chrono::steady_clock::now();
-                ready.compressed_payload.resize(
-                    local_compressor->max_compressed_size(queued.raw_payload.size()));
-                size_t compressed_size = 0;
-                auto compress_status = compress_payload(
-                    *local_compressor,
-                    {queued.raw_payload.data(), queued.raw_payload.size()},
-                    queued.raw_crc32,
-                    queued.has_raw_crc32,
-                    ready.compressed_payload.data(),
-                    ready.compressed_payload.size(),
-                    &compressed_size);
-                ready.compress_ns = std::chrono::steady_clock::now() - compress_start;
-                if (!compress_status.ok()) {
-                    ready.success = false;
-                    ready.error_message = compress_status.message();
-                    ready.compressed_payload.clear();
-                } else {
-                    ready.compressed_payload.resize(compressed_size);
-                }
-            }
-
-            {
-                std::lock_guard<std::mutex> lock(compression_mu_);
-                auto& slot = compression_ready_slots_[
-                    static_cast<size_t>(ready.sequence % compression_ready_slots_.size())];
-                slot.emplace(std::move(ready));
-            }
-            // Only the writer thread consumes ready blocks.
-            compression_ready_cv_.notify_one();
+        const size_t additional = required - compress_buf_.size();
+        if (budget_) {
+            auto reserve_status = budget_->reserve(additional);
+            if (!reserve_status.ok()) return reserve_status;
         }
+        try {
+            compress_buf_.resize(required);
+        } catch (const std::bad_alloc&) {
+            if (budget_) budget_->release(additional);
+            return Status::Internal("Compression buffer allocation failed");
+        } catch (...) {
+            if (budget_) budget_->release(additional);
+            return Status::Internal("Compression buffer allocation failed");
+        }
+        fixed_budget_bytes_ += budget_ ? additional : 0;
+        return Status::OK();
+    }
+
+    Status ensure_encoder_append_capacity(size_t encoded_size) {
+        const size_t current = encoder_->buffer_storage_size();
+        const size_t required =
+            encoder_->required_buffer_storage(encoded_size);
+        if (required <= current) return Status::OK();
+
+        const size_t additional = required - current;
+        if (budget_) {
+            auto reserve_status = budget_->reserve(additional);
+            if (!reserve_status.ok()) return reserve_status;
+        }
+        try {
+            encoder_->resize_buffer_storage(required);
+        } catch (const std::bad_alloc&) {
+            if (budget_) budget_->release(additional);
+            return Status::Internal("Data block encoder buffer allocation failed");
+        } catch (...) {
+            if (budget_) budget_->release(additional);
+            return Status::Internal("Data block encoder buffer allocation failed");
+        }
+        if (budget_) encoder_active_buffer_budget_bytes_ += additional;
+        return Status::OK();
+    }
+
+    static void run_shared_compression_task(
+            void* context,
+            codec::Compressor* compressor) noexcept {
+        auto* slot = static_cast<CompressionPipelineSlot*>(context);
+        slot->owner->compression_task(*slot, compressor);
     }
 
     void start_compression_workers() {
         if (!compression_pipeline_enabled()) {
             return;
         }
-        compression_stop_requested_ = false;
-        compression_ready_slots_.clear();
-        compression_ready_slots_.resize(compression_queue_depth_);
-        compression_workers_.reserve(compression_threads_);
-        for (uint32_t idx = 0; idx < compression_threads_; ++idx) {
-            compression_workers_.emplace_back([this]() {
-                compression_worker_loop();
-            });
+        compression_shutdown_requested_ = false;
+        compression_slots_ = std::make_unique<CompressionPipelineSlot[]>(
+            compression_queue_depth_);
+        pending_compression_slots_.resize(compression_queue_depth_);
+        // Fixed metadata slots make every worker completion allocation-free.
+        // The pool never changes size while compression tasks can reference it.
+        free_pipeline_buffers_.resize(
+            static_cast<size_t>(compression_queue_depth_) * 2u + 2u);
+        free_pipeline_buffer_count_ = 0;
+        for (size_t idx = 0; idx < compression_queue_depth_; ++idx) {
+            compression_slots_[idx].owner = this;
         }
+        codec::CompressionExecutor::instance().ensure_workers(
+            compression_threads_);
     }
 
     void shutdown_compression_workers() noexcept {
-        if (compression_workers_.empty()) {
-            return;
-        }
-        {
+        if (compression_slots_) {
+          {
             std::lock_guard<std::mutex> lock(compression_mu_);
-            compression_stop_requested_ = true;
-        }
-        compression_cv_.notify_all();
-        compression_ready_cv_.notify_all();
-        for (auto& worker : compression_workers_) {
-            if (worker.joinable()) {
-                worker.join();
+            compression_shutdown_requested_ = true;
+
+            // Pending tasks have not escaped this writer and may be discarded
+            // immediately on abort.  Submitted tasks must finish before slot
+            // storage can be destroyed.
+            while (pending_compression_count_ > 0) {
+                const size_t slot_index =
+                    pending_compression_slots_[pending_compression_head_];
+                pending_compression_head_ =
+                    (pending_compression_head_ + 1) % pending_compression_slots_.size();
+                --pending_compression_count_;
+                auto& slot = compression_slots_[slot_index];
+                return_pipeline_buffer_locked(std::move(slot.raw));
+                return_pipeline_buffer_locked(std::move(slot.compressed));
+                if (budget_) budget_->release(slot.transient_budget_bytes);
+                slot.transient_budget_bytes = 0;
+                slot.state = CompressionSlotState::Free;
+                if (compression_inflight_blocks_ > 0) {
+                    --compression_inflight_blocks_;
+                }
             }
+          }
+
+          {
+            std::unique_lock<std::mutex> lock(compression_mu_);
+            compression_state_cv_.wait(lock, [this]() {
+                return compression_submitted_tasks_ == 0;
+            });
+
+            for (size_t idx = 0; idx < compression_queue_depth_; ++idx) {
+                auto& slot = compression_slots_[idx];
+                if (slot.state == CompressionSlotState::Ready) {
+                    // raw is normally returned by compression_task(), but also
+                    // handle submit-failure paths where it never ran.
+                    return_pipeline_buffer_locked(std::move(slot.raw));
+                    return_pipeline_buffer_locked(std::move(slot.compressed));
+                    if (budget_) budget_->release(slot.transient_budget_bytes);
+                    slot.transient_budget_bytes = 0;
+                    slot.index_key = {};
+                    slot.error_message = {};
+                    slot.state = CompressionSlotState::Free;
+                    if (compression_inflight_blocks_ > 0) {
+                        --compression_inflight_blocks_;
+                    }
+                }
+            }
+          }
+
+          reclaim_free_pipeline_buffers();
+          compression_slots_.reset();
+          pending_compression_slots_.clear();
+          free_pipeline_buffers_.clear();
+          free_pipeline_buffer_count_ = 0;
         }
-        compression_workers_.clear();
+        if (budget_ && encoder_active_buffer_budget_bytes_ > 0) {
+            budget_->release(encoder_active_buffer_budget_bytes_);
+        }
+        encoder_active_buffer_budget_bytes_ = 0;
+        // Once finish/terminal shutdown starts, no API path may use the
+        // encoder again. Free it together with its released budget instead of
+        // retaining untracked block storage until the writer object dies.
+        encoder_.reset();
     }
 
-    Status write_ready_data_block(ReadyCompressedBlock ready) {
-        if (!ready.success) {
-            if (budget_ && ready.budget_bytes > 0) {
-                budget_->release(ready.budget_bytes);
+    void compression_task(CompressionPipelineSlot& slot,
+                          codec::Compressor* compressor) noexcept {
+        bool success = true;
+        std::string error_message;
+        size_t compressed_size = 0;
+        std::chrono::nanoseconds compress_ns{0};
+        try {
+            if (compressor == nullptr) {
+                throw std::runtime_error(
+                    "Compression worker codec initialization failed");
             }
+            const auto compress_start = std::chrono::steady_clock::now();
+            auto compress_status = compress_payload(
+                *compressor,
+                {slot.raw.bytes.data(), slot.uncompressed_size},
+                slot.raw_crc32,
+                slot.has_raw_crc32,
+                slot.compressed.bytes.data(),
+                slot.compressed.bytes.size(),
+                &compressed_size);
+            compress_ns = std::chrono::steady_clock::now() - compress_start;
+            if (!compress_status.ok()) {
+                success = false;
+                error_message = compress_status.message();
+            }
+        } catch (const std::exception& e) {
+            success = false;
+            try { error_message = e.what(); } catch (...) {}
+        } catch (...) {
+            success = false;
+            try { error_message = "Compression worker failed"; } catch (...) {}
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(compression_mu_);
+            return_pipeline_buffer_locked(std::move(slot.raw));
+            slot.compressed_size = success ? compressed_size : 0;
+            slot.compress_ns = compress_ns;
+            slot.success = success;
+            slot.error_message = std::move(error_message);
+            slot.state = CompressionSlotState::Ready;
+            if (compression_submitted_tasks_ > 0) {
+                --compression_submitted_tasks_;
+            }
+        }
+        compression_ready_cv_.notify_one();
+        compression_state_cv_.notify_all();
+    }
+
+    void enqueue_pending_compression_slot(size_t slot_index) {
+        std::lock_guard<std::mutex> lock(compression_mu_);
+        const size_t tail = (pending_compression_head_ +
+                             pending_compression_count_) %
+                            pending_compression_slots_.size();
+        pending_compression_slots_[tail] = slot_index;
+        ++pending_compression_count_;
+    }
+
+    void schedule_pending_compression() {
+        for (;;) {
+            CompressionPipelineSlot* slot = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(compression_mu_);
+                if (compression_shutdown_requested_ ||
+                    pending_compression_count_ == 0 ||
+                    compression_submitted_tasks_ >= compression_threads_) {
+                    return;
+                }
+                const size_t slot_index =
+                    pending_compression_slots_[pending_compression_head_];
+                pending_compression_head_ =
+                    (pending_compression_head_ + 1) % pending_compression_slots_.size();
+                --pending_compression_count_;
+                slot = &compression_slots_[slot_index];
+                slot->state = CompressionSlotState::Submitted;
+                ++compression_submitted_tasks_;
+            }
+
+            bool submitted = false;
+            try {
+                submitted = codec::CompressionExecutor::instance().submit({
+                    .run = &HFileWriterImpl::run_shared_compression_task,
+                    .context = slot,
+                    .compression = opts_.compression,
+                    .compression_level = opts_.compression_level,
+                });
+            } catch (...) {
+                // Preserve slot accounting so terminal shutdown cannot wait
+                // forever if mutex/CV infrastructure reports a system error.
+                submitted = false;
+            }
+            if (!submitted) {
+                {
+                    std::lock_guard<std::mutex> lock(compression_mu_);
+                    slot->success = false;
+                    try {
+                        slot->error_message = "Compression executor is shutting down";
+                    } catch (...) {}
+                    slot->state = CompressionSlotState::Ready;
+                    if (compression_submitted_tasks_ > 0) {
+                        --compression_submitted_tasks_;
+                    }
+                }
+                compression_ready_cv_.notify_one();
+                compression_state_cv_.notify_all();
+                return;
+            }
+        }
+    }
+
+    Status write_ready_data_block(CompressionPipelineSlot& ready) {
+        if (!ready.success) {
             return Status::Internal(ready.error_message.empty()
                 ? "Compression worker failed"
                 : ready.error_message);
@@ -827,7 +1291,7 @@ private:
         HFILE_RETURN_IF_ERROR(write_data_block(
             ready.uncompressed_size,
             ready.index_key,
-            {ready.compressed_payload.data(), ready.compressed_payload.size()},
+            {ready.compressed.bytes.data(), ready.compressed_size},
             block_offset));
         stats_.data_block_write_ns += std::chrono::steady_clock::now() - block_write_start;
         if (should_flush_pending_leaf_index()) {
@@ -847,12 +1311,6 @@ private:
             (data_block_count_ % opts_.fsync_block_interval) == 0) {
             HFILE_RETURN_IF_ERROR(writer_->flush());
         }
-        if (budget_ && ready.budget_bytes > 0) {
-            budget_->release(ready.budget_bytes);
-        }
-        if (compression_inflight_blocks_ > 0) {
-            --compression_inflight_blocks_;
-        }
         return Status::OK();
     }
 
@@ -861,30 +1319,48 @@ private:
             return Status::OK();
         }
 
-        ReadyCompressedBlock ready;
+        schedule_pending_compression();
+
+        CompressionPipelineSlot* ready = nullptr;
         {
             std::unique_lock<std::mutex> lock(compression_mu_);
             auto next_ready = [&]() {
-                const auto& slot = compression_ready_slots_[
-                    static_cast<size_t>(
-                        next_write_block_sequence_ % compression_ready_slots_.size())];
-                return slot.has_value() &&
-                       slot->sequence == next_write_block_sequence_;
+                const auto& slot = compression_slots_[static_cast<size_t>(
+                    next_write_block_sequence_ % compression_queue_depth_)];
+                return slot.state == CompressionSlotState::Ready &&
+                       slot.sequence == next_write_block_sequence_;
             };
             if (wait) {
                 compression_ready_cv_.wait(lock, next_ready);
             } else if (!next_ready()) {
                 return Status::OK();
             }
-            auto& slot = compression_ready_slots_[
-                static_cast<size_t>(
-                    next_write_block_sequence_ % compression_ready_slots_.size())];
-            ready = std::move(*slot);
-            slot.reset();
+            ready = &compression_slots_[static_cast<size_t>(
+                next_write_block_sequence_ % compression_queue_depth_)];
+            ready->state = CompressionSlotState::Writing;
         }
 
-        HFILE_RETURN_IF_ERROR(write_ready_data_block(std::move(ready)));
+        Status write_status = write_ready_data_block(*ready);
+        const size_t transient_budget_bytes = ready->transient_budget_bytes;
+        {
+            std::lock_guard<std::mutex> lock(compression_mu_);
+            return_pipeline_buffer_locked(std::move(ready->raw));
+            return_pipeline_buffer_locked(std::move(ready->compressed));
+            ready->index_key = {};
+            ready->error_message = {};
+            ready->transient_budget_bytes = 0;
+            ready->compressed_size = 0;
+            ready->state = CompressionSlotState::Free;
+            if (compression_inflight_blocks_ > 0) {
+                --compression_inflight_blocks_;
+            }
+        }
+        if (budget_) budget_->release(transient_budget_bytes);
+        compression_state_cv_.notify_all();
+
+        if (!write_status.ok()) return write_status;
         ++next_write_block_sequence_;
+        schedule_pending_compression();
         return Status::OK();
     }
 
@@ -926,6 +1402,7 @@ private:
             size_t comp_len = raw.size();
             std::span<const uint8_t> compressed = raw;
             if (opts_.compression != Compression::None) {
+                HFILE_RETURN_IF_ERROR(ensure_sync_compress_capacity(raw.size()));
                 const auto compress_start = std::chrono::steady_clock::now();
                 HFILE_RETURN_IF_ERROR(compress_payload(
                     *compressor_,
@@ -962,36 +1439,69 @@ private:
             return Status::OK();
         }
 
-        const size_t estimated_budget_bytes =
-            raw.size() +
-            compressor_->max_compressed_size(raw.size()) +
-            index_key.size() +
-            sizeof(QueuedCompressedBlock) +
-            sizeof(ReadyCompressedBlock);
-        HFILE_RETURN_IF_ERROR(reserve_pipeline_budget(estimated_budget_bytes));
+        const size_t raw_size = raw.size();
+        const size_t transient_budget_bytes = index_key.size();
+        HFILE_RETURN_IF_ERROR(
+            reserve_pipeline_budget(transient_budget_bytes));
 
-        QueuedCompressedBlock queued;
-        queued.sequence = next_queue_block_sequence_++;
-        queued.uncompressed_size = raw.size();
-        queued.raw_payload.assign(raw.begin(), raw.end());
-        queued.index_key = std::move(index_key);
-        queued.ready_bloom_chunk_count = ready_bloom_chunk_count;
-        queued.raw_crc32 = raw_crc32;
-        queued.has_raw_crc32 = has_raw_crc32;
-        queued.budget_bytes = estimated_budget_bytes;
+        ReusablePipelineBuffer replacement_raw;
+        ReusablePipelineBuffer compressed_buffer;
+        const size_t replacement_raw_size = opts_.block_size >
+                std::numeric_limits<size_t>::max() - 4096
+            ? opts_.block_size
+            : opts_.block_size + 4096;
+        auto replacement_status = acquire_pipeline_buffer(
+            replacement_raw_size, &replacement_raw);
+        if (!replacement_status.ok()) {
+            if (budget_) budget_->release(transient_budget_bytes);
+            return replacement_status;
+        }
+        auto compressed_status = acquire_pipeline_buffer(
+            compressor_->max_compressed_size(raw_size), &compressed_buffer);
+        if (!compressed_status.ok()) {
+            release_reusable_buffer(std::move(replacement_raw));
+            if (budget_) budget_->release(transient_budget_bytes);
+            return compressed_status;
+        }
+
+        const uint64_t sequence = next_queue_block_sequence_++;
+        const size_t slot_index = static_cast<size_t>(
+            sequence % compression_queue_depth_);
+        auto& slot = compression_slots_[slot_index];
+        assert(slot.state == CompressionSlotState::Free);
+
+        const size_t finished_buffer_budget_bytes =
+            encoder_active_buffer_budget_bytes_;
+        const size_t replacement_buffer_budget_bytes =
+            std::exchange(replacement_raw.budget_bytes, 0);
+        auto finished_storage = encoder_->take_finished_buffer(
+            std::move(replacement_raw.bytes));
+        encoder_active_buffer_budget_bytes_ =
+            replacement_buffer_budget_bytes;
+
+        slot.sequence = sequence;
+        slot.uncompressed_size = raw_size;
+        slot.compressed_size = 0;
+        slot.raw.bytes = std::move(finished_storage);
+        slot.raw.budget_bytes = finished_buffer_budget_bytes;
+        slot.compressed = std::move(compressed_buffer);
+        slot.index_key = std::move(index_key);
+        slot.ready_bloom_chunk_count = ready_bloom_chunk_count;
+        slot.raw_crc32 = raw_crc32;
+        slot.has_raw_crc32 = has_raw_crc32;
+        slot.transient_budget_bytes = transient_budget_bytes;
+        slot.compress_ns = {};
+        slot.success = true;
+        slot.error_message.clear();
+        slot.state = CompressionSlotState::Pending;
         reserved_ready_bloom_chunks_ += ready_bloom_chunk_count;
 
         copy_key_only_same_family(last_kv_.as_view(), &prev_block_last_kv_);
         has_prev_block_last_kv_ = true;
         has_first_kv_in_block_ = false;
-        encoder_->reset();
-
-        {
-            std::lock_guard<std::mutex> lock(compression_mu_);
-            compression_pending_blocks_.push_back(std::move(queued));
-            ++compression_inflight_blocks_;
-        }
-        compression_cv_.notify_one();
+        enqueue_pending_compression_slot(slot_index);
+        ++compression_inflight_blocks_;
+        schedule_pending_compression();
 
         while (compression_inflight_blocks_ >= compression_queue_depth_) {
             HFILE_RETURN_IF_ERROR(drain_one_compressed_block(true));
@@ -1440,6 +1950,8 @@ private:
             HFILE_RETURN_IF_ERROR(flush_data_block());
         }
 
+        HFILE_RETURN_IF_ERROR(ensure_encoder_append_capacity(encoded_size));
+
         if (encoder_->empty()) {
             copy_key_only_same_family(kv, &first_kv_in_block_);
             has_first_kv_in_block_ = true;
@@ -1470,10 +1982,8 @@ private:
             }
         } else if (opts_.bloom_type == BloomType::RowCol) {
             bloom_->add_row_col(kv.row, kv.qualifier);
-            last_bloom_key_.resize(kv.row.size() + kv.qualifier.size());
-            std::memcpy(last_bloom_key_.data(), kv.row.data(), kv.row.size());
-            std::memcpy(last_bloom_key_.data() + kv.row.size(),
-                        kv.qualifier.data(), kv.qualifier.size());
+            bloom::serialize_row_col_bloom_key(
+                kv.row, kv.qualifier, &last_bloom_key_);
         } else {
             last_bloom_key_.clear();
         }
@@ -1538,7 +2048,7 @@ private:
     std::unique_ptr<codec::Compressor>          compressor_;
     std::unique_ptr<bloom::CompoundBloomFilterWriter> bloom_;
 
-    std::vector<uint8_t>   compress_buf_;
+    memory::AlignedByteBuffer compress_buf_;
     std::vector<uint8_t>   checksum_buf_;
     std::vector<uint8_t>   last_key_;
     std::vector<uint8_t>   last_bloom_key_;
@@ -1562,14 +2072,19 @@ private:
     uint64_t next_queue_block_sequence_{0};
     uint64_t next_write_block_sequence_{0};
     uint64_t compression_inflight_blocks_{0};
+    uint64_t compression_submitted_tasks_{0};
     size_t reserved_ready_bloom_chunks_{0};
     std::mutex compression_mu_;
-    std::condition_variable compression_cv_;
     std::condition_variable compression_ready_cv_;
-    std::deque<QueuedCompressedBlock> compression_pending_blocks_;
-    std::vector<std::optional<ReadyCompressedBlock>> compression_ready_slots_;
-    std::vector<std::thread> compression_workers_;
-    bool compression_stop_requested_{false};
+    std::condition_variable compression_state_cv_;
+    std::unique_ptr<CompressionPipelineSlot[]> compression_slots_;
+    std::vector<size_t> pending_compression_slots_;
+    size_t pending_compression_head_{0};
+    size_t pending_compression_count_{0};
+    std::vector<ReusablePipelineBuffer> free_pipeline_buffers_;
+    size_t free_pipeline_buffer_count_{0};
+    size_t encoder_active_buffer_budget_bytes_{0};
+    bool compression_shutdown_requested_{false};
 
     // ── Statistics ────────────────────────────────────────────────────────────
     uint64_t entry_count_            = 0;
@@ -1607,8 +2122,10 @@ private:
     std::chrono::nanoseconds append_bookkeeping_ns_{0};
     WriterStats stats_;
     std::chrono::steady_clock::time_point start_time_;
+    Status   terminal_error_;
     bool     opened_   = false;
     bool     finished_ = false;
+    bool     output_aborted_ = false;
     bool     last_key_dirty_ = false;
     bool     disk_check_enabled_ = false;
     bool     hotpath_profile_enabled_ = false;
@@ -1624,19 +2141,43 @@ HFileWriter::HFileWriter(HFileWriter&&) noexcept = default;
 HFileWriter& HFileWriter::operator=(HFileWriter&&) noexcept = default;
 
 Status HFileWriter::append(const KeyValue& kv) {
-    return impl_->append(kv);
+    try {
+        return impl_->append(kv);
+    } catch (const std::exception& e) {
+        return impl_->fail_append_exception(e.what());
+    } catch (...) {
+        return impl_->fail_append_exception(nullptr);
+    }
 }
 
 Status HFileWriter::append_trusted(const KeyValue& kv) {
-    return impl_->append_trusted(kv);
+    try {
+        return impl_->append_trusted(kv);
+    } catch (const std::exception& e) {
+        return impl_->fail_append_exception(e.what());
+    } catch (...) {
+        return impl_->fail_append_exception(nullptr);
+    }
 }
 
 Status HFileWriter::append_trusted_new_row(const KeyValue& kv) {
-    return impl_->append_trusted_new_row(kv);
+    try {
+        return impl_->append_trusted_new_row(kv);
+    } catch (const std::exception& e) {
+        return impl_->fail_append_exception(e.what());
+    } catch (...) {
+        return impl_->fail_append_exception(nullptr);
+    }
 }
 
 Status HFileWriter::append_trusted_same_row(const KeyValue& kv) {
-    return impl_->append_trusted_same_row(kv);
+    try {
+        return impl_->append_trusted_same_row(kv);
+    } catch (const std::exception& e) {
+        return impl_->fail_append_exception(e.what());
+    } catch (...) {
+        return impl_->fail_append_exception(nullptr);
+    }
 }
 
 Status HFileWriter::append(std::span<const uint8_t> row,
@@ -1656,7 +2197,7 @@ Status HFileWriter::append(std::span<const uint8_t> row,
     kv.value      = value;
     kv.tags       = tags;
     kv.memstore_ts = memstore_ts;
-    return impl_->append(kv);
+    return append(kv);
 }
 
 Status HFileWriter::append_trusted(std::span<const uint8_t> row,
@@ -1676,7 +2217,7 @@ Status HFileWriter::append_trusted(std::span<const uint8_t> row,
     kv.value      = value;
     kv.tags       = tags;
     kv.memstore_ts = memstore_ts;
-    return impl_->append_trusted(kv);
+    return append_trusted(kv);
 }
 
 Status HFileWriter::append_trusted_new_row(std::span<const uint8_t> row,
@@ -1696,7 +2237,7 @@ Status HFileWriter::append_trusted_new_row(std::span<const uint8_t> row,
     kv.value      = value;
     kv.tags       = tags;
     kv.memstore_ts = memstore_ts;
-    return impl_->append_trusted_new_row(kv);
+    return append_trusted_new_row(kv);
 }
 
 Status HFileWriter::append_trusted_same_row(std::span<const uint8_t> row,
@@ -1716,7 +2257,7 @@ Status HFileWriter::append_trusted_same_row(std::span<const uint8_t> row,
     kv.value      = value;
     kv.tags       = tags;
     kv.memstore_ts = memstore_ts;
-    return impl_->append_trusted_same_row(kv);
+    return append_trusted_same_row(kv);
 }
 
 Status HFileWriter::finish() {
@@ -1806,7 +2347,9 @@ HFileWriter::Builder& HFileWriter::Builder::set_max_open_files(int n) {
     opts_.max_open_files = n; return *this;
 }
 
-std::pair<std::unique_ptr<HFileWriter>, Status> HFileWriter::Builder::build() {
+std::pair<std::unique_ptr<HFileWriter>, Status> HFileWriter::Builder::build(
+        WriterStats* failure_stats) {
+    if (failure_stats != nullptr) *failure_stats = {};
     if (path_.empty())
         return {nullptr, Status::InvalidArg("path must be set")};
     if (opts_.column_family.empty())
@@ -1815,20 +2358,38 @@ std::pair<std::unique_ptr<HFileWriter>, Status> HFileWriter::Builder::build() {
         opts_.compression != Compression::GZip) {
         return {nullptr, Status::InvalidArg("only compression=NONE or GZ is supported")};
     }
+    if (opts_.compression == Compression::GZip &&
+        (opts_.compression_level < 0 || opts_.compression_level > 9)) {
+        return {nullptr,
+                Status::InvalidArg("compression_level must be 0-9")};
+    }
     if (opts_.data_block_encoding != Encoding::None) {
         return {nullptr, Status::InvalidArg("only data_block_encoding=NONE is supported")};
     }
+    if (opts_.compression_queue_depth > 4096) {
+        return {nullptr,
+                Status::InvalidArg(
+                    "compression_queue_depth must be <= 4096")};
+    }
 
+    std::unique_ptr<HFileWriterImpl> impl;
     try {
-        auto impl = std::make_unique<HFileWriterImpl>(path_, opts_);
+        impl = std::make_unique<HFileWriterImpl>(path_, opts_);
         Status s  = impl->open();
-        if (!s.ok()) return {nullptr, s};
+        if (!s.ok()) {
+            if (failure_stats != nullptr) *failure_stats = impl->stats();
+            return {nullptr, s};
+        }
 
         return {std::unique_ptr<HFileWriter>(new HFileWriter(std::move(impl))),
                 Status::OK()};
     } catch (const std::exception& e) {
+        if (failure_stats != nullptr && impl != nullptr)
+            *failure_stats = impl->stats();
         return {nullptr, Status::Internal(std::string("writer build failed: ") + e.what())};
     } catch (...) {
+        if (failure_stats != nullptr && impl != nullptr)
+            *failure_stats = impl->stats();
         return {nullptr, Status::Internal("writer build failed: unknown exception")};
     }
 }

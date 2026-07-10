@@ -59,6 +59,51 @@ TEST(BloomFilter, MurmurHash) {
     // Different seeds → different hashes
     uint32_t h3 = static_cast<uint32_t>(murmur_hash(data, 3, 1));
     EXPECT_NE(h1, h3);
+    EXPECT_EQ(h1, 0x3aa63325u);
+
+    const auto row = make_key("row_0");
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(row.data(), row.size(), 0)),
+              0xb06bb73au);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(
+                  row.data(), row.size(), -123456789)),
+              0x3ad85e04u);
+
+    // HBase HashKey.get() returns a signed Java byte.  Tail bytes are not
+    // masked in MurmurHash.java, so these vectors catch zero-extension bugs.
+    const uint8_t high_tail[] = {0x80};
+    const int32_t high_h1 = murmur_hash(high_tail, 1, 0);
+    EXPECT_EQ(static_cast<uint32_t>(high_h1), 0xfdab6e14u);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(high_tail, 1, high_h1)),
+              0x97cfe73au);
+
+    const uint8_t utf8_e_acute[] = {0xc3, 0xa9};
+    const int32_t utf8_h1 = murmur_hash(utf8_e_acute, 2, 0);
+    EXPECT_EQ(static_cast<uint32_t>(utf8_h1), 0x20a5a987u);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(
+                  utf8_e_acute, 2, utf8_h1)),
+              0x47b788b2u);
+}
+
+TEST(BloomFilter, RowColHashMatchesHBaseLogicalKey) {
+    const auto row = make_key("row");
+    const auto qualifier = make_key("q");
+    const int32_t h1 = murmur_hash_row_col(row, qualifier, 0);
+    EXPECT_EQ(static_cast<uint32_t>(h1), 0x9350b067u);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash_row_col(row, qualifier, h1)),
+              0xf1a34ec0u);
+
+    std::vector<uint8_t> logical_key;
+    serialize_row_col_bloom_key(row, qualifier, &logical_key);
+    const std::vector<uint8_t> expected = {
+        0x00, 0x03, 'r', 'o', 'w', 0x00, 'q',
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    EXPECT_EQ(logical_key, expected);
+
+    CompoundBloomFilterWriter writer(BloomType::RowCol, 0.01, 10);
+    writer.add_row_col(row, qualifier);
+    std::vector<uint8_t> out;
+    auto result = writer.finish(out, 0);
+    EXPECT_TRUE(result.enabled);
 }
 
 TEST(BloomFilter, ChunkBoundary) {

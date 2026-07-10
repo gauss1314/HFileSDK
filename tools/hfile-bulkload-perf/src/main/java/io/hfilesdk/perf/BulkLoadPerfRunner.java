@@ -29,6 +29,9 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -56,6 +59,8 @@ public final class BulkLoadPerfRunner {
     private static final String STRATEGY_DIRECT = "DIRECT-CONVERT";
     private static final String STRATEGY_PARALLEL = "PARALLEL-CONVERT";
     private static final String STRATEGY_MERGE = "MERGE-THEN-CONVERT";
+    private static final String OUTPUT_LAYOUT_ONE_TO_ONE = "ONE-HFILE-PER-INPUT";
+    private static final String OUTPUT_LAYOUT_MERGED = "MERGED-INPUTS";
     private static final long PROCESS_SAMPLE_INTERVAL_MS = 50L;
     private static final long FALLBACK_CLK_TCK = 100L;
 
@@ -129,7 +134,7 @@ public final class BulkLoadPerfRunner {
         options.addOption(Option.builder().longOpt("implementations").hasArg().argName("LIST").desc("实现列表：arrow-to-hfile,arrow-to-hfile-java").build());
         options.addOption(Option.builder().longOpt("scenario-filter").hasArg().argName("TEXT").desc("按场景 ID 过滤执行").build());
         options.addOption(Option.builder().longOpt("iterations").hasArg().argName("N").desc("固定为 3").build());
-        options.addOption(Option.builder().longOpt("parallelism").hasArg().argName("N").desc("JNI 目录场景的 worker 内并行转换线程数；不同实现/轮次仍由父进程串行调度").build());
+        options.addOption(Option.builder().longOpt("parallelism").hasArg().argName("N").desc("目录场景中 JNI 与纯 Java worker 使用的相同有界并行转换线程数；不同实现/轮次仍由父进程串行调度").build());
         options.addOption(Option.builder().longOpt("merge-threshold").hasArg().argName("MB").desc("JNI 小文件合并阈值").build());
         options.addOption(Option.builder().longOpt("trigger-size").hasArg().argName("MB").desc("JNI 合并攒批大小阈值").build());
         options.addOption(Option.builder().longOpt("trigger-count").hasArg().argName("N").desc("JNI 合并攒批文件数阈值").build());
@@ -500,6 +505,7 @@ public final class BulkLoadPerfRunner {
 
         long start = System.nanoTime();
         String strategy = decideStrategy(arrowFiles, config.mergeThresholdMb());
+        int workerParallelism = Math.min(config.parallelism(), arrowFiles.size());
         BatchConvertOptions options = BatchConvertOptions.builder()
             .arrowFiles(arrowFiles)
             .hfileDir(hfileDir)
@@ -518,7 +524,7 @@ public final class BulkLoadPerfRunner {
             .numericSortFastPath(config.jniSdkNumericSortFastPath())
             // Preserve JNI directory-conversion semantics: a worker may still
             // convert multiple Arrow files according to the configured parallelism.
-            .parallelism(config.parallelism())
+            .parallelism(workerParallelism)
             .nativeLibPath(config.nativeLib())
             .build();
         AdaptiveBatchConverter.Policy policy = AdaptiveBatchConverter.Policy.builder()
@@ -549,7 +555,7 @@ public final class BulkLoadPerfRunner {
             batchResult.totalHfileSizeBytes,
             batchResult.totalKvWritten,
             batchResult.results.size(),
-            config.parallelism(),
+            workerParallelism,
             sdkBudgetBytes,
             sdkPeakBytes,
             config.jniSdkNumericSortFastPath(),
@@ -567,8 +573,10 @@ public final class BulkLoadPerfRunner {
         String hfileName = fileName.endsWith(".arrow") ? fileName.substring(0, fileName.length() - 6) + ".hfile" : fileName + ".hfile";
         Path hfilePath = hfileDir.resolve(hfileName);
         long start = System.nanoTime();
-        ConvertResult result = new ArrowToHFileConverter(config.nativeLib()).convert(
-            ConvertOptions.builder()
+        ConvertResult result;
+        try (ArrowToHFileConverter converter =
+                 new ArrowToHFileConverter(config.nativeLib())) {
+            result = converter.convert(ConvertOptions.builder()
                 .arrowPath(arrowFile.toString())
                 .hfilePath(hfilePath.toString())
                 .tableName(config.tableName())
@@ -585,8 +593,8 @@ public final class BulkLoadPerfRunner {
                 .compressionQueueDepth(Math.toIntExact(config.jniSdkCompressionQueueDepth()))
                 .numericSortFastPath(config.jniSdkNumericSortFastPath())
                 .nativeLibPath(config.nativeLib())
-                .build()
-        );
+                .build());
+        }
         String detailJson = "{"
             + "\"source\":\"" + jsonEscape(arrowFile.toString()) + "\","
             + "\"error_code\":" + result.errorCode + ","
@@ -610,7 +618,7 @@ public final class BulkLoadPerfRunner {
             result.hfileSizeBytes,
             result.kvWrittenCount,
             result.isSuccess() ? 1 : 0,
-            config.parallelism(),
+            1,
             result.memoryBudgetBytes,
             result.trackedMemoryPeakBytes,
             result.numericSortFastPathMode,
@@ -625,51 +633,66 @@ public final class BulkLoadPerfRunner {
                                                        int iterationIndex) throws Exception {
         Path hfileDir = iterationDir.resolve(config.columnFamily());
         Files.createDirectories(hfileDir);
-        ArrowToHFileJavaConverter converter = new ArrowToHFileJavaConverter();
         long start = System.nanoTime();
         long totalSize = 0L;
         long totalKvWritten = 0L;
         List<String> resultJsons = new ArrayList<>();
+        int workerParallelism = Math.min(config.parallelism(), arrowFiles.size());
+        String strategy = arrowFiles.size() == 1 ? STRATEGY_DIRECT : STRATEGY_PARALLEL;
 
-        for (Path arrowFile : arrowFiles) {
-            String fileName = arrowFile.getFileName().toString();
-            String hfileName = fileName.endsWith(".arrow") ? fileName.substring(0, fileName.length() - 6) + ".hfile" : fileName + ".hfile";
-            Path hfilePath = hfileDir.resolve(hfileName);
-            JavaConvertResult result = converter.convert(
-                JavaConvertOptions.builder()
-                    .arrowPath(arrowFile.toString())
-                    .hfilePath(hfilePath.toString())
-                    .tableName(config.tableName())
-                    .rowKeyRule(config.rowKeyRule())
-                    .columnFamily(config.columnFamily())
-                    .compression(config.compression())
-                    .dataBlockEncoding(config.encoding())
-                    .bloomType(config.bloom())
-                    .blockSize(config.blockSize())
-                    .defaultTimestampMs(config.defaultTimestampMs())
-                    .build()
-            );
+        // Match the JNI one-HFile-per-input execution model. Each task owns a
+        // converter instance, while results are collected in input order so the
+        // report remains deterministic regardless of completion order.
+        List<JavaConvertResult> results = new ArrayList<>(arrowFiles.size());
+        if (workerParallelism == 1) {
+            for (Path arrowFile : arrowFiles) {
+                results.add(convertJavaFile(config, arrowFile, hfileDir));
+            }
+        } else {
+            try (ExecutorService executor = Executors.newFixedThreadPool(workerParallelism)) {
+                List<Future<JavaConvertResult>> futures = new ArrayList<>(arrowFiles.size());
+                for (Path arrowFile : arrowFiles) {
+                    futures.add(executor.submit(
+                        () -> convertJavaFile(config, arrowFile, hfileDir)));
+                }
+                for (Future<JavaConvertResult> future : futures) {
+                    results.add(future.get());
+                }
+            }
+        }
+
+        int successfulHfiles = 0;
+        String firstError = "";
+        for (JavaConvertResult result : results) {
             resultJsons.add(result.toJson());
             if (!result.isSuccess()) {
-                return WorkerResult.failure(
-                    IMPL_JAVA,
-                    iterationIndex,
-                    result.errorMessage,
-                    STRATEGY_DIRECT,
-                    nanosToMillis(System.nanoTime() - start),
-                    totalSize,
-                    totalKvWritten,
-                    resultJsons.size(),
-                    1,
-                    0L,
-                    0L,
-                    "off",
-                    false,
-                    "[" + String.join(",", resultJsons) + "]"
-                );
+                if (firstError.isEmpty()) {
+                    firstError = result.errorMessage;
+                }
+                continue;
             }
             totalSize += result.hfileSizeBytes;
             totalKvWritten += result.kvWrittenCount;
+            successfulHfiles++;
+        }
+
+        if (!firstError.isEmpty()) {
+            return WorkerResult.failure(
+                IMPL_JAVA,
+                iterationIndex,
+                firstError,
+                strategy,
+                nanosToMillis(System.nanoTime() - start),
+                totalSize,
+                totalKvWritten,
+                successfulHfiles,
+                workerParallelism,
+                0L,
+                0L,
+                "off",
+                false,
+                "[" + String.join(",", resultJsons) + "]"
+            );
         }
 
         return new WorkerResult(
@@ -677,18 +700,41 @@ public final class BulkLoadPerfRunner {
             IMPL_JAVA,
             true,
             "",
-            STRATEGY_DIRECT,
+            strategy,
             nanosToMillis(System.nanoTime() - start),
             totalSize,
             totalKvWritten,
             arrowFiles.size(),
-            1,
+            workerParallelism,
             0L,
             0L,
             "off",
             false,
             "[" + String.join(",", resultJsons) + "]"
         );
+    }
+
+    private static JavaConvertResult convertJavaFile(RunConfig config,
+                                                     Path arrowFile,
+                                                     Path hfileDir) {
+        String fileName = arrowFile.getFileName().toString();
+        String hfileName = fileName.endsWith(".arrow")
+            ? fileName.substring(0, fileName.length() - 6) + ".hfile"
+            : fileName + ".hfile";
+        Path hfilePath = hfileDir.resolve(hfileName);
+        return new ArrowToHFileJavaConverter().convert(
+            JavaConvertOptions.builder()
+                .arrowPath(arrowFile.toString())
+                .hfilePath(hfilePath.toString())
+                .tableName(config.tableName())
+                .rowKeyRule(config.rowKeyRule())
+                .columnFamily(config.columnFamily())
+                .compression(config.compression())
+                .dataBlockEncoding(config.encoding())
+                .bloomType(config.bloom())
+                .blockSize(config.blockSize())
+                .defaultTimestampMs(config.defaultTimestampMs())
+                .build());
     }
 
     private static List<String> buildWorkerJavaCommand(RunConfig config,
@@ -1050,9 +1096,25 @@ public final class BulkLoadPerfRunner {
         System.out.println("  generate_ms         : " + nanosToMillis(report.generation().elapsedNanos()));
         for (ImplementationSummary implementation : report.implementations()) {
             System.out.println("  implementation      : " + implementation.implementation());
+            System.out.println("    strategy          : " + implementation.strategy());
+            System.out.println("    worker_parallelism: " + implementation.workerParallelism());
+            System.out.println("    output_layout     : " + implementation.outputLayout());
+            System.out.println("    hfile_count       : " + implementation.hfileCount());
+            System.out.println("    kv_written_count  : " + implementation.kvWrittenCount());
+            System.out.println("    output_consistent : " + implementation.iterationOutputConsistent());
             System.out.println("    average_ms        : " + formatDouble(implementation.averageMillis()));
             System.out.println("    iteration_ms      : " + implementation.iterationMillisJson());
             System.out.println("    max_peak_rss_mb   : " + formatMiB(implementation.maxProcessPeakRssBytes()));
+        }
+        ComparisonValidity comparison = report.comparisonValidity();
+        if (comparison.evaluated()) {
+            System.out.println("  comparison_valid    : " + comparison.valid());
+            System.out.println("  comparison_note     : " + comparison.note());
+            if (comparison.valid()) {
+                System.out.println("  java_over_jni       : " + formatDouble(comparison.javaOverJniSpeedup()) + "x");
+            } else {
+                System.out.println("  WARNING             : timings are not an implementation speedup comparison");
+            }
         }
     }
 
@@ -1079,6 +1141,17 @@ public final class BulkLoadPerfRunner {
         long averageBytes = totalBytes / Math.max(1, arrowFiles.size());
         long thresholdBytes = mergeThresholdMb * 1024L * 1024L;
         return averageBytes < thresholdBytes ? STRATEGY_MERGE : STRATEGY_PARALLEL;
+    }
+
+    static String outputLayoutForStrategy(String strategy) {
+        return STRATEGY_MERGE.equals(strategy) ? OUTPUT_LAYOUT_MERGED : OUTPUT_LAYOUT_ONE_TO_ONE;
+    }
+
+    static boolean executionStrategyMatches(String leftStrategy,
+                                            int leftParallelism,
+                                            String rightStrategy,
+                                            int rightParallelism) {
+        return leftStrategy.equals(rightStrategy) && leftParallelism == rightParallelism;
     }
 
     private static String batchConvertResultToJson(String strategy, BatchConvertResult batchResult) {
@@ -1529,10 +1602,56 @@ public final class BulkLoadPerfRunner {
                 .collect(Collectors.joining(",", "[", "]"));
         }
 
+        private String strategy() {
+            return iterationResults.stream()
+                .map(IterationResult::strategy)
+                .distinct()
+                .collect(Collectors.joining(",", "", ""));
+        }
+
+        private String outputLayout() {
+            return iterationResults.stream()
+                .map(result -> outputLayoutForStrategy(result.strategy()))
+                .distinct()
+                .collect(Collectors.joining(",", "", ""));
+        }
+
+        private int hfileCount() {
+            return iterationResults.isEmpty() ? 0 : iterationResults.getFirst().hfileCount();
+        }
+
+        private long kvWrittenCount() {
+            return iterationResults.isEmpty() ? 0L : iterationResults.getFirst().kvWrittenCount();
+        }
+
+        private int workerParallelism() {
+            return iterationResults.isEmpty() ? 0 : iterationResults.getFirst().workerParallelism();
+        }
+
+        private boolean iterationOutputConsistent() {
+            if (iterationResults.isEmpty()) {
+                return false;
+            }
+            final IterationResult first = iterationResults.getFirst();
+            return iterationResults.stream().allMatch(result ->
+                result.success()
+                    && result.strategy().equals(first.strategy())
+                    && result.workerParallelism() == first.workerParallelism()
+                    && result.hfileCount() == first.hfileCount()
+                    && result.kvWrittenCount() == first.kvWrittenCount());
+        }
+
         private String toJson() {
             StringBuilder builder = new StringBuilder();
             builder.append("{");
             builder.append("\"implementation\":\"").append(jsonEscape(implementation)).append("\",");
+            builder.append("\"strategy\":\"").append(jsonEscape(strategy())).append("\",");
+            builder.append("\"worker_parallelism\":").append(workerParallelism()).append(",");
+            builder.append("\"output_layout\":\"").append(jsonEscape(outputLayout())).append("\",");
+            builder.append("\"hfile_count\":").append(hfileCount()).append(",");
+            builder.append("\"kv_written_count\":").append(kvWrittenCount()).append(",");
+            builder.append("\"iteration_output_consistent\":")
+                .append(iterationOutputConsistent()).append(",");
             builder.append("\"average_ms\":").append(formatDouble(averageMillis())).append(",");
             builder.append("\"iteration_ms\":").append(iterationMillisJson()).append(",");
             builder.append("\"max_process_peak_rss_bytes\":").append(maxProcessPeakRssBytes()).append(",");
@@ -1548,8 +1667,61 @@ public final class BulkLoadPerfRunner {
         }
     }
 
+    private record ComparisonValidity(boolean evaluated,
+                                      boolean valid,
+                                      String note,
+                                      double javaOverJniSpeedup) {}
+
     private record ScenarioReport(ScenarioConfig scenario, GenerationStats generation, List<ImplementationSummary> implementations) {
+        private ComparisonValidity comparisonValidity() {
+            ImplementationSummary jni = null;
+            ImplementationSummary java = null;
+            for (ImplementationSummary implementation : implementations) {
+                if (IMPL_JNI.equals(implementation.implementation())) {
+                    jni = implementation;
+                } else if (IMPL_JAVA.equals(implementation.implementation())) {
+                    java = implementation;
+                }
+            }
+            if (jni == null || java == null) {
+                return new ComparisonValidity(false, false,
+                    "both JNI and Java implementations are required", 0.0);
+            }
+            if (!jni.iterationOutputConsistent() || !java.iterationOutputConsistent()) {
+                return new ComparisonValidity(true, false,
+                    "strategy, worker parallelism, HFile count, or KV count changed between iterations", 0.0);
+            }
+            if (!executionStrategyMatches(
+                    jni.strategy(), jni.workerParallelism(),
+                    java.strategy(), java.workerParallelism())) {
+                return new ComparisonValidity(true, false,
+                    "execution strategies differ: JNI=" + jni.strategy()
+                        + " (parallelism=" + jni.workerParallelism() + "), Java="
+                        + java.strategy() + " (parallelism=" + java.workerParallelism() + ")",
+                    0.0);
+            }
+            if (!jni.outputLayout().equals(java.outputLayout())) {
+                return new ComparisonValidity(true, false,
+                    "output layouts differ: JNI=" + jni.outputLayout() + ", Java=" + java.outputLayout(), 0.0);
+            }
+            if (jni.hfileCount() != java.hfileCount()) {
+                return new ComparisonValidity(true, false,
+                    "HFile counts differ: JNI=" + jni.hfileCount() + ", Java=" + java.hfileCount(), 0.0);
+            }
+            if (jni.kvWrittenCount() != java.kvWrittenCount()) {
+                return new ComparisonValidity(true, false,
+                    "KV counts differ: JNI=" + jni.kvWrittenCount() + ", Java=" + java.kvWrittenCount(), 0.0);
+            }
+            if (jni.averageMillis() <= 0.0) {
+                return new ComparisonValidity(true, false, "JNI elapsed time is zero", 0.0);
+            }
+            return new ComparisonValidity(true, true,
+                "same execution strategy, worker parallelism, output layout, HFile count, and KV count",
+                java.averageMillis() / jni.averageMillis());
+        }
+
         private String toJson() {
+            ComparisonValidity comparison = comparisonValidity();
             StringBuilder builder = new StringBuilder();
             builder.append("{");
             builder.append("\"scenario_id\":\"").append(jsonEscape(scenario.scenarioId())).append("\",");
@@ -1560,6 +1732,16 @@ public final class BulkLoadPerfRunner {
             builder.append("\"generated_batches\":").append(generation.batches()).append(",");
             builder.append("\"generated_arrow_size_bytes\":").append(generation.arrowSizeBytes()).append(",");
             builder.append("\"generate_ms\":").append(nanosToMillis(generation.elapsedNanos())).append(",");
+            builder.append("\"comparison_evaluated\":").append(comparison.evaluated()).append(",");
+            builder.append("\"comparison_valid\":").append(comparison.valid()).append(",");
+            builder.append("\"comparison_note\":\"").append(jsonEscape(comparison.note())).append("\",");
+            builder.append("\"java_over_jni_speedup\":");
+            if (comparison.valid()) {
+                builder.append(formatDouble(comparison.javaOverJniSpeedup()));
+            } else {
+                builder.append("null");
+            }
+            builder.append(",");
             builder.append("\"implementations\":[");
             for (int index = 0; index < implementations.size(); index++) {
                 if (index > 0) {

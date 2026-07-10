@@ -25,6 +25,28 @@ import org.junit.jupiter.api.io.TempDir;
 final class BulkLoadPerfRunnerTest {
 
     @Test
+    void outputLayoutSeparatesMergeFromOneToOneStrategies() {
+        assertEquals("MERGED-INPUTS",
+            BulkLoadPerfRunner.outputLayoutForStrategy("MERGE-THEN-CONVERT"));
+        assertEquals("ONE-HFILE-PER-INPUT",
+            BulkLoadPerfRunner.outputLayoutForStrategy("DIRECT-CONVERT"));
+        assertEquals("ONE-HFILE-PER-INPUT",
+            BulkLoadPerfRunner.outputLayoutForStrategy("PARALLEL-CONVERT"));
+    }
+
+    @Test
+    void speedupRequiresSameStrategyAndWorkerParallelism() {
+        assertTrue(BulkLoadPerfRunner.executionStrategyMatches(
+            "PARALLEL-CONVERT", 4, "PARALLEL-CONVERT", 4));
+        assertFalse(BulkLoadPerfRunner.executionStrategyMatches(
+            "PARALLEL-CONVERT", 4, "DIRECT-CONVERT", 1));
+        assertFalse(BulkLoadPerfRunner.executionStrategyMatches(
+            "PARALLEL-CONVERT", 4, "PARALLEL-CONVERT", 2));
+        assertFalse(BulkLoadPerfRunner.executionStrategyMatches(
+            "MERGE-THEN-CONVERT", 4, "PARALLEL-CONVERT", 4));
+    }
+
+    @Test
     void workerModeWritesStructuredResult(@TempDir Path tempDir) throws Exception {
         Path inputDir = tempDir.resolve("input");
         Path outputDir = tempDir.resolve("output");
@@ -53,7 +75,58 @@ final class BulkLoadPerfRunnerTest {
         String json = Files.readString(resultJson, StandardCharsets.UTF_8);
         assertTrue(json.contains("\"implementation\":\"arrow-to-hfile-java\""));
         assertTrue(json.contains("\"success\":true"));
+        assertTrue(json.contains("\"strategy\":\"DIRECT-CONVERT\""));
+        assertTrue(json.contains("\"worker_parallelism\":1"));
         assertTrue(json.contains("\"detail\":"));
+    }
+
+    @Test
+    void javaDirectoryWorkerUsesBoundedParallelismAndStableResultOrder(
+        @TempDir Path tempDir) throws Exception {
+        Path inputDir = tempDir.resolve("input");
+        Path outputDir = tempDir.resolve("output");
+        Path resultJson = tempDir.resolve("worker-result.json");
+        Files.createDirectories(inputDir);
+        writeArrowStream(inputDir.resolve("part-002.arrow"),
+            List.of("user-000000000005", "user-000000000006"),
+            List.of("value5", "value6"));
+        writeArrowStream(inputDir.resolve("part-000.arrow"),
+            List.of("user-000000000001", "user-000000000002"),
+            List.of("value1", "value2"));
+        writeArrowStream(inputDir.resolve("part-001.arrow"),
+            List.of("user-000000000003", "user-000000000004"),
+            List.of("value3", "value4"));
+
+        BulkLoadPerfRunner.main(new String[] {
+            "--worker-mode",
+            "--worker-implementation", "arrow-to-hfile-java",
+            "--worker-input-dir", inputDir.toString(),
+            "--worker-output-dir", outputDir.toString(),
+            "--worker-result-json", resultJson.toString(),
+            "--worker-iteration-index", "1",
+            "--parallelism", "2",
+            "--table", "perf_table",
+            "--rule", "USER_ID,0,false,0",
+            "--cf", "cf",
+            "--compression", "GZ",
+            "--encoding", "NONE",
+            "--bloom", "row",
+            "--block-size", "65536",
+            "--timestamp-ms", "1700000000123"
+        });
+
+        String json = Files.readString(resultJson, StandardCharsets.UTF_8);
+        assertTrue(json.contains("\"success\":true"), json);
+        assertTrue(json.contains("\"strategy\":\"PARALLEL-CONVERT\""), json);
+        assertTrue(json.contains("\"worker_parallelism\":2"), json);
+        assertTrue(json.contains("\"hfile_count\":3"), json);
+        int part0 = json.indexOf("part-000.arrow");
+        int part1 = json.indexOf("part-001.arrow");
+        int part2 = json.indexOf("part-002.arrow");
+        assertTrue(part0 >= 0 && part0 < part1 && part1 < part2, json);
+        try (var outputs = Files.list(outputDir.resolve("cf"))) {
+            assertEquals(3L, outputs.filter(Files::isRegularFile).count());
+        }
     }
 
     @Test
@@ -82,6 +155,13 @@ final class BulkLoadPerfRunnerTest {
         assertTrue(json.contains("\"jni_sdk_compression_queue_depth\": 0"));
         assertTrue(json.contains("\"jni_sdk_numeric_sort_fast_path\": \"auto\""));
         assertTrue(json.contains("\"default_timestamp_ms\": 0"));
+        assertTrue(json.contains("\"comparison_evaluated\":false"));
+        assertTrue(json.contains("\"comparison_valid\":false"));
+        assertTrue(json.contains("\"java_over_jni_speedup\":null"));
+        assertTrue(json.contains("\"strategy\":\"DIRECT-CONVERT\""));
+        assertTrue(json.contains("\"output_layout\":\"ONE-HFILE-PER-INPUT\""));
+        assertTrue(json.contains("\"hfile_count\":1"));
+        assertTrue(json.contains("\"iteration_output_consistent\":true"));
         assertFalse(Files.exists(tempDir.resolve("single-001mb")));
     }
 

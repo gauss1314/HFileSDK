@@ -1,5 +1,8 @@
 package com.hfile;
 
+import java.lang.ref.Cleaner;
+import java.util.concurrent.atomic.AtomicLong;
+
 /**
  * JNI bridge to the C++ HFileSDK shared library ({@code libhfilesdk.so} / {@code libhfilesdk.dylib} / {@code hfilesdk.dll}).
  *
@@ -69,12 +72,75 @@ package com.hfile;
  *
  * @since 4.0
  */
-public class HFileSDK {
+public class HFileSDK implements AutoCloseable {
 
     static {
         if (!Boolean.getBoolean("hfilesdk.native.loaded")) {
             System.loadLibrary("hfilesdk");
         }
+    }
+
+    private static final Cleaner CLEANER = Cleaner.create();
+    private static final String CLOSED_RESULT_JSON =
+        "{\"error_code\":20,\"error_message\":\"HFileSDK native session is closed or invalid\"}";
+    private static final String ABI_MISMATCH_MESSAGE =
+        "HFileSDK Java/native ABI mismatch: this Java artifact requires a native " +
+        "library with the session API (nativeCreateSession/nativeConvert). " +
+        "Deploy the matching libhfilesdk before or together with the Java jar.";
+
+    /**
+     * Native sessions are addressed by an opaque id rather than a C++ pointer.
+     * This lets native code reject stale/corrupted handles without dereferencing
+     * arbitrary memory.  {@link AtomicLong#getAndSet} makes explicit close and
+     * Cleaner fallback safely idempotent.
+     */
+    private static final class NativeSessionCleanup implements Runnable {
+        private final AtomicLong handle;
+
+        NativeSessionCleanup(long handle) {
+            this.handle = new AtomicLong(handle);
+        }
+
+        @Override
+        public void run() {
+            long value = handle.getAndSet(0L);
+            if (value != 0L) {
+                nativeDestroySession(value);
+            }
+        }
+    }
+
+    private volatile long nativeHandle;
+    private final Cleaner.Cleanable cleanable;
+    /** Serializes one session's native operation and its result snapshot. */
+    private final Object nativeCallLock = new Object();
+    /** Result paired with the most recent operation made by the calling thread. */
+    private final ThreadLocal<String> threadLastResult = new ThreadLocal<>();
+
+    public HFileSDK() {
+        final long handle;
+        try {
+            handle = nativeCreateSession();
+        } catch (UnsatisfiedLinkError e) {
+            // Old native libraries only export the three legacy instance
+            // methods.  Fail with an actionable rollout message instead of an
+            // opaque unresolved-symbol error.
+            throw new IllegalStateException(ABI_MISMATCH_MESSAGE, e);
+        }
+        if (handle == 0L) {
+            throw new IllegalStateException("Unable to allocate HFileSDK native session");
+        }
+
+        NativeSessionCleanup cleanup = new NativeSessionCleanup(handle);
+        Cleaner.Cleanable registered;
+        try {
+            registered = CLEANER.register(this, cleanup);
+        } catch (RuntimeException | Error e) {
+            nativeDestroySession(handle);
+            throw e;
+        }
+        this.nativeHandle = handle;
+        this.cleanable = registered;
     }
 
     // ── Error codes (mirror hfile::ErrorCode in convert_options.h) ──────────
@@ -90,7 +156,26 @@ public class HFileSDK {
     public static final int MEMORY_EXHAUSTED     = 12;
     public static final int INTERNAL_ERROR       = 20;
 
-    // ── Native methods ───────────────────────────────────────────────────────
+    // ── Native session methods ───────────────────────────────────────────────
+
+    private static native long nativeCreateSession();
+    private static native void nativeDestroySession(long handle);
+    private static native int nativeConvert(long handle,
+                                            String arrowPath,
+                                            String hfilePath,
+                                            String tableName,
+                                            String rowKeyRule);
+    private static native String nativeGetLastResult(long handle);
+    private static native int nativeConfigure(long handle, String configJson);
+
+    // Package-private lifecycle probe used only by integration tests.
+    static native boolean nativeSessionExistsForTesting(long handle);
+
+    long nativeHandleForTesting() {
+        return nativeHandle;
+    }
+
+    // ── Public API (method descriptors unchanged from the native-only bridge) ─
 
     /**
      * Convert an Arrow IPC Stream file to a HFile v3 file.
@@ -106,14 +191,26 @@ public class HFileSDK {
      * @return {@code 0} on success; non-zero error code otherwise.
      *         Call {@link #getLastResult()} for a JSON description of the result.
      */
-    public native int convert(String arrowPath,
-                               String hfilePath,
-                               String tableName,
-                               String rowKeyRule);
+    public int convert(String arrowPath,
+                       String hfilePath,
+                       String tableName,
+                       String rowKeyRule) {
+        synchronized (nativeCallLock) {
+            long handle = nativeHandle;
+            if (handle == 0L) {
+                threadLastResult.set(CLOSED_RESULT_JSON);
+                return INTERNAL_ERROR;
+            }
+            int rc = nativeConvert(handle, arrowPath, hfilePath, tableName, rowKeyRule);
+            threadLastResult.set(readNativeResult(handle, rc));
+            return rc;
+        }
+    }
 
     /**
-     * Return a JSON string describing the result of the most recent
-     * {@link #convert} call on this thread.
+     * Return a JSON string describing the result paired with the most recent
+     * operation made by the calling thread. This pairing remains stable even
+     * when several threads share one SDK instance.
      *
      * <p>Fields:
      * <ul>
@@ -131,7 +228,18 @@ public class HFileSDK {
      *   <li>{@code write_ms}           — time spent writing the HFile
      * </ul>
      */
-    public native String getLastResult();
+    public String getLastResult() {
+        if (nativeHandle == 0L) return CLOSED_RESULT_JSON;
+        String paired = threadLastResult.get();
+        if (paired != null) return paired;
+
+        synchronized (nativeCallLock) {
+            long handle = nativeHandle;
+            if (handle == 0L) return CLOSED_RESULT_JSON;
+            String result = nativeGetLastResult(handle);
+            return result == null ? "{}" : result;
+        }
+    }
 
     /**
      * Set global writer configuration.
@@ -148,7 +256,7 @@ public class HFileSDK {
      *   <li>{@code error_policy}               — {@code "strict" | "skip_row" | "skip_batch"}
      *   <li>{@code bloom_type}                 — {@code "none" | "row" | "rowcol"}
      *   <li>{@code max_memory_bytes}           — soft SDK memory budget in bytes, 0 = unlimited
-     *   <li>{@code compression_threads}        — background data-block compression workers, 0 = disabled
+     *   <li>{@code compression_threads}        — process-wide shared data-block compression workers, 0 = synchronous
      *   <li>{@code compression_queue_depth}    — max in-flight compressed blocks, 0 = auto when threads > 0
      *   <li>{@code numeric_sort_fast_path}     — {@code "auto" | "on" | "off"}.
      *                                            Controls the C++ numeric row-key sorting fast path
@@ -190,7 +298,42 @@ public class HFileSDK {
      * @param configJson JSON configuration string.
      * @return {@code 0} on success.
      */
-    public native int configure(String configJson);
+    public int configure(String configJson) {
+        synchronized (nativeCallLock) {
+            long handle = nativeHandle;
+            if (handle == 0L) {
+                threadLastResult.set(CLOSED_RESULT_JSON);
+                return INTERNAL_ERROR;
+            }
+            int rc = nativeConfigure(handle, configJson);
+            threadLastResult.set(readNativeResult(handle, rc));
+            return rc;
+        }
+    }
+
+    /**
+     * Release the per-instance native configuration/result session.
+     *
+     * <p>Close is idempotent and waits for an operation already executing on
+     * this SDK instance. It does not provide cooperative cancellation; every
+     * call that starts after close returns {@link #INTERNAL_ERROR}. The Cleaner
+     * remains a fallback for callers that do not use try-with-resources.</p>
+     */
+    @Override
+    public void close() {
+        synchronized (nativeCallLock) {
+            nativeHandle = 0L;
+            cleanable.clean();
+            threadLastResult.remove();
+        }
+    }
+
+    private static String readNativeResult(long handle, int rc) {
+        String result = nativeGetLastResult(handle);
+        if (result != null && !result.isBlank()) return result;
+        return "{\"error_code\":" + rc +
+            ",\"error_message\":\"native result unavailable\"}";
+    }
 
     // ── Convenience factory ──────────────────────────────────────────────────
 
@@ -232,7 +375,13 @@ public class HFileSDK {
             HFileSDK sdk = new HFileSDK();
             int rc = sdk.configure(toConfigJson());
             if (rc != OK) {
-                throw new IllegalStateException("HFileSDK configure failed: " + sdk.getLastResult());
+                String detail;
+                try {
+                    detail = sdk.getLastResult();
+                } finally {
+                    sdk.close();
+                }
+                throw new IllegalStateException("HFileSDK configure failed: " + detail);
             }
             return sdk;
         }

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <atomic>
 #include <algorithm>
+#include <cassert>
 
 namespace hfile {
 namespace memory {
@@ -32,35 +33,55 @@ public:
 
     /// Try to reserve `bytes` bytes of quota.
     /// Returns error if used + bytes > max_bytes.
-    Status reserve(size_t bytes) noexcept {
+    Status reserve(size_t bytes) {
         if (bytes == 0) return Status::OK();
-        size_t prev = used_.fetch_add(bytes, std::memory_order_relaxed);
-        size_t now  = prev + bytes;
-        if (now <= max_bytes_) {
-            // Update peak
-            size_t p = peak_.load(std::memory_order_relaxed);
-            while (now > p &&
-                   !peak_.compare_exchange_weak(p, now,
-                       std::memory_order_relaxed,
-                       std::memory_order_relaxed)) {}
-            return Status::OK();
+        size_t current = used_.load(std::memory_order_relaxed);
+        size_t next = 0;
+        for (;;) {
+            // Checked addition prevents size_t wraparound from bypassing the
+            // configured ceiling near SIZE_MAX.
+            if (current > max_bytes_ || bytes > max_bytes_ - current) {
+                return Status::InvalidArg(
+                    "MemoryBudget: limit exceeded ("
+                    + std::to_string(max_bytes_ / 1024 / 1024) + " MB)");
+            }
+            next = current + bytes;
+            if (used_.compare_exchange_weak(
+                    current, next,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                break;
+            }
         }
-        // Over limit: roll back
-        used_.fetch_sub(bytes, std::memory_order_relaxed);
-        return Status::InvalidArg(
-            "MemoryBudget: limit exceeded ("
-            + std::to_string(max_bytes_ / 1024 / 1024) + " MB)");
+
+        size_t p = peak_.load(std::memory_order_relaxed);
+        while (next > p &&
+               !peak_.compare_exchange_weak(
+                   p, next,
+                   std::memory_order_relaxed,
+                   std::memory_order_relaxed)) {}
+        return Status::OK();
     }
 
     /// Release `bytes` bytes of previously reserved quota.
     void release(size_t bytes) noexcept {
         if (bytes == 0) return;
-        used_.fetch_sub(bytes, std::memory_order_relaxed);
+        size_t current = used_.load(std::memory_order_relaxed);
+        for (;;) {
+            assert(current >= bytes && "MemoryBudget double release");
+            const size_t next = current >= bytes ? current - bytes : 0;
+            if (used_.compare_exchange_weak(
+                    current, next,
+                    std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+                return;
+            }
+        }
     }
 
     /// RAII guard: reserves on construction, releases on destruction.
     struct Guard {
-        Guard(MemoryBudget& b, size_t bytes) noexcept
+        Guard(MemoryBudget& b, size_t bytes)
             : budget_{b}, bytes_{0} {
             if (b.reserve(bytes).ok()) bytes_ = bytes;
         }

@@ -203,7 +203,7 @@ TEST(HFileWriterEdgeCases, AppendDropsTagsAndMvccWhenDisabled) {
     fs::remove(path);
 }
 
-TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksThrowsOnDescendingRow) {
+TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnDescendingRow) {
     auto path = temp_path("descending_midpoint");
     auto [writer, status] = HFileWriter::builder()
         .set_path(path.string())
@@ -220,13 +220,17 @@ TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksThrowsOnDescendingRow) {
     auto second = make_owned_kv("a", "q", 1, std::string(256, 'b'));
     ASSERT_TRUE(writer->append_trusted_new_row(first.as_view()).ok());
     ASSERT_TRUE(writer->append_trusted_new_row(second.as_view()).ok());
-    EXPECT_THROW((void)writer->finish(), std::invalid_argument);
+    const Status failure = writer->finish();
+    EXPECT_FALSE(failure.ok());
+    EXPECT_EQ(failure.code(), Status::Code::Internal);
+    EXPECT_EQ(writer->finish().message(), failure.message());
+    EXPECT_FALSE(fs::exists(path));
 
     writer.reset();
     EXPECT_FALSE(fs::exists(path));
 }
 
-TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksThrowsOnShorterPrefix) {
+TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnShorterPrefix) {
     auto path = temp_path("prefix_midpoint");
     auto [writer, status] = HFileWriter::builder()
         .set_path(path.string())
@@ -243,7 +247,11 @@ TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksThrowsOnShorterPrefix) {
     auto second = make_owned_kv("a", "q", 1, std::string(256, 'b'));
     ASSERT_TRUE(writer->append_trusted_new_row(first.as_view()).ok());
     ASSERT_TRUE(writer->append_trusted_new_row(second.as_view()).ok());
-    EXPECT_THROW((void)writer->finish(), std::invalid_argument);
+    const Status failure = writer->finish();
+    EXPECT_FALSE(failure.ok());
+    EXPECT_EQ(failure.code(), Status::Code::Internal);
+    EXPECT_EQ(writer->finish().message(), failure.message());
+    EXPECT_FALSE(fs::exists(path));
 
     writer.reset();
     EXPECT_FALSE(fs::exists(path));

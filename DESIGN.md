@@ -620,15 +620,18 @@ ArenaAllocator（bump-pointer）
 
 ### 5.6 Pipeline 设计（当前状态）
 
-**当前实现**：Encode → Compress → Write 三阶段**串行**执行。
+**当前实现**：有界的 Encode / Compress 重叠流水线：
 
-**设计目标**（未实现）：双缓冲三线程流水线：
 ```
-线程 1 (Encode):   [编码 Block N+1] [编码 Block N+2] ...
-线程 2 (Compress): [压缩 Block N]   [压缩 Block N+1] ...
-线程 3 (I/O):      [写入 Block N-1] [写入 Block N]   ...
+Writer 线程:       [编码 N] [提交 N] [编码 N+1] ... [按 sequence 写出]
+进程共享压缩池:             [压缩 N] [压缩 N+1] ...
 ```
-实现方案：`HFileWriterImpl` 中增加 `std::thread` + 双 `BlockPool` 缓冲区 + `std::condition_variable` 协调。此功能是达到 3× 性能目标的关键优化之一。
+
+- `queue_depth` 个持久 `PipelineSlot` 保存 raw/compressed 缓冲和 sequence；缓冲 64 字节对齐并按高水位复用。
+- `NoneEncoder` 通过 ownership swap 移交完成块，避免逐 Block raw copy。
+- 多个 Writer 共用进程级压缩 executor；同为 T 时全进程只有 T 个压缩线程。
+- Writer 严格按 sequence 写出，压缩完成顺序不会改变 HFile 字节。
+- I/O 仍由 Writer 线程执行。当前 4MiB `BufferedFileWriter` 已合并系统调用，基准显示 GZip/排序而非 I/O 是主瓶颈；只有目标存储的 I/O profile 证明值得时，才增加独立 I/O stage。
 
 ---
 
@@ -645,12 +648,16 @@ ArenaAllocator（bump-pointer）
 | `[[likely]]/[[unlikely]]` 分支提示 | 热路径分支判断 | 中 |
 | Arrow String/Binary 零拷贝 | `std::span` 引用原始 Arrow 缓冲区 | 高 |
 | IoUringWriter 双缓冲 | `buf_[2]` + `cur_` 轮换 | 中 |
+| 有界 Encode/Compress Pipeline | 持久 `PipelineSlot` + 进程共享 executor | 高，尤其是大文件和多 Writer |
+| 紧凑排序索引 | 16B numeric / 24B string entry | 中高 |
+| Schema 专用列序列化计划 | `BatchColumnPlan` typed appender | 中 |
+| JNI prepared session | native handle + worker ThreadLocal 复用 | 小文件场景高 |
 
 ### 6.2 未实现的优化
 
 | 优化项 | 预期收益 | 优先级 |
 |-------|---------|-------|
-| 双缓冲 Encode/Compress/IO Pipeline | 极高（待基准数据驱动）| 见 §11 决策说明 |
+| 独立异步 I/O stage | 低到中（需目标存储 profile）| P3 |
 | AVX2 前缀扫描（32B/次，当前为 16B） | 低 | P3 |
 
 ### 6.3 与 Java 版本差距分析
@@ -663,7 +670,7 @@ ArenaAllocator（bump-pointer）
 | CRC32C 软件实现 | SSE4.2 硬件指令 | ✅ 已实现 |
 | GC 停顿 | C++ 无 GC | ✅ 天然优势 |
 | 串行 I/O | io_uring 双缓冲 | ✅ 已实现（可选） |
-| 三阶段串行执行 | Pipeline（待基准数据驱动后决定是否实现）| ⏳ 待数据 |
+| 编码与压缩串行 | 有界 Pipeline + 共享压缩池 | ✅ 已实现 |
 
 ---
 
@@ -855,7 +862,7 @@ java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
 | Phase 3 | NONE 编码 + 压缩（GZip/None）+ Bloom Filter | ✅ **完成** |
 | Phase 4 | Region 分裂（手动模式）+ HDFS I/O | ✅ **完成** |
 | Phase 5 | Arrow 集成 + RowKeyRule 引擎 + JNI 层 + AutoSort | ✅ **完成** |
-| Phase 6 | 性能优化（SSE4.2 CRC、SIMD 前缀、栈缓冲、双缓冲 IoUring） | ⚠️ **核心完成**，Pipeline 待基准数据驱动 |
+| Phase 6 | 性能优化（SSE4.2 CRC、SIMD 前缀、紧凑排序、Schema plan、共享压缩 Pipeline） | ✅ **完成** |
 | Phase 7 | 基准工具 + 验证工具 + 文档 | ✅ **完成** |
 
 ### Phase 4 设计决策：不提供 `from_hbase()` 在线模式
@@ -877,9 +884,9 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 ### Phase 6 设计决策：Pipeline 和 PGO
 
 **双缓冲 Encode/Compress/IO Pipeline**：
-- 当前三阶段串行执行。理论上流水线可提升 30–50% 吞吐量，但实际收益高度依赖瓶颈位置。
-- **决策准则**：先运行 `tools/hfile-bulkload-perf` 取得 JNI / 纯 Java 的固定场景矩阵数据。若 I/O 等待时间占比 < 50%（说明编码/压缩是瓶颈），或与 Java 基线差距 < 3×，再实现 Pipeline。若 I/O 已是瓶颈（NVMe 打满），Pipeline 帮助有限。
-- 实现方案参见 §5.6。
+- 性能矩阵确认 GZip 和排序是主瓶颈后，已实现 Encode/Compress 重叠、持久 Slot 和进程共享压缩池，详见 §5.6。
+- 写出仍在 Writer 线程按 sequence 执行，以保持 AtomicFileWriter、索引、Bloom 和 checksum 顺序简单且可证明。
+- 只有目标生产存储 profile 显示 Writer 的 I/O 等待占主导时，才考虑增加独立异步 I/O stage；该变化必须重新执行掉电、磁盘满和逐字节门禁。
 
 **PGO（Profile-Guided Optimization）**：**有意不实现**。
 - SDK 热路径是线性紧凑代码（无复杂多态分发、无密集分支），PGO 的典型收益场景不适用此处，预期收益 5–10%。
@@ -888,7 +895,7 @@ Java Admin:   admin.getRegions(...).stream().map(r -> r.getStartKey())
 ### 剩余工作（按优先级）
 
 **P2 — 数据驱动后决定**
-- [ ] **双缓冲 Pipeline**：先运行 `tools/hfile-bulkload-perf` 拿到对比数据，若差距 < 3× 再实现
+- [ ] **独立异步 I/O stage**：仅在目标文件系统 profile 显示 I/O 等待占主导时实施
 - [ ] **AutoSort 外排序**：当前 AutoSort 将全量 batch 保留在内存；超大文件（> RAM）需外排序实现
 
 ---

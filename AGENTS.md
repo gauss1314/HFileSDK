@@ -249,7 +249,7 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 | 3 | Arrow IPC Stream 读取 + RowKeyRule 规则引擎 + JNI 接口 | ✅ 完成 |
 | 4 | NONE 编码 + 压缩（GZip/None）+ Bloom Filter | ✅ 完成 |
 | 5 | 生产可靠性（输入校验、FsyncPolicy、ErrorPolicy、MemoryBudget、磁盘检查、进度回调） | ✅ 完成 |
-| 6 | 性能优化（SSE4.2 CRC、SIMD 前缀、512B 栈缓冲、双缓冲 IoUring；Pipeline 待基准数据）| ⚠️ 核心完成 |
+| 6 | 性能优化（SSE4.2 CRC、SIMD 前缀、紧凑排序、Schema plan、共享压缩 Pipeline）| ✅ 完成 |
 | 7 | 基准测试工具 + Java 基线 benchmark + 验证工具 + 文档 | ✅ 完成 |
 
 ### 有意不实现的功能
@@ -259,7 +259,7 @@ Java 进程调用: HFileSDK.convert(arrowPath, hfilePath, tableName, rowKeyRule)
 
 ### 待实现功能
 
-- ⏳ **双缓冲 Encode/Compress/IO Pipeline**：待 `tools/hfile-bulkload-perf` 的双实现数据驱动后决定（见 DESIGN.md §11）
+- ⏳ **独立异步 I/O stage**：仅在目标生产文件系统 profile 显示 I/O 等待占主导时实施（见 DESIGN.md §11）
 - ⏳ **AutoSort 外排序**：当前全量 batch 保留内存；超大文件（> 可用 RAM）需外排序
 
 ---

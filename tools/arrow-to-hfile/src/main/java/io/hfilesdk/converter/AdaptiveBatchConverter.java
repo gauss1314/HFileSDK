@@ -208,9 +208,12 @@ public class AdaptiveBatchConverter {
         ExecutorService pool = Executors.newFixedThreadPool(batchParallelism,
             r -> { Thread t = new Thread(r, "adaptive-merge"); t.setDaemon(true); return t; });
 
-        Map<Path, Future<ConvertResult>> futures = new LinkedHashMap<>();
-        AtomicLong batchSeq = new AtomicLong(0);
-        long wallStart = System.currentTimeMillis();
+        ArrowToHFileConverter converter =
+            new ArrowToHFileConverter(opts.nativeLibPath);
+        try {
+            Map<Path, Future<ConvertResult>> futures = new LinkedHashMap<>();
+            AtomicLong batchSeq = new AtomicLong(0);
+            long wallStart = System.currentTimeMillis();
 
         for (List<Path> batch : batches) {
             long seq = batchSeq.incrementAndGet();
@@ -227,57 +230,68 @@ public class AdaptiveBatchConverter {
                     String.format("merged_%s_%03d.arrow",
                         opts.tableName.isBlank() ? "batch" : sanitize(opts.tableName),
                         seq));
-                long mergeStart = System.currentTimeMillis();
                 try {
-                    ArrowFileMerger.merge(batch, mergedArrow);
-                } catch (IOException e) {
-                    return ConvertResult.ofError(ConvertResult.ARROW_FILE_ERROR,
-                        tag + " merge failed: " + e.getMessage());
+                    long mergeStart = System.currentTimeMillis();
+                    try {
+                        ArrowFileMerger.merge(batch, mergedArrow);
+                    } catch (IOException e) {
+                        return ConvertResult.ofError(ConvertResult.ARROW_FILE_ERROR,
+                            tag + " merge failed: " + e.getMessage());
+                    }
+                    long mergeMs = System.currentTimeMillis() - mergeStart;
+                    long mergedSize = Files.size(mergedArrow);
+                    System.out.printf("%s Merge done: %.1fMiB in %dms → %s%n",
+                        tag, mergedSize / 1024.0 / 1024.0, mergeMs,
+                        mergedArrow.getFileName());
+
+                    // ── B. Convert merged Arrow → HFile ───────────────────────
+                    String hfileName = String.format("%s_%03d.hfile",
+                        opts.tableName.isBlank() ? "merged" : sanitize(opts.tableName), seq);
+                    Path hfileOut = opts.hfileDir.resolve(hfileName);
+
+                    ConvertResult result = converter.convert(
+                        ConvertOptions.builder()
+                            .arrowPath(mergedArrow.toAbsolutePath().toString())
+                            .hfilePath(hfileOut.toAbsolutePath().toString())
+                            .tableName(opts.tableName)
+                            .rowKeyRule(opts.rowKeyRule)
+                            .columnFamily(opts.columnFamily)
+                            .compression(opts.compression)
+                            .compressionLevel(opts.compressionLevel)
+                            .dataBlockEncoding(opts.dataBlockEncoding)
+                            .bloomType(opts.bloomType)
+                            .errorPolicy(opts.errorPolicy)
+                            .blockSize(opts.blockSize)
+                            .maxMemoryBytes(opts.maxMemoryBytes)
+                            .compressionThreads(opts.compressionThreads)
+                            .compressionQueueDepth(opts.compressionQueueDepth)
+                            .numericSortFastPath(opts.numericSortFastPath)
+                            .defaultTimestampMs(opts.defaultTimestampMs)
+                            .excludedColumnPrefixes(opts.excludedColumnPrefixes)
+                            .excludedColumns(opts.excludedColumns)
+                            .build());
+
+                    System.out.printf("%s Convert %s: %s%n",
+                        tag, hfileOut.getFileName(),
+                        result.isSuccess()
+                            ? result.summary()
+                            : "FAILED: " + result.errorMessage);
+
+                    if (opts.progressCallback != null) {
+                        // Use mergedArrow path as the callback identifier. The
+                        // temporary file is removed when this task leaves.
+                        opts.progressCallback.accept(mergedArrow, result);
+                    }
+                    return result;
+                } finally {
+                    // Covers merge failure, Files.size(), conversion, callback,
+                    // interruption, and every unchecked exceptional path.
+                    try {
+                        Files.deleteIfExists(mergedArrow);
+                    } catch (IOException ignored) {
+                        // Best effort; the conversion result remains authoritative.
+                    }
                 }
-                long mergeMs = System.currentTimeMillis() - mergeStart;
-                long mergedSize = Files.size(mergedArrow);
-                System.out.printf("%s Merge done: %.1fMiB in %dms → %s%n",
-                    tag, mergedSize / 1024.0 / 1024.0, mergeMs, mergedArrow.getFileName());
-
-                // ── B. Convert merged Arrow → HFile ───────────────────────────
-                String hfileName = String.format("%s_%03d.hfile",
-                    opts.tableName.isBlank() ? "merged" : sanitize(opts.tableName), seq);
-                Path hfileOut = opts.hfileDir.resolve(hfileName);
-
-                ArrowToHFileConverter converter = new ArrowToHFileConverter(opts.nativeLibPath);
-                ConvertResult result = converter.convert(
-                    ConvertOptions.builder()
-                        .arrowPath(mergedArrow.toAbsolutePath().toString())
-                        .hfilePath(hfileOut.toAbsolutePath().toString())
-                        .tableName(opts.tableName)
-                        .rowKeyRule(opts.rowKeyRule)
-                        .columnFamily(opts.columnFamily)
-                        .compression(opts.compression)
-                        .compressionLevel(opts.compressionLevel)
-                        .dataBlockEncoding(opts.dataBlockEncoding)
-                        .bloomType(opts.bloomType)
-                        .errorPolicy(opts.errorPolicy)
-                        .blockSize(opts.blockSize)
-                        .maxMemoryBytes(opts.maxMemoryBytes)
-                        .compressionThreads(opts.compressionThreads)
-                        .compressionQueueDepth(opts.compressionQueueDepth)
-                        .numericSortFastPath(opts.numericSortFastPath)
-                        .excludedColumnPrefixes(opts.excludedColumnPrefixes)
-                        .excludedColumns(opts.excludedColumns)
-                        .build());
-
-                System.out.printf("%s Convert %s: %s%n",
-                    tag, hfileOut.getFileName(),
-                    result.isSuccess() ? result.summary() : "FAILED: " + result.errorMessage);
-
-                // ── C. Delete temp merged file ─────────────────────────────────
-                try { Files.deleteIfExists(mergedArrow); } catch (IOException ignored) {}
-
-                if (opts.progressCallback != null) {
-                    // Use mergedArrow path as the "file" identifier for the callback
-                    opts.progressCallback.accept(mergedArrow, result);
-                }
-                return result;
             });
 
             // Key = the first Arrow file in this batch (unique identifier)
@@ -285,7 +299,10 @@ public class AdaptiveBatchConverter {
         }
 
         pool.shutdown();
-        pool.awaitTermination(10, TimeUnit.HOURS);
+        boolean completed = pool.awaitTermination(10, TimeUnit.HOURS);
+        if (!completed) {
+            throw new InterruptedException("Adaptive conversion timed out after 10 hours");
+        }
 
         // ── Collect results ───────────────────────────────────────────────────
         Map<Path, ConvertResult> results   = new LinkedHashMap<>();
@@ -311,7 +328,11 @@ public class AdaptiveBatchConverter {
 
         System.out.println();
         System.out.println("[AdaptiveBatch] " + batch.summary());
-        return batch;
+            return batch;
+        } finally {
+            pool.shutdownNow();
+            converter.close();
+        }
     }
 
     // ── Partition logic ───────────────────────────────────────────────────────

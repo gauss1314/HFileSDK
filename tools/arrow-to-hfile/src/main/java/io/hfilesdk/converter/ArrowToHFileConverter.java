@@ -6,6 +6,14 @@ import org.apache.commons.cli.*;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Arrow IPC Stream → HFile v3 converter.
@@ -53,8 +61,9 @@ import java.nio.file.Paths;
  * }</pre>
  *
  * <h3>线程安全</h3>
- * {@link #convert} 和 {@link #convertOrThrow} 是线程安全的：每次调用都会
- * 创建一个新的 {@link HFileSDK} 实例（底层 C++ 对象各自独立）。
+ * {@link #convert} 和 {@link #convertOrThrow} 是线程安全的：每个活跃转换
+ * 从一个有界池中独占借用 prepared {@link HFileSDK} session；配置不变时
+ * 跨调用复用，配置变化时替换底层 session，转换状态不会并发共享。
  * {@link NativeLibLoader#load} 有内置的幂等性保护，多次调用安全。
  *
  * <h3>Native Library 加载顺序</h3>
@@ -65,13 +74,85 @@ import java.nio.file.Paths;
  *   <li>{@code java.library.path}（通过 {@code -Djava.library.path=} 传入）</li>
  * </ol>
  */
-public class ArrowToHFileConverter {
+public class ArrowToHFileConverter implements AutoCloseable {
 
     /**
      * Explicit path to the native library, set at construction time.
      * {@code null} means fall through to env vars / java.library.path.
      */
     private final String nativeLibPath;
+
+    private static final int DEFAULT_MAX_PREPARED_SESSIONS = Math.max(
+        1, Runtime.getRuntime().availableProcessors());
+
+    /** Bounded reusable sessions; no state is retained for historical threads. */
+    private final int maxPreparedSessions;
+    private final ArrayBlockingQueue<PreparedSession> idleSessions;
+    private final Set<PreparedSession> preparedSessions =
+        ConcurrentHashMap.newKeySet();
+    private final AtomicInteger preparedSessionCount = new AtomicInteger();
+    private final AtomicBoolean closed = new AtomicBoolean(false);
+    private final ReentrantReadWriteLock lifecycleLock = new ReentrantReadWriteLock();
+
+    private static final class PreparedSession implements AutoCloseable {
+        private HFileSDK sdk;
+        private String configuredJson;
+        private String configureErrorJson = "{}";
+        private final AtomicLong configureCalls = new AtomicLong();
+
+        int prepare(String configJson) {
+            if (sdk != null && Objects.equals(configuredJson, configJson)) {
+                return HFileSDK.OK;
+            }
+
+            // ConvertOptions omits default-valued keys. Reconfiguring an old
+            // session would therefore retain settings that disappeared from a
+            // later options object. Build a fresh session only when the full
+            // config changes, preserving the historical per-call defaults.
+            HFileSDK next = new HFileSDK();
+            int rc = HFileSDK.OK;
+            if (!configJson.equals("{}")) {
+                configureCalls.incrementAndGet();
+                rc = next.configure(configJson);
+            }
+            if (rc != HFileSDK.OK) {
+                configureErrorJson = next.getLastResult();
+                next.close();
+                return rc;
+            }
+
+            HFileSDK previous = sdk;
+            sdk = next;
+            configuredJson = configJson;
+            configureErrorJson = "{}";
+            if (previous != null) {
+                previous.close();
+            }
+            return HFileSDK.OK;
+        }
+
+        HFileSDK sdk() {
+            return sdk;
+        }
+
+        String configureErrorJson() {
+            return configureErrorJson;
+        }
+
+        long configureCalls() {
+            return configureCalls.get();
+        }
+
+        @Override
+        public void close() {
+            HFileSDK current = sdk;
+            sdk = null;
+            configuredJson = null;
+            if (current != null) {
+                current.close();
+            }
+        }
+    }
 
     // ── Construction ──────────────────────────────────────────────────────────
 
@@ -89,7 +170,17 @@ public class ArrowToHFileConverter {
      *                      {@code java.library.path}.
      */
     public ArrowToHFileConverter(String nativeLibPath) {
+        this(nativeLibPath, DEFAULT_MAX_PREPARED_SESSIONS);
+    }
+
+    /** Package-private constructor used by lifecycle/concurrency tests. */
+    ArrowToHFileConverter(String nativeLibPath, int maxPreparedSessions) {
+        if (maxPreparedSessions <= 0) {
+            throw new IllegalArgumentException("maxPreparedSessions must be > 0");
+        }
         this.nativeLibPath = nativeLibPath;
+        this.maxPreparedSessions = maxPreparedSessions;
+        this.idleSessions = new ArrayBlockingQueue<>(maxPreparedSessions, true);
     }
 
     /**
@@ -109,14 +200,29 @@ public class ArrowToHFileConverter {
     /**
      * Convert an Arrow IPC Stream file to a HFile v3 file.
      *
-     * <p>This method is thread-safe: it creates a new {@link HFileSDK} instance
-     * per call and holds no shared mutable state.
+     * <p>This method is thread-safe: each active call leases one prepared
+     * {@link HFileSDK} session exclusively, and conversion-local C++ state is
+     * never shared concurrently.
      *
      * @param opts conversion parameters (non-null).
      * @return a {@link ConvertResult} describing the outcome.
      *         Check {@link ConvertResult#isSuccess()} before using the output file.
      */
     public ConvertResult convert(ConvertOptions opts) {
+        lifecycleLock.readLock().lock();
+        try {
+            return convertPrepared(opts);
+        } finally {
+            lifecycleLock.readLock().unlock();
+        }
+    }
+
+    private ConvertResult convertPrepared(ConvertOptions opts) {
+        if (closed.get()) {
+            return ConvertResult.ofError(
+                ConvertResult.INTERNAL_ERROR, "ArrowToHFileConverter is closed");
+        }
+
         // Determine effective native lib path (option-level overrides instance-level)
         String libPath = opts.nativeLibPath() != null && !opts.nativeLibPath().isBlank()
                          ? opts.nativeLibPath()
@@ -129,25 +235,114 @@ public class ArrowToHFileConverter {
             return ConvertResult.ofError(ConvertResult.INTERNAL_ERROR, e.getMessage());
         }
 
-        // Build and invoke SDK
+        // Borrow one session exclusively for the complete configure + convert
+        // + result sequence.  The bounded pool prevents one native handle from
+        // being retained for every historical/virtual calling thread.
         String configJson = opts.toConfigJson();
-        HFileSDK sdk = new HFileSDK();
-
-        if (!configJson.equals("{}")) {
-            int cfgRc = sdk.configure(configJson);
+        final PreparedSession session;
+        try {
+            session = borrowPreparedSession();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return ConvertResult.ofError(
+                ConvertResult.INTERNAL_ERROR,
+                "Interrupted while waiting for a prepared HFileSDK session");
+        } catch (IllegalStateException e) {
+            return ConvertResult.ofError(ConvertResult.INTERNAL_ERROR, e.getMessage());
+        }
+        try {
+            final int cfgRc = session.prepare(configJson);
             if (cfgRc != HFileSDK.OK) {
-                String detail = sdk.getLastResult();
-                return ConvertResult.fromJson(detail, cfgRc);
+                return ConvertResult.fromJson(session.configureErrorJson(), cfgRc);
             }
+
+            HFileSDK sdk = session.sdk();
+            int rc = sdk.convert(
+                opts.arrowPath(),
+                opts.hfilePath(),
+                opts.tableName(),
+                opts.rowKeyRule());
+
+            return ConvertResult.fromJson(sdk.getLastResult(), rc);
+        } catch (IllegalStateException e) {
+            return ConvertResult.ofError(ConvertResult.INTERNAL_ERROR, e.getMessage());
+        } finally {
+            returnPreparedSession(session);
+        }
+    }
+
+    private PreparedSession borrowPreparedSession() throws InterruptedException {
+        if (closed.get()) {
+            throw new IllegalStateException("ArrowToHFileConverter is closed");
         }
 
-        int rc = sdk.convert(
-            opts.arrowPath(),
-            opts.hfilePath(),
-            opts.tableName(),
-            opts.rowKeyRule());
+        PreparedSession idle = idleSessions.poll();
+        if (idle != null) return idle;
 
-        return ConvertResult.fromJson(sdk.getLastResult(), rc);
+        for (;;) {
+            int current = preparedSessionCount.get();
+            if (current < maxPreparedSessions &&
+                preparedSessionCount.compareAndSet(current, current + 1)) {
+                try {
+                    PreparedSession created = new PreparedSession();
+                    preparedSessions.add(created);
+                    return created;
+                } catch (RuntimeException | Error e) {
+                    preparedSessionCount.decrementAndGet();
+                    throw e;
+                }
+            }
+            // All leases are busy. close() cannot acquire the lifecycle write
+            // lock while this caller holds its read lock, so another active
+            // conversion will return a session and make progress.
+            return idleSessions.take();
+        }
+    }
+
+    private void returnPreparedSession(PreparedSession session) {
+        if (idleSessions.offer(session)) return;
+
+        // Defensive fallback: capacity equals the maximum number ever created,
+        // so this branch indicates an internal accounting error. Release the
+        // native handle rather than leaking it.
+        preparedSessions.remove(session);
+        preparedSessionCount.decrementAndGet();
+        session.close();
+    }
+
+    int preparedSessionCountForTesting() {
+        return preparedSessionCount.get();
+    }
+
+    long configureCallCountForTesting() {
+        long total = 0;
+        for (PreparedSession session : preparedSessions) {
+            total += session.configureCalls();
+        }
+        return total;
+    }
+
+    /**
+     * Close every worker-local native session created by this converter.
+     * Concurrent conversions may finish; close waits for their composite
+     * convert/getLastResult calls before releasing sessions.
+     */
+    @Override
+    public void close() {
+        lifecycleLock.writeLock().lock();
+        try {
+            if (!closed.compareAndSet(false, true)) {
+                return;
+            }
+            for (PreparedSession session : preparedSessions) {
+                session.close();
+            }
+            preparedSessions.clear();
+            idleSessions.clear();
+            preparedSessionCount.set(0);
+        } finally {
+            lifecycleLock.writeLock().unlock();
+        }
     }
 
     /**
@@ -319,8 +514,10 @@ public class ArrowToHFileConverter {
         System.out.printf("Converting%n  arrow : %s%n  hfile : %s%n  table : %s%n  rule  : %s%n",
             arrowPath, hfilePath, tableName.isBlank() ? "(none)" : tableName, rowKeyRule);
 
-        ArrowToHFileConverter converter = new ArrowToHFileConverter();
-        ConvertResult result = converter.convert(opts);
+        ConvertResult result;
+        try (ArrowToHFileConverter converter = new ArrowToHFileConverter()) {
+            result = converter.convert(opts);
+        }
 
         if (result.isSuccess()) {
             System.out.println("Result: " + result.summary());

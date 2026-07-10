@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 using namespace hfile::memory;
@@ -32,6 +33,16 @@ TEST(MemoryBudget, GuardAndOverLimitBehavior) {
     }
     EXPECT_EQ(budget.used(), 0u);
     EXPECT_FALSE(budget.reserve(65).ok());
+    EXPECT_EQ(budget.used(), 0u);
+}
+
+TEST(MemoryBudget, CheckedAdditionRejectsSizeTOverflow) {
+    MemoryBudget budget(std::numeric_limits<size_t>::max());
+    const size_t first = std::numeric_limits<size_t>::max() - 8;
+    ASSERT_TRUE(budget.reserve(first).ok());
+    EXPECT_FALSE(budget.reserve(16).ok());
+    EXPECT_EQ(budget.used(), first);
+    budget.release(first);
     EXPECT_EQ(budget.used(), 0u);
 }
 

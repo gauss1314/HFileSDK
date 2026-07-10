@@ -14,7 +14,7 @@
 需要区分两层串行/并行语义：
 
 - 父进程层面：不同 implementation 与不同 iteration 仍然串行调度，避免 JNI 与纯 Java 在同一轮里互相抢占资源
-- worker 层面：保留各实现自己的目录转换能力；例如 JNI 目录场景仍可使用 `--parallelism` 对多个 Arrow 文件并行生成多个 HFile
+- worker 层面：一一对应的目录场景中，JNI 与纯 Java 都使用同一个 `--parallelism` 上限并行生成多个 HFile；纯 Java 的每个任务持有独立 converter，结果按输入文件顺序汇总
 
 ## 固定场景
 
@@ -84,7 +84,7 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 - `--implementations`：实现列表，默认同时执行两种实现
 - `--scenario-filter`：只运行匹配场景 ID 的子集
 - `--iterations`：固定为 `3`
-- `--parallelism`：JNI 目录场景的 worker 内并行度；JNI 与纯 Java 两个 implementation 本身仍由父进程串行执行
+- `--parallelism`：一一对应目录场景中 JNI 与纯 Java worker 共用的有界并行度；两个 implementation 本身仍由父进程串行执行
 - `--merge-threshold`：JNI 小文件合并阈值
 - `--trigger-size` / `--trigger-count` / `--trigger-interval`：JNI 小文件合并策略参数
 - `--payload-bytes`：每行 `PAYLOAD` 的字节数
@@ -106,13 +106,16 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 
 - 官方对比口径以 Linux 为准，优先使用相同 `--cpu-set` 和 `--process-memory-mb`
 - 纯 Java 实现不能只设置 `-Xmx`，还应同时设置 `--java-direct-memory-mb`
+- 报告会同时展示每个实现的 `strategy`、`worker_parallelism`、`output_layout`、`hfile_count` 和 `kv_written_count`。只有执行策略、实际 worker 并行度、输出布局、HFile 数和 KV 数全部一致时，`comparison_valid` 才为 `true`，并生成 `java_over_jni_speedup`；否则加速比为 `null`，控制台明确告警
+- 默认 `--merge-threshold 100` 可能让 JNI 目录场景使用 `MERGE-THEN-CONVERT`，而 Java 仍逐文件转换。此时两者耗时只能用于各自生产策略评估，不能作为 JNI/C++ 与 Java 引擎加速比
+- 需要一一对应的目录性能对比时，把 `--merge-threshold` 设为低于最小输入 Arrow 文件实际大小的值，并确认报告中双方均为 `PARALLEL-CONVERT`、相同 `worker_parallelism`、`ONE-HFILE-PER-INPUT` 且 HFile 数相同
 - JNI 报告中的 `sdk_memory_budget_bytes` / `sdk_tracked_memory_peak_bytes` 是 SDK 内部可归因内存，不是整个 worker RSS
 - `--jni-sdk-numeric-sort-fast-path=on` 只适用于满足快路径约束的 rowkey 规则；不满足时会主动失败，便于避免“静默误配”
 
 Linux x86 最高性能起点：
 
 - 单文件延迟：`--parallelism 1`，`--jni-sdk-compression-threads` 先取绑定物理核数的 `1/2`，常见上限从 `8~16` 扫描，`--jni-sdk-compression-queue-depth 0` 让 SDK 自动使用 `clamp(4 * threads, 4, 64)`
-- 目录吞吐：控制 `parallelism * (1 + compression_threads)` 不超过绑定核数的 `75%~90%`，例如 16 核先用 `--parallelism 4 --jni-sdk-compression-threads 2`
+- 目录吞吐：压缩池为进程级共享资源，总线程数近似 `parallelism + compression_threads`。约 1MiB 的小文件先测 `P≈C-2,T=0`；约 10MiB 及以上的独立文件再保持 `P+T≈C`，扫描 `P=C/4,C/2,3C/4`。本机 8 核对应的已验证起点分别是 `P=6,T=0` 和 `P=2,T=6`
 - 纯性能压测且机器内存充足时，`--jni-sdk-max-memory-mb 0` 通常最快；生产演练建议设为进程内存扣除 JVM heap/direct 后的 `60%~70%`
 - 更完整的 Linux x86 参数表和 sweep 命令见仓库根目录 `TESTING.md`
 
@@ -127,10 +130,16 @@ Linux x86 最高性能起点：
 - `implementations`
 - `iteration_ms`
 - `average_ms`
+- `comparison_evaluated` / `comparison_valid` / `comparison_note`
+- `java_over_jni_speedup`（仅可比时为数值，否则为 `null`）
 
 每个实现的每轮结果还会记录：
 
 - `strategy`
+- `worker_parallelism`
+- `output_layout`
+- `hfile_count`
+- `iteration_output_consistent`（三轮 strategy、worker 并行度、HFile 数和 KV 数是否一致）
 - `elapsed_ms`
 - `hfile_size_bytes`
 - `kv_written_count`

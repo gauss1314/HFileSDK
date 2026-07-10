@@ -6,6 +6,7 @@
 #include "codec/compressor.h"
 #include <vector>
 #include <span>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
@@ -14,42 +15,113 @@
 namespace hfile {
 namespace bloom {
 
-/// HBase-compatible MurmurHash (same algorithm as org.apache.hadoop.hbase.util.MurmurHash).
-inline int32_t murmur_hash(const uint8_t* data, size_t len, int32_t seed = 0) noexcept {
-    constexpr int32_t m = 0x5bd1e995;
-    constexpr int32_t r = 24;
-    int32_t h = seed ^ static_cast<int32_t>(len);
+namespace detail {
+
+inline constexpr uint32_t java_signed_byte_bits(uint8_t value) noexcept {
+    return value < 0x80u ? static_cast<uint32_t>(value)
+                         : (0xFFFFFF00u | static_cast<uint32_t>(value));
+}
+
+template <typename ByteAt>
+inline int32_t murmur_hash_bytes(size_t len, ByteAt byte_at,
+                                 int32_t seed) noexcept {
+    constexpr uint32_t m = 0x5bd1e995u;
+    constexpr uint32_t r = 24;
+    uint32_t h = static_cast<uint32_t>(seed) ^ static_cast<uint32_t>(len);
 
     const size_t len_4 = len >> 2;
     for (size_t i = 0; i < len_4; ++i) {
         const size_t i_4 = i << 2;
-        int32_t k = static_cast<int32_t>(data[i_4 + 3]);
-        k <<= 8;
-        k |= static_cast<int32_t>(data[i_4 + 2] & 0xff);
-        k <<= 8;
-        k |= static_cast<int32_t>(data[i_4 + 1] & 0xff);
-        k <<= 8;
-        k |= static_cast<int32_t>(data[i_4 + 0] & 0xff);
+        // This is equivalent to HBase's signed-byte construction: only the
+        // most-significant source byte remains after the Java left shifts.
+        uint32_t k = static_cast<uint32_t>(byte_at(i_4 + 0)) |
+                     (static_cast<uint32_t>(byte_at(i_4 + 1)) << 8) |
+                     (static_cast<uint32_t>(byte_at(i_4 + 2)) << 16) |
+                     (static_cast<uint32_t>(byte_at(i_4 + 3)) << 24);
         k *= m;
-        k ^= static_cast<int32_t>(static_cast<uint32_t>(k) >> r);
+        k ^= k >> r;
         k *= m;
         h *= m;
         h ^= k;
     }
 
+    // HashKey.get() returns Java byte.  HBase deliberately does not mask the
+    // one-to-three trailing bytes, so values >= 0x80 must be sign-extended.
     const size_t len_m = len_4 << 2;
     const size_t left = len - len_m;
     if (left != 0) {
-        if (left >= 3) h ^= static_cast<int32_t>(data[len_m + 2]) << 16;
-        if (left >= 2) h ^= static_cast<int32_t>(data[len_m + 1]) << 8;
-        if (left >= 1) h ^= static_cast<int32_t>(data[len_m]);
+        if (left >= 3)
+            h ^= java_signed_byte_bits(byte_at(len_m + 2)) << 16;
+        if (left >= 2)
+            h ^= java_signed_byte_bits(byte_at(len_m + 1)) << 8;
+        if (left >= 1)
+            h ^= java_signed_byte_bits(byte_at(len_m));
         h *= m;
     }
 
-    h ^= static_cast<int32_t>(static_cast<uint32_t>(h) >> 13);
+    h ^= h >> 13;
     h *= m;
-    h ^= static_cast<int32_t>(static_cast<uint32_t>(h) >> 15);
-    return h;
+    h ^= h >> 15;
+    return std::bit_cast<int32_t>(h);
+}
+
+struct RowColBloomKeyView {
+    std::span<const uint8_t> row;
+    std::span<const uint8_t> qualifier;
+
+    size_t size() const noexcept {
+        // row length + row + empty family length + qualifier + latest ts/type
+        return 2 + row.size() + 1 + qualifier.size() + 8 + 1;
+    }
+
+    uint8_t operator()(size_t offset) const noexcept {
+        if (offset == 0)
+            return static_cast<uint8_t>((row.size() >> 8) & 0xFFu);
+        if (offset == 1)
+            return static_cast<uint8_t>(row.size() & 0xFFu);
+        offset -= 2;
+        if (offset < row.size())
+            return row[offset];
+        offset -= row.size();
+        if (offset == 0)
+            return 0; // HBase ROWCOL Bloom ignores the column family.
+        --offset;
+        if (offset < qualifier.size())
+            return qualifier[offset];
+        offset -= qualifier.size();
+        if (offset == 0)
+            return 0x7Fu; // HConstants.LATEST_TIMESTAMP == Long.MAX_VALUE.
+        if (offset < 8)
+            return 0xFFu;
+        return 0xFFu; // KeyValue.Type.Maximum.
+    }
+};
+
+} // namespace detail
+
+/// HBase-compatible MurmurHash (same algorithm as org.apache.hadoop.hbase.util.MurmurHash).
+inline int32_t murmur_hash(const uint8_t* data, size_t len, int32_t seed = 0) noexcept {
+    // Java/HBase int arithmetic wraps modulo 2^32. Express that contract with
+    // unsigned arithmetic so optimized C++ builds cannot exploit signed UB.
+    return detail::murmur_hash_bytes(
+        len, [data](size_t offset) noexcept { return data[offset]; }, seed);
+}
+
+inline int32_t murmur_hash_row_col(std::span<const uint8_t> row,
+                                   std::span<const uint8_t> qualifier,
+                                   int32_t seed = 0) noexcept {
+    const detail::RowColBloomKeyView key{row, qualifier};
+    return detail::murmur_hash_bytes(
+        key.size(), [&key](size_t offset) noexcept { return key(offset); }, seed);
+}
+
+inline void serialize_row_col_bloom_key(std::span<const uint8_t> row,
+                                        std::span<const uint8_t> qualifier,
+                                        std::vector<uint8_t>* output) {
+    const detail::RowColBloomKeyView key{row, qualifier};
+    output->resize(key.size());
+    for (size_t i = 0; i < key.size(); ++i)
+        (*output)[i] = key(i);
 }
 
 struct BloomWriteResult {
@@ -70,6 +142,12 @@ public:
     static constexpr int     kHashTypeMurmur3 = 1;
     static constexpr double  kDefaultErrorRate  = 0.01;
     static constexpr size_t  kMaxChunkSize      = 128 * 1024;  // 128 KB per chunk
+
+    /// Conservative resident reservation: one active chunk plus at most one
+    /// sealed chunk waiting for the next data-block flush.
+    static constexpr size_t resident_memory_reservation(BloomType type) noexcept {
+        return type == BloomType::None ? 0 : 2 * kMaxChunkSize;
+    }
 
     CompoundBloomFilterWriter(BloomType type        = BloomType::Row,
                               double    error_rate   = kDefaultErrorRate,
@@ -106,11 +184,17 @@ public:
     void add_row_col(std::span<const uint8_t> row,
                      std::span<const uint8_t> qualifier) {
         if (type_ == BloomType::RowCol) {
-            // Concatenate row + qualifier for hashing
-            std::vector<uint8_t> combined(row.size() + qualifier.size());
-            std::memcpy(combined.data(), row.data(), row.size());
-            std::memcpy(combined.data() + row.size(), qualifier.data(), qualifier.size());
-            add(combined);
+            if (cur_keys_ >= chunk_keys_) finish_chunk();
+            const detail::RowColBloomKeyView key{row, qualifier};
+            if (cur_keys_ == 0) {
+                // HBase indexes ROWCOL Bloom chunks with createFirstOnRowCol:
+                // the same logical key used for hashing, not row+qualifier.
+                serialize_row_col_bloom_key(row, qualifier, &cur_first_key_);
+            }
+            const int32_t hash1 = murmur_hash_row_col(row, qualifier, 0);
+            set_bits(hash1, murmur_hash_row_col(row, qualifier, hash1));
+            ++cur_keys_;
+            ++total_keys_;
         } else {
             add(row);
         }
@@ -230,15 +314,34 @@ private:
 
     void set_bits(std::span<const uint8_t> key) noexcept {
         if (cur_chunk_.empty()) return;
-        int32_t hash1 = murmur_hash(key.data(), key.size(), 0);
-        int32_t hash2 = murmur_hash(key.data(), key.size(), hash1);
-        int32_t composite_hash = hash1;
-        int32_t nbits = static_cast<int32_t>(cur_chunk_.size() * 8);
+        const int32_t hash1 = murmur_hash(key.data(), key.size(), 0);
+        const int32_t hash2 = murmur_hash(key.data(), key.size(), hash1);
+        set_bits(hash1, hash2);
+    }
+
+    void set_bits(int32_t hash1, int32_t hash2) noexcept {
+        if (cur_chunk_.empty()) return;
+        uint32_t composite_hash = static_cast<uint32_t>(hash1);
+        const uint32_t hash2_bits = static_cast<uint32_t>(hash2);
+        const uint32_t nbits = static_cast<uint32_t>(cur_chunk_.size() * 8);
+        const bool power_of_two = (nbits & (nbits - 1u)) == 0u;
         for (int i = 0; i < hash_count_; ++i) {
-            int32_t bit = composite_hash % nbits;
-            if (bit < 0) bit = -bit;
+            uint32_t bit = 0;
+            const int32_t signed_hash = std::bit_cast<int32_t>(composite_hash);
+            if (power_of_two) [[likely]] {
+                // Equivalent to abs(signed_hash % nbits) for a power-of-two
+                // Bloom size, without integer division or INT_MIN overflow.
+                const uint32_t magnitude = signed_hash < 0
+                    ? 0u - composite_hash
+                    : composite_hash;
+                bit = magnitude & (nbits - 1u);
+            } else {
+                int64_t remainder = static_cast<int64_t>(signed_hash) % nbits;
+                if (remainder < 0) remainder = -remainder;
+                bit = static_cast<uint32_t>(remainder);
+            }
             cur_chunk_[static_cast<size_t>(bit >> 3)] |= static_cast<uint8_t>(1u << (bit & 7));
-            composite_hash += hash2;
+            composite_hash += hash2_bits;
         }
     }
 

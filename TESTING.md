@@ -239,29 +239,30 @@ strings "$HFILESDK_NATIVE_LIB" | grep -E 'max_memory_bytes|compression_threads|c
 
 关键参数含义：
 
-- `--jni-sdk-compression-threads`：每个 JNI 转换任务内部的 GZip 数据块后台压缩线程数。`0` 表示同步压缩，通常不是 GZip 最高性能。
+- `--jni-sdk-compression-threads`：进程级共享 GZip worker 数，同时限制单个 Writer 的在途压缩任务数。P 个 Writer 同为 T 时总压缩 worker 是 T，不是 P*T；`0` 表示每个文件线程同步压缩。
 - `--jni-sdk-compression-queue-depth`：每个转换任务允许排队的未写出压缩块数量。`0` 表示 SDK 自动使用 `clamp(compression_threads * 4, 4, 64)`。
 - `--jni-sdk-max-memory-mb`：C++ SDK 内部 soft budget。纯性能压测且机器内存足够时可设 `0` 表示不限制，避免预算检查和误限流；生产演练建议设为进程内存上限扣除 JVM heap/direct 后的 `60%~70%`。
 - `--process-memory-mb`：worker 进程 OS 级硬限制。性能压测时不要贴满物理内存，至少给 Linux page cache、文件系统和系统守护进程预留 `20%~30%`。
 
 起步配置表：
 
-| 绑定 CPU 核数 | 单文件延迟：`parallelism` | 单文件延迟：压缩线程 | 单文件延迟：队列 | 目录吞吐：`parallelism` | 目录吞吐：每任务压缩线程 | 目录吞吐：队列 |
+| 绑定 CPU 核数 | 单文件延迟：`parallelism` | 单文件延迟：共享压缩线程 | 单文件延迟：队列 | 小文件目录：`parallelism` | 小文件目录：共享压缩线程 | 队列 |
 |---:|---:|---:|---:|---:|---:|---:|
-| 8 | 1 | 4 | 0 或 8 | 2 | 2 | 0 |
-| 16 | 1 | 8 | 0 或 16 | 4 | 2 | 0 |
-| 32 | 1 | 8~12 | 0 或 `threads*3` | 6~8 | 3 | 0 |
-| 64 | 1 | 12~16 | 0 或 `threads*3` | 8~12 | 3~4 | 0 |
+| 8 | 1 | 4~6 | 0 | 6 | 0 | 0 |
+| 16 | 1 | 8~12 | 0 | 12 | 0 | 0 |
+| 32 | 1 | 12~16 | 0 | 24 | 0 | 0 |
+| 64 | 1 | 16~24 | 0 | 32~48 | 0 | 0 |
 
 调参规则：
 
 - 单文件场景只有一个 Arrow 文件，`--parallelism` 固定为 `1`，主要增加 `--jni-sdk-compression-threads`；通常从物理核数的 `1/2` 起步，超过 `8~16` 后收益会逐步变小。
-- 目录场景会同时跑多个转换任务，总线程数大致是 `parallelism * (1 + compression_threads)`；建议先让这个值不超过绑定核数的 `75%~90%`，再逐步上调。
+- 异步目录场景总线程数大致是 `parallelism + compression_threads`。约 1MiB 的文件先测 `compression_threads=0`，让多个文件线程各自同步压缩；约 10MiB 及以上的独立文件则优先测试 `P+T≈C`，并把 `P` 从 `C/4`、`C/2` 扫到 `3C/4`。本机 8 物理核验证中，100×1MiB 使用 `P=6,T=0`，100×10MiB 使用 `P=2,T=6`；其他 CPU 必须重新找拐点。
 - `compression_queue_depth=0` 是推荐起点，因为 SDK 会自动设置成 `clamp(4 * compression_threads, 4, 64)`；只有需要复现实验时才显式指定。如果看到 RSS 增长但平均耗时不再下降，应减少线程数，而不是继续加深队列。
 - `--jni-sdk-max-memory-mb 0` 通常是纯性能压测最快口径；如果需要避免 OOM kill，则设为 `process_memory_mb - jni_xmx_mb - jni_direct_memory_mb - 4096` 的 `60%~70%`，并确认 `report.json` 里的 `sdk_tracked_memory_peak_bytes` 不贴近预算。
 - `--java-xmx-mb` 和 `--java-direct-memory-mb` 不影响 JNI C++ hot path，但会影响纯 Java 对比实现是否被堆或 direct memory 限制；为了公平，Java 侧也要给足内存。
 - `--compression NONE` 下压缩线程和队列不会启用；只有 `--compression GZ` 或兼容别名 `gzip` 时这些参数才影响性能。
 - 每次只改一个维度，至少保留三轮默认迭代结果。优先比较 `average_ms`、`iteration_ms` 稳定性、`process_peak_rss_bytes` 和 `sdk_tracked_memory_peak_bytes`。
+- 目录 JNI/Java 对比只有在报告 `comparison_valid=true` 时才允许引用 `java_over_jni_speedup`。若 JNI 为 `MERGE-THEN-CONVERT`、Java 为逐文件转换，输出布局不同，加速比必须视为无效。
 
 16 核 / 32 GiB 进程限制的最高性能起步命令：
 

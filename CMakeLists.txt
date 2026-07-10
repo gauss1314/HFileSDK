@@ -257,6 +257,7 @@ set(HFILE_SOURCES
   src/memory/block_pool.cc
   src/memory/memory_budget.cc
   src/codec/compressor.cc
+  src/codec/compression_executor.cc
   src/block/none_encoder.cc
   src/block/block_builder.cc
   src/index/block_index_writer.cc

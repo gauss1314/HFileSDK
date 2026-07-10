@@ -53,6 +53,7 @@ TEST(NoneEncoder, SingleKV) {
     auto data = enc.finish_block();
     EXPECT_GT(data.size(), 0u);
     EXPECT_EQ(data.size(), kv.encoded_size());
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(data.data()) % 64u, 0u);
 }
 
 TEST(NoneEncoder, BlockFull) {

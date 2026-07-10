@@ -12,24 +12,24 @@ import java.util.stream.Stream;
  * Converts a batch of Arrow IPC Stream files to HBase HFile v3 files
  * using a fixed-size thread pool.
  *
- * <h2>核心设计决策：Java 多线程 + 每线程独立 HFileSDK 实例</h2>
+ * <h2>核心设计决策：Java 多线程 + 有界 HFileSDK 会话池</h2>
  *
  * <h3>为什么不在 C++ 内部实现多线程批量接口？</h3>
  * <ol>
  *   <li>每次 {@code convert()} 调用的状态完全独立（sort_index、batches[]、
  *       HFileWriter 均在栈/堆上独立分配），天然线程安全。</li>
- *   <li>JNI 层的全局锁（{@code g_config_mutex}）只在 {@code configure()} 和
- *       实例查找时持有（微秒级），{@code convert()} 主体不持锁，并发调用无阻塞。</li>
- *   <li>Java 线程池提供更灵活的调度（可中途取消、动态调整并发度、监控进度），
- *       C++ 内部线程池则需要额外的 JNI 数组传递、错误聚合、进度回调接口。</li>
+ *   <li>JNI handle registry 只在会话查找时短暂持锁；每个 convert 使用独立
+ *       native state，转换主体不持 registry 锁。</li>
+ *   <li>Java 线程池提供动态并发度和进度聚合。线程 interrupt 只能阻止尚未
+ *       开始的任务；已经进入 JNI 的转换没有原生协作取消点。</li>
  *   <li>内存可控：每线程独立使用内存，峰值 = parallelism × 单文件内存，
  *       可通过调节并发度控制总内存压力。</li>
  * </ol>
  *
  * <h3>线程安全保证</h3>
  * <ul>
- *   <li>每个工作线程有自己的 {@link ArrowToHFileConverter} 实例（持有独立的
- *       {@code HFileSDK} C++ 对象），互不干扰。</li>
+ *   <li>每次转换从有界池独占借用 prepared {@code HFileSDK} native session；
+ *       配置不变时跨任务复用，会话不会被两个转换同时使用。</li>
  *   <li>{@code NativeLibLoader.load()} 有幂等保护，多线程重复调用安全。</li>
  *   <li>输出 HFile 路径各不相同，不存在文件级竞争。</li>
  * </ul>
@@ -110,8 +110,9 @@ public class BatchArrowToHFileConverter {
         }
 
         // ── 3. Submit tasks to thread pool ────────────────────────────────────
-        // Each worker gets its own ArrowToHFileConverter (which holds its own
-        // HFileSDK C++ object). No sharing of state between workers.
+        // One thread-safe converter owns a bounded lease pool of prepared
+        // HFileSDK sessions. Stable options configure once and are reused
+        // without retaining state for historical worker threads.
         ExecutorService pool = Executors.newFixedThreadPool(parallelism,
             r -> {
                 Thread t = new Thread(r, "hfile-convert");
@@ -119,9 +120,12 @@ public class BatchArrowToHFileConverter {
                 return t;
             });
 
-        Map<Path, Future<ConvertResult>> futures = new LinkedHashMap<>();
-        AtomicInteger doneCount = new AtomicInteger(0);
-        long startMs = System.currentTimeMillis();
+        ArrowToHFileConverter converter =
+            new ArrowToHFileConverter(opts.nativeLibPath);
+        try {
+            Map<Path, Future<ConvertResult>> futures = new LinkedHashMap<>();
+            AtomicInteger doneCount = new AtomicInteger(0);
+            long startMs = System.currentTimeMillis();
 
         for (Path arrowFile : arrowFiles) {
             Path hfileOut = resolveHfilePath(arrowFile, opts.hfileDir);
@@ -133,10 +137,6 @@ public class BatchArrowToHFileConverter {
             }
 
             Future<ConvertResult> future = pool.submit(() -> {
-                // Each worker creates its own converter instance —
-                // this is the key to thread safety: no shared HFileSDK state.
-                ArrowToHFileConverter converter = new ArrowToHFileConverter(opts.nativeLibPath);
-
                 ConvertOptions fileOpts = ConvertOptions.builder()
                     .arrowPath(arrowFile.toAbsolutePath().toString())
                     .hfilePath(hfileOut.toAbsolutePath().toString())
@@ -220,7 +220,13 @@ public class BatchArrowToHFileConverter {
             });
         }
 
-        return batch;
+            return batch;
+        } finally {
+            // Signal exceptional-path workers before close waits for any
+            // in-flight convert/getLastResult composite call to leave.
+            pool.shutdownNow();
+            converter.close();
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────

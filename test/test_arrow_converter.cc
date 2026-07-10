@@ -494,6 +494,65 @@ TEST(ArrowConverter, NumericRadixSortOrdersAllUint64Bits) {
     fs::remove_all(dir);
 }
 
+TEST(ArrowConverter, CompactNumericAndStringSortPathsWriteIdenticalBytes) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder value_builder;
+
+    for (const auto& [id, value] : std::vector<std::pair<int64_t, std::string>>{
+             {10, "ten"}, {2, "first-two"}, {999, "last"}, {2, "duplicate-two"}}) {
+        ARROW_EXPECT_OK(id_builder.Append(id));
+        ARROW_EXPECT_OK(value_builder.Append(value));
+    }
+
+    std::shared_ptr<arrow::Array> id_arr, value_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(value_builder.Finish(&value_arr));
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("value", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 4, {id_arr, value_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto numeric_path = dir / "numeric.hfile";
+    auto string_path = dir / "string.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = numeric_path.string();
+    opts.row_key_rule = "ID,0,false,5";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1700000000123LL;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto numeric_result = convert(opts);
+    ASSERT_EQ(numeric_result.error_code, ErrorCode::OK)
+        << numeric_result.error_message;
+    EXPECT_TRUE(numeric_result.numeric_sort_fast_path_used);
+    EXPECT_EQ(numeric_result.duplicate_key_count, 1);
+
+    opts.hfile_path = string_path.string();
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
+    auto string_result = convert(opts);
+    ASSERT_EQ(string_result.error_code, ErrorCode::OK)
+        << string_result.error_message;
+    EXPECT_FALSE(string_result.numeric_sort_fast_path_used);
+    EXPECT_EQ(string_result.duplicate_key_count, 1);
+
+    EXPECT_EQ(read_file(numeric_path), read_file(string_path));
+    auto cells = decode_data_block_cells(read_file(numeric_path));
+    ASSERT_EQ(cells.size(), 3);
+    EXPECT_EQ(cells[0].row, "00002");
+    EXPECT_EQ(cells[0].value, "2|first-two");
+
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey) {
     arrow::StringBuilder rk_builder;
     arrow::Int64Builder age_builder;
@@ -994,6 +1053,7 @@ TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey) {
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";
+    auto reference_hfile_path = dir / "reference.hfile";
     write_ipc_stream(*batch, arrow_path);
 
     ConvertOptions opts;
@@ -1032,6 +1092,13 @@ TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey) {
     ASSERT_NE(row12hz_pos, std::string::npos);
     EXPECT_LT(row2aa_pos, row2sh_pos);
     EXPECT_LT(row2sh_pos, row12hz_pos);
+
+    opts.hfile_path = reference_hfile_path.string();
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
+    auto reference_result = convert(opts);
+    ASSERT_EQ(reference_result.error_code, ErrorCode::OK)
+        << reference_result.error_message;
+    EXPECT_EQ(read_file(hfile_path), read_file(reference_hfile_path));
 
     fs::remove_all(dir);
 }
@@ -1097,6 +1164,70 @@ TEST(ArrowConverter, ConvertFallsBackForNegativeNumericRowKeyValues) {
     ASSERT_NE(row_pos2_pos, std::string::npos);
     EXPECT_LT(row_neg10_pos, row_neg2_pos);
     EXPECT_LT(row_neg2_pos, row_pos2_pos);
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, LateNumericFallbackFitsGenericStringIndexBudget) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder value_builder;
+    ARROW_EXPECT_OK(id_builder.Append(12));
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(id_builder.Append(-7)); // force Auto fallback at the end
+    ARROW_EXPECT_OK(value_builder.Append("twelve"));
+    ARROW_EXPECT_OK(value_builder.Append("two"));
+    ARROW_EXPECT_OK(value_builder.Append("negative"));
+
+    std::shared_ptr<arrow::Array> id_arr, value_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(value_builder.Finish(&value_arr));
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("value", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 3, {id_arr, value_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto generic_path = dir / "generic.hfile";
+    auto fallback_path = dir / "fallback.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions generic_opts;
+    generic_opts.arrow_path = arrow_path.string();
+    generic_opts.hfile_path = generic_path.string();
+    generic_opts.row_key_rule = "ID,0,false,5";
+    generic_opts.column_family = "cf";
+    generic_opts.default_timestamp = 1700000000123LL;
+    generic_opts.writer_opts.column_family = "cf";
+    generic_opts.writer_opts.compression = Compression::None;
+    generic_opts.writer_opts.bloom_type = BloomType::None;
+    generic_opts.writer_opts.max_memory_bytes = 1024 * 1024;
+    generic_opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
+
+    auto generic_result = convert(generic_opts);
+    ASSERT_EQ(generic_result.error_code, ErrorCode::OK)
+        << generic_result.error_message;
+    ASSERT_GT(generic_result.tracked_memory_peak_bytes, 0);
+
+    ConvertOptions fallback_opts = generic_opts;
+    fallback_opts.hfile_path = fallback_path.string();
+    // Keep the aggregate converter+writer limit tight while still covering the
+    // writer's fixed synchronous block buffers.
+    const uint64_t writer_buffer_floor =
+        static_cast<uint64_t>(generic_opts.writer_opts.block_size) + 65536u;
+    fallback_opts.writer_opts.max_memory_bytes =
+        static_cast<size_t>(std::max<uint64_t>(
+            generic_result.tracked_memory_peak_bytes, writer_buffer_floor));
+    fallback_opts.numeric_sort_fast_path = NumericSortFastPathMode::Auto;
+
+    auto fallback_result = convert(fallback_opts);
+    ASSERT_EQ(fallback_result.error_code, ErrorCode::OK)
+        << fallback_result.error_message;
+    EXPECT_FALSE(fallback_result.numeric_sort_fast_path_used);
+    EXPECT_LE(fallback_result.tracked_memory_peak_bytes,
+              generic_result.tracked_memory_peak_bytes);
+    EXPECT_EQ(read_file(generic_path), read_file(fallback_path));
 
     fs::remove_all(dir);
 }
@@ -1362,8 +1493,8 @@ TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertTracksBatchReservedMemoryWithinBudget) {
-    auto batch = make_wide_batch(64);
+TEST(ArrowConverter, WriterOpenFailureReportsAggregateTrackedPeak) {
+    auto batch = make_wide_batch(1);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";
@@ -1377,11 +1508,43 @@ TEST(ArrowConverter, ConvertTracksBatchReservedMemoryWithinBudget) {
     opts.column_family = "cf";
     opts.writer_opts.column_family = "cf";
     opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::Row;
+    opts.writer_opts.max_memory_bytes = 128 * 1024;
+
+    auto result = convert(opts);
+    EXPECT_EQ(result.error_code, ErrorCode::MEMORY_EXHAUSTED);
+    // Pass 1 plus the successfully reserved encoder must be visible even
+    // though the subsequent Bloom reservation prevents writer construction.
+    EXPECT_GT(result.tracked_memory_peak_bytes,
+              static_cast<int64_t>(opts.writer_opts.block_size));
+    EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
+    EXPECT_FALSE(fs::exists(hfile_path));
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertTracksAggregateConverterAndWriterMemoryWithinBudget) {
+    auto batch = make_wide_batch(64);
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::GZip;
     opts.writer_opts.max_memory_bytes = 1024 * 1024;
 
     auto result = convert(opts);
     ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
-    EXPECT_GT(result.tracked_memory_peak_bytes, 0);
+    // This is larger than the retained Arrow/sort data alone and proves the
+    // synchronous writer's encoder/compression buffers are included.
+    EXPECT_GT(result.tracked_memory_peak_bytes,
+              static_cast<int64_t>(opts.writer_opts.block_size * 2));
     EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
 
     fs::remove_all(dir);

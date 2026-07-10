@@ -2,6 +2,7 @@
 
 #include <hfile/types.h>
 #include <hfile/status.h>
+#include "memory/aligned_allocator.h"
 #include <span>
 #include <vector>
 #include <memory>
@@ -135,6 +136,29 @@ public:
 
     /// Reset for the next block.
     virtual void reset() = 0;
+
+    /// Transfer ownership of the finished block storage to the caller and
+    /// install a reusable replacement buffer for the next block.  The caller
+    /// obtains the logical byte count from finish_block() before this call.
+    /// This is used by the asynchronous compression pipeline to avoid copying
+    /// every raw block into a queue-owned vector.
+    virtual memory::AlignedByteBuffer take_finished_buffer(
+        memory::AlignedByteBuffer replacement) noexcept = 0;
+
+    /// Bytes currently owned by the encoder's writable block buffer.  Writer
+    /// implementations use this to keep MemoryBudget accounting synchronized
+    /// with the zero-copy buffer exchanged by take_finished_buffer().
+    virtual size_t buffer_storage_size() const noexcept = 0;
+
+    /// Return the buffer size required before appending a cell with the given
+    /// encoded size.  The returned value includes the encoder's growth policy,
+    /// allowing the writer to reserve MemoryBudget before any allocation.
+    virtual size_t required_buffer_storage(size_t encoded_size) const noexcept = 0;
+
+    /// Grow the writable block buffer to at least `size` bytes.  This may throw
+    /// on allocation failure; HFileWriter converts that failure to Status after
+    /// rolling back its MemoryBudget reservation.
+    virtual void resize_buffer_storage(size_t size) = 0;
 
     /// First key in the current block (for index building).
     virtual std::span<const uint8_t> first_key() const = 0;

@@ -10,9 +10,13 @@
 #include <string>
 #include <stdexcept>
 #include <cstdio>
+#include <atomic>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -31,7 +35,7 @@ static std::string ascii_lower(std::string value) {
 }
 
 struct InstanceState {
-    jobject       weak_ref{nullptr};
+    mutable std::mutex mutex;
     WriterOptions writer_opts;
     NumericSortFastPathMode numeric_sort_fast_path{NumericSortFastPathMode::Auto};
     ConvertResult last_result;
@@ -86,49 +90,94 @@ static ConvertResult make_error_result(int code, std::string message) {
 } // namespace hfile
 
 // ─── Per-instance config / state (set via configure()) ──────────────────────
-static std::mutex                           g_config_mutex;
-static std::vector<hfile::jni::InstanceState> g_instance_states;
-static void cleanup_instance_states_locked(JNIEnv* env) {
-    auto it = g_instance_states.begin();
-    while (it != g_instance_states.end()) {
+//
+// Java owns an opaque monotonically increasing handle.  The registry is used
+// instead of storing a raw pointer in Java so a stale/corrupted handle can be
+// rejected without dereferencing arbitrary memory.  A lookup returns a
+// shared_ptr: nativeDestroySession() removes future access immediately, while
+// a convert already in progress can safely finish without a use-after-free.
+using InstanceStatePtr = std::shared_ptr<hfile::jni::InstanceState>;
+
+static std::shared_mutex g_sessions_mutex;
+static std::unordered_map<jlong, InstanceStatePtr> g_sessions;
+static std::atomic<uint64_t> g_next_session_handle{1};
+
+// Compatibility-only state for HFileSDK.class versions compiled before the
+// nativeHandle API existed. New Java code never enters this registry.
+struct LegacyInstanceState {
+    jweak weak_ref{nullptr};
+    InstanceStatePtr state;
+};
+static std::mutex g_legacy_sessions_mutex;
+static std::vector<LegacyInstanceState> g_legacy_sessions;
+
+static InstanceStatePtr find_instance_state(jlong handle) {
+    if (handle == 0) return {};
+    std::shared_lock<std::shared_mutex> lock(g_sessions_mutex);
+    auto it = g_sessions.find(handle);
+    return it == g_sessions.end() ? InstanceStatePtr{} : it->second;
+}
+
+static jlong create_instance_state() {
+    auto state = std::make_shared<hfile::jni::InstanceState>();
+    state->writer_opts.column_family = "cf";
+
+    // Handle 0 is permanently reserved as the Java-side "closed" sentinel.
+    for (;;) {
+        const auto raw = g_next_session_handle.fetch_add(1, std::memory_order_relaxed);
+        const auto handle = static_cast<jlong>(raw);
+        if (handle == 0) continue;
+        std::unique_lock<std::shared_mutex> lock(g_sessions_mutex);
+        if (g_sessions.emplace(handle, state).second) return handle;
+    }
+}
+
+static void destroy_instance_state(jlong handle) noexcept {
+    if (handle == 0) return;
+    std::unique_lock<std::shared_mutex> lock(g_sessions_mutex);
+    g_sessions.erase(handle);
+}
+
+static InstanceStatePtr get_or_create_legacy_instance_state(JNIEnv* env,
+                                                            jobject obj) {
+    std::lock_guard<std::mutex> lock(g_legacy_sessions_mutex);
+    auto it = g_legacy_sessions.begin();
+    while (it != g_legacy_sessions.end()) {
         if (env->IsSameObject(it->weak_ref, nullptr)) {
             env->DeleteWeakGlobalRef(it->weak_ref);
-            it = g_instance_states.erase(it);
-        } else {
-            ++it;
+            it = g_legacy_sessions.erase(it);
+            continue;
         }
+        if (env->IsSameObject(it->weak_ref, obj)) return it->state;
+        ++it;
     }
-}
 
-static hfile::jni::InstanceState* find_instance_state_locked(JNIEnv* env, jobject obj) {
-    cleanup_instance_states_locked(env);
-    for (auto& state : g_instance_states) {
-        if (env->IsSameObject(state.weak_ref, obj))
-            return &state;
+    auto state = std::make_shared<hfile::jni::InstanceState>();
+    state->writer_opts.column_family = "cf";
+    auto weak_ref = env->NewWeakGlobalRef(obj);
+    if (weak_ref == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return {};
     }
-    return nullptr;
+    g_legacy_sessions.push_back({weak_ref, state});
+    return state;
 }
 
-static hfile::jni::InstanceState& get_or_create_instance_state_locked(JNIEnv* env, jobject obj) {
-    if (auto* state = find_instance_state_locked(env, obj))
-        return *state;
-    hfile::jni::InstanceState state;
-    state.weak_ref = env->NewWeakGlobalRef(obj);
-    state.writer_opts.column_family = "cf";
-    g_instance_states.push_back(std::move(state));
-    return g_instance_states.back();
+static void set_instance_result(const InstanceStatePtr& state,
+                                const hfile::ConvertResult& result) {
+    if (!state) return;
+    // JSON construction may allocate; keep it outside the instance lock so a
+    // concurrent getLastResult() is not blocked by formatting work.
+    std::string result_json = hfile::jni::result_to_json(result);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->last_result = result;
+    state->last_result_json = std::move(result_json);
 }
 
-static void set_instance_result(JNIEnv* env, jobject obj, const hfile::ConvertResult& result) {
-    std::lock_guard<std::mutex> lk(g_config_mutex);
-    auto& state = get_or_create_instance_state_locked(env, obj);
-    state.last_result = result;
-    state.last_result_json = hfile::jni::result_to_json(result);
-}
-
-static hfile::WriterOptions get_instance_writer_opts(JNIEnv* env, jobject obj) {
-    std::lock_guard<std::mutex> lk(g_config_mutex);
-    return get_or_create_instance_state_locked(env, obj).writer_opts;
+static hfile::ConvertResult invalid_session_result() {
+    return hfile::jni::make_error_result(
+        hfile::ErrorCode::INTERNAL_ERROR,
+        "HFileSDK native session is closed or invalid");
 }
 
 /// Retrieve a snapshot of the full InstanceState (writer_opts + exclusions).
@@ -140,9 +189,9 @@ struct InstanceSnapshot {
     std::vector<std::string> excluded_columns;
     std::vector<std::string> excluded_column_prefixes;
 };
-static InstanceSnapshot get_instance_snapshot(JNIEnv* env, jobject obj) {
-    std::lock_guard<std::mutex> lk(g_config_mutex);
-    const auto& s = get_or_create_instance_state_locked(env, obj);
+static InstanceSnapshot get_instance_snapshot(const InstanceStatePtr& state) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto& s = *state;
     return {
         s.writer_opts,
         s.numeric_sort_fast_path,
@@ -155,6 +204,33 @@ static InstanceSnapshot get_instance_snapshot(JNIEnv* env, jobject obj) {
 // ─── JNI exports ─────────────────────────────────────────────────────────────
 extern "C" {
 
+/** Allocate an opaque native session for one HFileSDK Java object. */
+JNIEXPORT jlong JNICALL
+Java_com_hfile_HFileSDK_nativeCreateSession(JNIEnv*, jclass)
+{
+    try {
+        return create_instance_state();
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[ERROR] JNI nativeCreateSession: %s\n", e.what());
+        return 0;
+    } catch (...) {
+        fprintf(stderr, "[ERROR] JNI nativeCreateSession: unknown exception\n");
+        return 0;
+    }
+}
+
+/** Remove a session from the registry. Safe and idempotent. */
+JNIEXPORT void JNICALL
+Java_com_hfile_HFileSDK_nativeDestroySession(JNIEnv*, jclass, jlong handle)
+{
+    try {
+        destroy_instance_state(handle);
+    } catch (...) {
+        // Cleaner callbacks must never surface a C++ exception into the JVM.
+        fprintf(stderr, "[ERROR] JNI nativeDestroySession: unknown exception\n");
+    }
+}
+
 /**
  * Java: public native int convert(String arrowPath, String hfilePath,
  *                                  String tableName, String rowKeyRule)
@@ -164,13 +240,15 @@ extern "C" {
  *
  * Returns: 0 = success, non-zero = ErrorCode constant
  */
-JNIEXPORT jint JNICALL
-Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
-                                 jstring j_arrow_path,
-                                 jstring j_hfile_path,
-                                 jstring j_table_name,
-                                 jstring j_row_key_rule)
+static jint convert_with_state(JNIEnv* env,
+                               const InstanceStatePtr& state,
+                               jstring j_arrow_path,
+                               jstring j_hfile_path,
+                               jstring j_table_name,
+                               jstring j_row_key_rule)
 {
+    if (!state) return hfile::ErrorCode::INTERNAL_ERROR;
+
     try {
         using namespace hfile::jni;
 
@@ -186,7 +264,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
                 ? hfile::ErrorCode::INVALID_ARGUMENT
                 : hfile::ErrorCode::INTERNAL_ERROR,
                 "arrowPath: " + s.message());
-            set_instance_result(env, obj, r);
+            set_instance_result(state, r);
             return r.error_code;
         }
         s = jstring_to_string(env, j_hfile_path, &hfile_path);
@@ -196,21 +274,21 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
                 ? hfile::ErrorCode::INVALID_ARGUMENT
                 : hfile::ErrorCode::INTERNAL_ERROR,
                 "hfilePath: " + s.message());
-            set_instance_result(env, obj, r);
+            set_instance_result(state, r);
             return r.error_code;
         }
         s = optional_jstring_to_string(env, j_table_name, &table_name);
         if (!s.ok()) {
             auto r = make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
                                        "tableName: " + s.message());
-            set_instance_result(env, obj, r);
+            set_instance_result(state, r);
             return r.error_code;
         }
         s = optional_jstring_to_string(env, j_row_key_rule, &row_key_rule);
         if (!s.ok()) {
             auto r = make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
                                        "rowKeyRule: " + s.message());
-            set_instance_result(env, obj, r);
+            set_instance_result(state, r);
             return r.error_code;
         }
 
@@ -218,7 +296,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
         if (arrow_path.empty() || hfile_path.empty()) {
             auto r = make_error_result(hfile::ErrorCode::INVALID_ARGUMENT,
                                        "arrowPath and hfilePath must not be null/empty");
-            set_instance_result(env, obj, r);
+            set_instance_result(state, r);
             return r.error_code;
         }
 
@@ -229,7 +307,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
         opts.table_name   = table_name;
         opts.row_key_rule = row_key_rule;
 
-        auto snap = get_instance_snapshot(env, obj);
+        auto snap = get_instance_snapshot(state);
         opts.writer_opts  = snap.writer_opts;
         opts.numeric_sort_fast_path = snap.numeric_sort_fast_path;
         opts.default_timestamp = snap.default_timestamp_ms;
@@ -245,7 +323,7 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
         // ── Execute conversion ────────────────────────────────────────────
         hfile::ConvertResult result = hfile::convert(opts);
 
-        set_instance_result(env, obj, result);
+        set_instance_result(state, result);
 
         return result.error_code;
 
@@ -254,15 +332,32 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
         auto r = hfile::jni::make_error_result(
             hfile::ErrorCode::INTERNAL_ERROR,
             std::string("Internal C++ exception: ") + e.what());
-        set_instance_result(env, obj, r);
+        set_instance_result(state, r);
         return r.error_code;
     } catch (...) {
         fprintf(stderr, "[ERROR] JNI convert: unknown exception\n");
         auto r = hfile::jni::make_error_result(
             hfile::ErrorCode::INTERNAL_ERROR,
             "Internal C++ exception: unknown");
-        set_instance_result(env, obj, r);
+        set_instance_result(state, r);
         return r.error_code;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_hfile_HFileSDK_nativeConvert(JNIEnv* env, jclass,
+                                      jlong handle,
+                                      jstring j_arrow_path,
+                                      jstring j_hfile_path,
+                                      jstring j_table_name,
+                                      jstring j_row_key_rule)
+{
+    try {
+        return convert_with_state(env, find_instance_state(handle),
+                                  j_arrow_path, j_hfile_path,
+                                  j_table_name, j_row_key_rule);
+    } catch (...) {
+        return hfile::ErrorCode::INTERNAL_ERROR;
     }
 }
 
@@ -270,17 +365,31 @@ Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
  * Java: public native String getLastResult()
  * Returns JSON string with the details of the last convert() call.
  */
-JNIEXPORT jstring JNICALL
-Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject obj)
+static jstring get_last_result_with_state(JNIEnv* env,
+                                          const InstanceStatePtr& state)
 {
     try {
-        std::string result_json = "{}";
+        if (!state) {
+            const std::string invalid_json =
+                hfile::jni::result_to_json(invalid_session_result());
+            return env->NewStringUTF(invalid_json.c_str());
+        }
+        std::string result_json;
         {
-            std::lock_guard<std::mutex> lk(g_config_mutex);
-            if (auto* state = find_instance_state_locked(env, obj))
-                result_json = state->last_result_json;
+            std::lock_guard<std::mutex> lock(state->mutex);
+            result_json = state->last_result_json;
         }
         return env->NewStringUTF(result_json.c_str());
+    } catch (...) {
+        return env->NewStringUTF("{}");
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_hfile_HFileSDK_nativeGetLastResult(JNIEnv* env, jclass, jlong handle)
+{
+    try {
+        return get_last_result_with_state(env, find_instance_state(handle));
     } catch (...) {
         return env->NewStringUTF("{}");
     }
@@ -291,44 +400,46 @@ Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject obj)
  * Apply global configuration before the first convert() call.
  * configJson: {"compression":"GZ","block_size":65536,"column_family":"cf",...}
  */
-JNIEXPORT jint JNICALL
-Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
+static jint configure_with_state(JNIEnv* env,
+                                 const InstanceStatePtr& state,
+                                 jstring j_config)
 {
+    if (!state) return hfile::ErrorCode::INTERNAL_ERROR;
+
     try {
         std::string config;
         auto str_status = hfile::jni::optional_jstring_to_string(env, j_config, &config);
         if (!str_status.ok()) {
             auto r = hfile::jni::make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
                                                    "configJson: " + str_status.message());
-            set_instance_result(env, obj, r);
+            set_instance_result(state, r);
             return r.error_code;
         }
         if (config.empty()) {
-            set_instance_result(env, obj, hfile::ConvertResult{});
+            set_instance_result(state, hfile::ConvertResult{});
             return 0;
         }
 
-        std::lock_guard<std::mutex> lk(g_config_mutex);
-        auto& state = get_or_create_instance_state_locked(env, obj);
-        auto next_opts = state.writer_opts;
-        auto next_numeric_sort_fast_path = state.numeric_sort_fast_path;
-        auto next_default_timestamp_ms = state.default_timestamp_ms;
-        auto next_excluded_columns = state.excluded_columns;
-        auto next_excluded_column_prefixes = state.excluded_column_prefixes;
+        std::lock_guard<std::mutex> lock(state->mutex);
+        auto next_opts = state->writer_opts;
+        auto next_numeric_sort_fast_path = state->numeric_sort_fast_path;
+        auto next_default_timestamp_ms = state->default_timestamp_ms;
+        auto next_excluded_columns = state->excluded_columns;
+        auto next_excluded_column_prefixes = state->excluded_column_prefixes;
         auto fail_config = [&](std::string message) {
-            state.last_result = hfile::jni::make_error_result(
+            state->last_result = hfile::jni::make_error_result(
                 hfile::ErrorCode::INVALID_ARGUMENT, std::move(message));
-            state.last_result_json = hfile::jni::result_to_json(state.last_result);
-            return state.last_result.error_code;
+            state->last_result_json = hfile::jni::result_to_json(state->last_result);
+            return state->last_result.error_code;
         };
 
         hfile::jni::JsonConfigObject cfg;
         auto parse_status = hfile::jni::parse_json_config(config, &cfg);
         if (!parse_status.ok()) {
-            state.last_result = hfile::jni::make_error_result(
+            state->last_result = hfile::jni::make_error_result(
                 hfile::ErrorCode::INVALID_ARGUMENT, parse_status.message());
-            state.last_result_json = hfile::jni::result_to_json(state.last_result);
-            return state.last_result.error_code;
+            state->last_result_json = hfile::jni::result_to_json(state->last_result);
+            return state->last_result.error_code;
         }
 
         static const std::unordered_set<std::string> kAllowedKeys = {
@@ -416,12 +527,17 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
         }
 
         if (auto ct = hfile::jni::config_int(cfg, "compression_threads")) {
-            if (*ct < 0) return fail_config("compression_threads must be >= 0");
+            if (*ct < 0 ||
+                static_cast<uint64_t>(*ct) >
+                    std::numeric_limits<uint32_t>::max()) {
+                return fail_config("compression_threads must be 0-4294967295");
+            }
             next_opts.compression_threads = static_cast<uint32_t>(*ct);
         }
 
         if (auto cq = hfile::jni::config_int(cfg, "compression_queue_depth")) {
-            if (*cq < 0) return fail_config("compression_queue_depth must be >= 0");
+            if (*cq < 0 || *cq > 4096)
+                return fail_config("compression_queue_depth must be 0-4096");
             next_opts.compression_queue_depth = static_cast<uint32_t>(*cq);
         }
 
@@ -453,18 +569,83 @@ Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
             next_excluded_column_prefixes = std::move(*pfxs);
         }
 
-        state.writer_opts = std::move(next_opts);
-        state.numeric_sort_fast_path = next_numeric_sort_fast_path;
-        state.default_timestamp_ms = next_default_timestamp_ms;
-        state.excluded_columns = std::move(next_excluded_columns);
-        state.excluded_column_prefixes = std::move(next_excluded_column_prefixes);
-        state.last_result = {};
-        state.last_result_json = hfile::jni::result_to_json(state.last_result);
+        state->writer_opts = std::move(next_opts);
+        state->numeric_sort_fast_path = next_numeric_sort_fast_path;
+        state->default_timestamp_ms = next_default_timestamp_ms;
+        state->excluded_columns = std::move(next_excluded_columns);
+        state->excluded_column_prefixes = std::move(next_excluded_column_prefixes);
+        state->last_result = {};
+        state->last_result_json = hfile::jni::result_to_json(state->last_result);
         return 0;
     } catch (...) {
         auto r = hfile::jni::make_error_result(hfile::ErrorCode::INTERNAL_ERROR,
                                                "Internal C++ exception during configure()");
-        set_instance_result(env, obj, r);
+        set_instance_result(state, r);
+        return hfile::ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_hfile_HFileSDK_nativeConfigure(JNIEnv* env, jclass,
+                                        jlong handle, jstring j_config)
+{
+    try {
+        return configure_with_state(env, find_instance_state(handle), j_config);
+    } catch (...) {
+        return hfile::ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+/** Test-only visibility probe for deterministic lifecycle assertions. */
+JNIEXPORT jboolean JNICALL
+Java_com_hfile_HFileSDK_nativeSessionExistsForTesting(JNIEnv*, jclass, jlong handle)
+{
+    try {
+        return find_instance_state(handle) ? JNI_TRUE : JNI_FALSE;
+    } catch (...) {
+        return JNI_FALSE;
+    }
+}
+
+// ─── Legacy HFileSDK.class JNI ABI shims ────────────────────────────────────
+// These exact symbols keep older already-compiled Java artifacts loadable. The
+// new class calls only native*Session/native* methods above, so its hot path
+// never scans the compatibility weak-reference table.
+JNIEXPORT jint JNICALL
+Java_com_hfile_HFileSDK_convert(JNIEnv* env, jobject obj,
+                                jstring j_arrow_path,
+                                jstring j_hfile_path,
+                                jstring j_table_name,
+                                jstring j_row_key_rule)
+{
+    try {
+        return convert_with_state(env,
+                                  get_or_create_legacy_instance_state(env, obj),
+                                  j_arrow_path, j_hfile_path,
+                                  j_table_name, j_row_key_rule);
+    } catch (...) {
+        return hfile::ErrorCode::INTERNAL_ERROR;
+    }
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_hfile_HFileSDK_getLastResult(JNIEnv* env, jobject obj)
+{
+    try {
+        return get_last_result_with_state(
+            env, get_or_create_legacy_instance_state(env, obj));
+    } catch (...) {
+        return env->NewStringUTF("{}");
+    }
+}
+
+JNIEXPORT jint JNICALL
+Java_com_hfile_HFileSDK_configure(JNIEnv* env, jobject obj, jstring j_config)
+{
+    try {
+        return configure_with_state(
+            env, get_or_create_legacy_instance_state(env, obj), j_config);
+    } catch (...) {
         return hfile::ErrorCode::INTERNAL_ERROR;
     }
 }
