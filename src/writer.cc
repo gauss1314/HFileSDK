@@ -24,8 +24,8 @@
 #include <cstdlib>
 #include <cstdio>   // stderr logging (no external dep)
 #include <limits>
-#include <map>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #if !defined(_WIN32) && !defined(_WIN64)
@@ -54,7 +54,11 @@ uint32_t effective_compression_queue_depth(const WriterOptions& opts) noexcept {
     if (opts.compression_queue_depth > 0) {
         return opts.compression_queue_depth;
     }
-    return std::max<uint32_t>(2u, opts.compression_threads * 2u);
+    // Four blocks per worker kept the compressor fed across short scheduling
+    // stalls in the production-shaped matrix. Cap the automatic value so a
+    // large CPU count cannot multiply per-writer memory without bound.
+    const uint64_t target = static_cast<uint64_t>(opts.compression_threads) * 4u;
+    return static_cast<uint32_t>(std::clamp<uint64_t>(target, 4u, 64u));
 }
 
 struct QueuedCompressedBlock {
@@ -765,9 +769,12 @@ private:
 
             {
                 std::lock_guard<std::mutex> lock(compression_mu_);
-                compression_ready_blocks_.emplace(ready.sequence, std::move(ready));
+                auto& slot = compression_ready_slots_[
+                    static_cast<size_t>(ready.sequence % compression_ready_slots_.size())];
+                slot.emplace(std::move(ready));
             }
-            compression_ready_cv_.notify_all();
+            // Only the writer thread consumes ready blocks.
+            compression_ready_cv_.notify_one();
         }
     }
 
@@ -776,6 +783,8 @@ private:
             return;
         }
         compression_stop_requested_ = false;
+        compression_ready_slots_.clear();
+        compression_ready_slots_.resize(compression_queue_depth_);
         compression_workers_.reserve(compression_threads_);
         for (uint32_t idx = 0; idx < compression_threads_; ++idx) {
             compression_workers_.emplace_back([this]() {
@@ -856,17 +865,22 @@ private:
         {
             std::unique_lock<std::mutex> lock(compression_mu_);
             auto next_ready = [&]() {
-                return compression_ready_blocks_.find(next_write_block_sequence_) !=
-                       compression_ready_blocks_.end();
+                const auto& slot = compression_ready_slots_[
+                    static_cast<size_t>(
+                        next_write_block_sequence_ % compression_ready_slots_.size())];
+                return slot.has_value() &&
+                       slot->sequence == next_write_block_sequence_;
             };
             if (wait) {
                 compression_ready_cv_.wait(lock, next_ready);
             } else if (!next_ready()) {
                 return Status::OK();
             }
-            auto it = compression_ready_blocks_.find(next_write_block_sequence_);
-            ready = std::move(it->second);
-            compression_ready_blocks_.erase(it);
+            auto& slot = compression_ready_slots_[
+                static_cast<size_t>(
+                    next_write_block_sequence_ % compression_ready_slots_.size())];
+            ready = std::move(*slot);
+            slot.reset();
         }
 
         HFILE_RETURN_IF_ERROR(write_ready_data_block(std::move(ready)));
@@ -1553,7 +1567,7 @@ private:
     std::condition_variable compression_cv_;
     std::condition_variable compression_ready_cv_;
     std::deque<QueuedCompressedBlock> compression_pending_blocks_;
-    std::map<uint64_t, ReadyCompressedBlock> compression_ready_blocks_;
+    std::vector<std::optional<ReadyCompressedBlock>> compression_ready_slots_;
     std::vector<std::thread> compression_workers_;
     bool compression_stop_requested_{false};
 

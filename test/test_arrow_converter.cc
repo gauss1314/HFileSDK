@@ -273,6 +273,80 @@ TEST(ArrowConverter, ConvertBuildsValueInArrowColumnOrder) {
     fs::remove_all(dir);
 }
 
+TEST(ArrowConverter, ConvertPreservesJoinedValueTextFormatting) {
+    arrow::StringBuilder id_builder;
+    arrow::Int64Builder signed_builder;
+    arrow::UInt64Builder unsigned_builder;
+    arrow::BooleanBuilder bool_builder;
+    arrow::FloatBuilder float_builder;
+    arrow::DoubleBuilder double_builder;
+    arrow::TimestampBuilder timestamp_builder(
+        arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
+    arrow::BinaryBuilder binary_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append("row"));
+    ARROW_EXPECT_OK(signed_builder.Append(-42));
+    ARROW_EXPECT_OK(unsigned_builder.Append(18446744073709551615ULL));
+    ARROW_EXPECT_OK(bool_builder.Append(true));
+    ARROW_EXPECT_OK(float_builder.Append(1.25F));
+    ARROW_EXPECT_OK(double_builder.Append(-2.5));
+    ARROW_EXPECT_OK(timestamp_builder.Append(1234567));
+    ARROW_EXPECT_OK(binary_builder.Append(
+        reinterpret_cast<const uint8_t*>("bin"), 3));
+
+    std::shared_ptr<arrow::Array> id_arr, signed_arr, unsigned_arr, bool_arr;
+    std::shared_ptr<arrow::Array> float_arr, double_arr, timestamp_arr, binary_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(signed_builder.Finish(&signed_arr));
+    ARROW_EXPECT_OK(unsigned_builder.Finish(&unsigned_arr));
+    ARROW_EXPECT_OK(bool_builder.Finish(&bool_arr));
+    ARROW_EXPECT_OK(float_builder.Finish(&float_arr));
+    ARROW_EXPECT_OK(double_builder.Finish(&double_arr));
+    ARROW_EXPECT_OK(timestamp_builder.Finish(&timestamp_arr));
+    ARROW_EXPECT_OK(binary_builder.Finish(&binary_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::utf8()),
+        arrow::field("signed", arrow::int64()),
+        arrow::field("unsigned", arrow::uint64()),
+        arrow::field("bool", arrow::boolean()),
+        arrow::field("float", arrow::float32()),
+        arrow::field("double", arrow::float64()),
+        arrow::field("timestamp", arrow::timestamp(arrow::TimeUnit::MICRO)),
+        arrow::field("binary", arrow::binary()),
+    });
+    auto batch = arrow::RecordBatch::Make(
+        schema, 1,
+        {id_arr, signed_arr, unsigned_arr, bool_arr, float_arr, double_arr,
+         timestamp_arr, binary_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::None;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+
+    auto cells = decode_data_block_cells(read_file(hfile_path));
+    ASSERT_EQ(cells.size(), 1);
+    EXPECT_EQ(cells[0].value,
+              "row|-42|18446744073709551615|1|1.250000|-2.500000|1234|Ymlu");
+
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
     arrow::StringBuilder rk_builder;
     arrow::Int64Builder age_builder;
@@ -318,6 +392,104 @@ TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
     EXPECT_EQ(result.kv_written_count, 1);
     EXPECT_EQ(result.kv_skipped_count, 1);
     EXPECT_TRUE(fs::exists(hfile_path));
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, NumericRadixSortKeepsFirstDuplicateSourceRow) {
+    arrow::Int64Builder id_builder;
+    arrow::StringBuilder value_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(2));
+    ARROW_EXPECT_OK(value_builder.Append("two"));
+    ARROW_EXPECT_OK(id_builder.Append(1));
+    ARROW_EXPECT_OK(value_builder.Append("first"));
+    ARROW_EXPECT_OK(id_builder.Append(1));
+    ARROW_EXPECT_OK(value_builder.Append("second"));
+
+    std::shared_ptr<arrow::Array> id_arr, value_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    ARROW_EXPECT_OK(value_builder.Finish(&value_arr));
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("value", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 3, {id_arr, value_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,5";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_TRUE(result.numeric_sort_fast_path_used);
+    EXPECT_EQ(result.duplicate_key_count, 1);
+    EXPECT_EQ(result.kv_written_count, 2);
+    EXPECT_EQ(result.kv_skipped_count, 1);
+
+    auto cells = decode_data_block_cells(read_file(hfile_path));
+    ASSERT_EQ(cells.size(), 2);
+    EXPECT_EQ(cells[0].row, "00001");
+    EXPECT_EQ(cells[0].value, "1|first");
+    EXPECT_EQ(cells[1].row, "00002");
+    EXPECT_EQ(cells[1].value, "2|two");
+
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, NumericRadixSortOrdersAllUint64Bits) {
+    arrow::UInt64Builder id_builder;
+
+    ARROW_EXPECT_OK(id_builder.Append(UINT64_MAX));
+    ARROW_EXPECT_OK(id_builder.Append(1));
+    ARROW_EXPECT_OK(id_builder.Append(UINT64_C(1) << 63));
+    ARROW_EXPECT_OK(id_builder.Append(0));
+
+    std::shared_ptr<arrow::Array> id_arr;
+    ARROW_EXPECT_OK(id_builder.Finish(&id_arr));
+    auto schema = arrow::schema({arrow::field("id", arrow::uint64())});
+    auto batch = arrow::RecordBatch::Make(schema, 4, {id_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,20";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::None;
+    opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_TRUE(result.numeric_sort_fast_path_used);
+
+    auto cells = decode_data_block_cells(read_file(hfile_path));
+    ASSERT_EQ(cells.size(), 4);
+    EXPECT_EQ(cells[0].row, "00000000000000000000");
+    EXPECT_EQ(cells[1].row, "00000000000000000001");
+    EXPECT_EQ(cells[2].row, "09223372036854775808");
+    EXPECT_EQ(cells[3].row, "18446744073709551615");
 
     fs::remove_all(dir);
 }
@@ -1187,5 +1359,30 @@ TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall) {
     EXPECT_FALSE(result.error_message.empty());
     EXPECT_EQ(result.memory_budget_bytes, 1);
     EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
+    fs::remove_all(dir);
+}
+
+TEST(ArrowConverter, ConvertTracksBatchReservedMemoryWithinBudget) {
+    auto batch = make_wide_batch(64);
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "ID,0,false,0";
+    opts.column_family = "cf";
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.max_memory_bytes = 1024 * 1024;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+    EXPECT_GT(result.tracked_memory_peak_bytes, 0);
+    EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
+
     fs::remove_all(dir);
 }

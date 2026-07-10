@@ -107,6 +107,88 @@ writer->finish();  // AutoSort + 写 Index、Bloom、FileInfo、Trailer
 
 ***
 
+## JNI/C++ 性能调优
+
+以下建议以**可分配给转换进程的物理 CPU 核数** `C` 为基准，而不是机器的逻辑线程总数。生产环境还会同时运行 JVM、HDFS 客户端和其他任务时，应先按容器的 CPU quota / cpuset 折算 `C`。不要在 SDK 内按宿主机总核数自动开满线程：同一个进程可能并发转换多个文件，自动开满会造成严重超卖。
+
+### 关键参数
+
+JNI `configure()` 和性能工具使用以下参数：
+
+| JNI 配置 | 性能工具参数 | 含义 |
+| --- | --- | --- |
+| `compression_threads` | `--jni-sdk-compression-threads` | 每个转换任务的 GZip 后台压缩线程数；`0` 表示同步压缩 |
+| `compression_queue_depth` | `--jni-sdk-compression-queue-depth` | 每个转换任务允许存在的 in-flight 数据块数；`0` 表示自动取 `clamp(4 * compression_threads, 4, 64)` |
+| `max_memory_bytes` | `--jni-sdk-max-memory-mb` | SDK 可归因内存预算；生产环境建议显式设置，`0` 仅适合资源已被外层严格限制的压测或专用进程 |
+| `numeric_sort_fast_path` | `--jni-sdk-numeric-sort-fast-path` | `auto`、`on` 或 `off`；生产默认用 `auto` |
+
+`compression_queue_depth=0` 是推荐值。自动队列会随压缩线程数增长，同时封顶 64，避免高核机器上按每个 writer 无界放大内存。显式值主要用于复现实验；队列过小会让压缩线程断粮，过大通常只增加内存。
+
+### 按 CPU 核数选择起点
+
+单个大文件追求最低延迟时使用 `parallelism=1`，从下表起步：
+
+| 可用物理核 `C` | `compression_threads` | `compression_queue_depth` |
+| ---: | ---: | ---: |
+| 4 | 2 | 0（自动为 8） |
+| 8 | 4～6 | 0（自动为 16～24） |
+| 16 | 8～12 | 0（自动为 32～48） |
+| 32 | 12～16 | 0（自动为 48～64） |
+| 64 及以上 | 16～24 | 0（自动封顶 64） |
+
+目录批量转换追求总吞吐时，先确定并发文件数 `P=parallelism`，再确定每个任务的压缩线程数 `T=compression_threads`。推荐满足：
+
+```text
+P * (1 + T) <= C * 75%～90%
+```
+
+这里的 `1` 是每个任务的读取、排序、编码和写出线程。可从以下组合开始，再按真实数据 sweep：
+
+| 可用物理核 `C` | 并发文件 `P` | 每任务压缩线程 `T` | 自动队列 |
+| ---: | ---: | ---: | ---: |
+| 4 | 1 | 2 | 8 |
+| 8 | 2 | 3 | 12 |
+| 16 | 4 | 2 | 8 |
+| 32 | 6～8 | 3 | 12 |
+| 64 | 8～12 | 3～4 | 12～16 |
+
+如果机器启用了 SMT/超线程，GZip 通常不能把两个逻辑线程当成两个完整物理核使用；优先按物理核配额起步。跨 NUMA 节点时，优先把进程 CPU 和内存绑定在同一节点，并让输入、临时目录和输出落在本地 NVMe/SSD。
+
+### 内存、排序与格式参数
+
+- 每个活跃 writer 的压缩流水线内存大致随 `queue_depth * block_size` 线性增长，实际还包含未压缩块、压缩输出上界、Bloom、索引、Arrow batches 和排序索引。并发转换时必须再乘以 `P`。
+- `max_memory_bytes` 是 SDK 内部 soft budget，不等于整个进程 RSS。生产值应从进程硬限制中扣除 JVM heap、Arrow direct memory、JNI/JVM 固定开销和系统余量；压测后确认 `tracked_memory_peak_bytes` 不贴近预算。
+- `numeric_sort_fast_path=auto` 会只在首段 row key 是非负数、左侧补 `0` 且值不超过 `padLen` 时启用；纯数值 row key 使用稳定基数排序，预算不足则自动回退到原地比较排序。`on` 适合校验数据是否完全满足快路径前提，`off` 仅用于诊断或 A/B。
+- 保持 `block_size=65536`、`compression=GZ`、`compression_level=1`、`encoding=NONE` 可维持当前文件布局和读写兼容基线。修改 block size、压缩方式、Bloom 或编码会改变 HFile 字节内容，必须重新做 HBase Reader 与 Bulk Load 验证。
+- `compression=NONE` 不启用压缩流水线，此时压缩线程和队列参数不会带来收益。
+
+### 在目标机器上做三轮 sweep
+
+性能结论必须在生产同型号 CPU、文件系统和典型 Arrow 数据上复核。每次只改变一个维度，性能工具固定执行三轮；比较 `average_ms`、每轮波动、`process_peak_rss_bytes`、`sdk_tracked_memory_peak_bytes`，并用 `hfile-verify` 校验结果。
+
+例如 16 个可用物理核的单文件 GZip 起步命令：
+
+```bash
+java -jar tools/hfile-bulkload-perf/target/hfile-bulkload-perf-1.0.0.jar \
+  --native-lib ./build/libhfilesdk.so \
+  --implementations arrow-to-hfile,arrow-to-hfile-java \
+  --scenario-filter single-500mb \
+  --compression GZ \
+  --encoding NONE \
+  --bloom row \
+  --block-size 65536 \
+  --parallelism 1 \
+  --jni-sdk-compression-threads 8 \
+  --jni-sdk-compression-queue-depth 0 \
+  --jni-sdk-numeric-sort-fast-path auto \
+  --work-dir /data/tmp/hfilesdk-perf \
+  --report-json /data/tmp/hfilesdk-perf/report.json
+```
+
+单文件建议依次测试 `T` 的相邻值，例如 16 核测试 `6/8/10/12`；目录场景则先按上式扫描 `P`，再在最佳 `P` 下扫描 `T`。若增加线程后均值不再下降或波动、RSS 上升，就使用前一个配置。完整矩阵和 CPU/内存隔离命令见 [TESTING.md](TESTING.md) 与 [性能工具说明](tools/hfile-bulkload-perf/README.md)。
+
+***
+
 ## 模块架构
 
 ```

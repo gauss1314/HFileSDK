@@ -111,7 +111,7 @@ bash scripts/hfile-bulkload-perf-runner.sh \
 
 Linux x86 最高性能起点：
 
-- 单文件延迟：`--parallelism 1`，`--jni-sdk-compression-threads` 先取绑定核数的 `1/2`，常见上限从 `8~16` 扫描，`--jni-sdk-compression-queue-depth 0` 让 SDK 自动使用 `2 * threads`
+- 单文件延迟：`--parallelism 1`，`--jni-sdk-compression-threads` 先取绑定物理核数的 `1/2`，常见上限从 `8~16` 扫描，`--jni-sdk-compression-queue-depth 0` 让 SDK 自动使用 `clamp(4 * threads, 4, 64)`
 - 目录吞吐：控制 `parallelism * (1 + compression_threads)` 不超过绑定核数的 `75%~90%`，例如 16 核先用 `--parallelism 4 --jni-sdk-compression-threads 2`
 - 纯性能压测且机器内存充足时，`--jni-sdk-max-memory-mb 0` 通常最快；生产演练建议设为进程内存扣除 JVM heap/direct 后的 `60%~70%`
 - 更完整的 Linux x86 参数表和 sweep 命令见仓库根目录 `TESTING.md`

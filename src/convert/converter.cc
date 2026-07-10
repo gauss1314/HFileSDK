@@ -28,6 +28,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <cstdio>
+#include <new>
 
 namespace hfile {
 
@@ -160,6 +161,75 @@ struct SortEntry {
     int32_t     batch_idx;   // which RecordBatch (0-based)
     int32_t     row_idx;     // row within that batch
 };
+
+static Status reserve_sort_entries(std::vector<SortEntry>* entries,
+                                   size_t additional,
+                                   memory::MemoryBudget* budget) {
+    if (additional == 0) {
+        return Status::OK();
+    }
+    if (additional > entries->max_size() - entries->size()) {
+        return Status::InvalidArg("SortEntry count exceeds addressable memory");
+    }
+
+    const size_t required = entries->size() + additional;
+    if (required <= entries->capacity()) return Status::OK();
+    const size_t doubled_capacity = entries->capacity() > entries->max_size() / 2
+        ? entries->max_size()
+        : entries->capacity() * 2;
+    size_t target = entries->capacity() == 0
+        ? std::max<size_t>(1024, required)
+        : std::max(required, doubled_capacity);
+    size_t reserved_bytes = 0;
+    if (budget) {
+        reserved_bytes = (target - entries->capacity()) * sizeof(SortEntry);
+        auto reserve_status = budget->reserve(reserved_bytes);
+        if (!reserve_status.ok() && target != required) {
+            target = required;
+            reserved_bytes = (target - entries->capacity()) * sizeof(SortEntry);
+            reserve_status = budget->reserve(reserved_bytes);
+        }
+        if (!reserve_status.ok()) return reserve_status;
+    }
+
+    try {
+        entries->reserve(target);
+    } catch (const std::bad_alloc&) {
+        if (budget && reserved_bytes > 0) budget->release(reserved_bytes);
+        return Status::Internal("SortEntry reserve failed");
+    }
+    return Status::OK();
+}
+
+static void radix_sort_numeric_entries(std::vector<SortEntry>* entries) {
+    if (entries->size() < 2) return;
+
+    static constexpr unsigned kRadixBits = 11;
+    static constexpr size_t kRadixSize = 1u << kRadixBits;
+    static constexpr uint64_t kRadixMask = kRadixSize - 1;
+    static constexpr unsigned kPasses = 6;
+    std::vector<SortEntry> scratch(entries->size());
+    for (unsigned pass = 0; pass < kPasses; ++pass) {
+        auto& source = (pass & 1u) == 0 ? *entries : scratch;
+        auto& destination = (pass & 1u) == 0 ? scratch : *entries;
+        std::array<size_t, kRadixSize> offsets{};
+        const unsigned shift = pass * kRadixBits;
+        for (const auto& entry : source) {
+            ++offsets[static_cast<size_t>(
+                (entry.numeric_sort_key >> shift) & kRadixMask)];
+        }
+        size_t next = 0;
+        for (auto& offset : offsets) {
+            const size_t count = offset;
+            offset = next;
+            next += count;
+        }
+        for (const auto& entry : source) {
+            destination[offsets[static_cast<size_t>(
+                (entry.numeric_sort_key >> shift) & kRadixMask)]++] = entry;
+        }
+    }
+}
 
 struct BatchColumnRef {
     std::string_view     name;
@@ -470,9 +540,22 @@ static void append_base64(std::string_view bytes, std::string* out) {
     }
 }
 
-// Arrow scalar -> UTF-8 text for the single value: column:value cell.
-static Status scalar_to_value_string(const arrow::Array& arr, int64_t row, std::string* out) {
-    out->clear();
+template <typename T>
+static void append_decimal(T value, std::string* out) {
+    // 32 bytes covers the sign and every decimal digit of all integral Arrow
+    // types. This keeps the conversion on the stack instead of creating one
+    // temporary std::string per numeric cell.
+    std::array<char, 32> buffer{};
+    const auto result = std::to_chars(
+        buffer.data(), buffer.data() + buffer.size(), value);
+    out->append(buffer.data(), static_cast<size_t>(result.ptr - buffer.data()));
+}
+
+// Append an Arrow scalar's UTF-8 representation directly to the joined row
+// value. String and binary data stay as Arrow views until this final copy.
+static Status append_scalar_to_value(const arrow::Array& arr,
+                                     int64_t row,
+                                     std::string* out) {
     if (arr.IsNull(row)) return Status::OK();
 
     using T = arrow::Type;
@@ -480,13 +563,13 @@ static Status scalar_to_value_string(const arrow::Array& arr, int64_t row, std::
     case T::STRING: {
         auto& sa = static_cast<const arrow::StringArray&>(arr);
         auto sv = sa.GetView(row);
-        out->assign(sv.data(), sv.size());
+        out->append(sv.data(), sv.size());
         return Status::OK();
     }
     case T::LARGE_STRING: {
         auto& sa = static_cast<const arrow::LargeStringArray&>(arr);
         auto sv = sa.GetView(row);
-        out->assign(sv.data(), sv.size());
+        out->append(sv.data(), sv.size());
         return Status::OK();
     }
     case T::BINARY: {
@@ -501,21 +584,21 @@ static Status scalar_to_value_string(const arrow::Array& arr, int64_t row, std::
         append_base64(std::string_view(sv.data(), sv.size()), out);
         return Status::OK();
     }
-    case T::INT8:   *out = std::to_string(static_cast<const arrow::Int8Array&>(arr).Value(row)); return Status::OK();
-    case T::INT16:  *out = std::to_string(static_cast<const arrow::Int16Array&>(arr).Value(row)); return Status::OK();
-    case T::INT32:  *out = std::to_string(static_cast<const arrow::Int32Array&>(arr).Value(row)); return Status::OK();
-    case T::INT64:  *out = std::to_string(static_cast<const arrow::Int64Array&>(arr).Value(row)); return Status::OK();
-    case T::UINT8:  *out = std::to_string(static_cast<const arrow::UInt8Array&>(arr).Value(row)); return Status::OK();
-    case T::UINT16: *out = std::to_string(static_cast<const arrow::UInt16Array&>(arr).Value(row)); return Status::OK();
-    case T::UINT32: *out = std::to_string(static_cast<const arrow::UInt32Array&>(arr).Value(row)); return Status::OK();
-    case T::UINT64: *out = std::to_string(static_cast<const arrow::UInt64Array&>(arr).Value(row)); return Status::OK();
-    case T::FLOAT:  *out = std::to_string(static_cast<const arrow::FloatArray&>(arr).Value(row)); return Status::OK();
-    case T::DOUBLE: *out = std::to_string(static_cast<const arrow::DoubleArray&>(arr).Value(row)); return Status::OK();
-    case T::BOOL:   *out = static_cast<const arrow::BooleanArray&>(arr).Value(row) ? "1" : "0"; return Status::OK();
+    case T::INT8:   append_decimal(static_cast<const arrow::Int8Array&>(arr).Value(row), out); return Status::OK();
+    case T::INT16:  append_decimal(static_cast<const arrow::Int16Array&>(arr).Value(row), out); return Status::OK();
+    case T::INT32:  append_decimal(static_cast<const arrow::Int32Array&>(arr).Value(row), out); return Status::OK();
+    case T::INT64:  append_decimal(static_cast<const arrow::Int64Array&>(arr).Value(row), out); return Status::OK();
+    case T::UINT8:  append_decimal(static_cast<const arrow::UInt8Array&>(arr).Value(row), out); return Status::OK();
+    case T::UINT16: append_decimal(static_cast<const arrow::UInt16Array&>(arr).Value(row), out); return Status::OK();
+    case T::UINT32: append_decimal(static_cast<const arrow::UInt32Array&>(arr).Value(row), out); return Status::OK();
+    case T::UINT64: append_decimal(static_cast<const arrow::UInt64Array&>(arr).Value(row), out); return Status::OK();
+    case T::FLOAT:  out->append(std::to_string(static_cast<const arrow::FloatArray&>(arr).Value(row))); return Status::OK();
+    case T::DOUBLE: out->append(std::to_string(static_cast<const arrow::DoubleArray&>(arr).Value(row))); return Status::OK();
+    case T::BOOL:   out->push_back(static_cast<const arrow::BooleanArray&>(arr).Value(row) ? '1' : '0'); return Status::OK();
     case T::TIMESTAMP: {
         auto& ta = static_cast<const arrow::TimestampArray&>(arr);
         auto unit = static_cast<const arrow::TimestampType&>(*arr.type()).unit();
-        *out = std::to_string(normalize_timestamp_to_millis(ta.Value(row), unit));
+        append_decimal(normalize_timestamp_to_millis(ta.Value(row), unit), out);
         return Status::OK();
     }
     default: {
@@ -524,7 +607,7 @@ static Status scalar_to_value_string(const arrow::Array& arr, int64_t row, std::
             return Status::InvalidArg(
                 "cannot materialize Arrow scalar as text: " + scalar.status().ToString());
         }
-        *out = scalar.ValueOrDie()->ToString();
+        out->append(scalar.ValueOrDie()->ToString());
         return Status::OK();
     }
     }
@@ -704,6 +787,8 @@ static Status build_sort_index(
             if (!reserve_status.ok()) return reserve_status;
         }
         batches_out.push_back(batch);    // store the FILTERED batch
+        HFILE_RETURN_IF_ERROR(reserve_sort_entries(
+            &index_out, static_cast<size_t>(std::max<int64_t>(0, n_rows)), budget));
 
         for (int64_t r = 0; r < n_rows; ++r) {
             if (direct_string_fast_path) {
@@ -723,10 +808,6 @@ static Status build_sort_index(
                 if (rk_view.empty()) {
                     result.kv_skipped_count++;
                     continue;
-                }
-                if (budget) {
-                    auto reserve_status = budget->reserve(sizeof(SortEntry) + rk_view.size());
-                    if (!reserve_status.ok()) return reserve_status;
                 }
                 index_out.push_back({rk_view, 0, false, batch_idx, static_cast<int32_t>(r)});
                 continue;
@@ -779,8 +860,7 @@ static Status build_sort_index(
                         }
                     }
                     if (budget) {
-                        auto reserve_status =
-                            budget->reserve(sizeof(SortEntry) + rk_suffix.size());
+                        auto reserve_status = budget->reserve(rk_suffix.size());
                         if (!reserve_status.ok()) return reserve_status;
                     }
                     SortEntry entry;
@@ -812,7 +892,7 @@ static Status build_sort_index(
                     continue;
                 }
                 if (budget) {
-                    auto reserve_status = budget->reserve(sizeof(SortEntry) + rk.size());
+                    auto reserve_status = budget->reserve(rk.size());
                     if (!reserve_status.ok()) return reserve_status;
                 }
                 owned_row_keys_out.push_back(std::move(rk));
@@ -844,7 +924,7 @@ static Status build_sort_index(
             }
 
             if (budget) {
-                auto reserve_status = budget->reserve(sizeof(SortEntry) + rk.size());
+                auto reserve_status = budget->reserve(rk.size());
                 if (!reserve_status.ok()) return reserve_status;
             }
 
@@ -891,7 +971,6 @@ static Status build_joined_row_value(
         std::string*                        row_value,
         Pass2Profile*                       profile = nullptr) {
     row_value->clear();
-    std::string field_value;
     bool first = true;
 
     for (const auto& column_ref : columns) {
@@ -901,8 +980,8 @@ static Status build_joined_row_value(
         const auto materialize_start = profile != nullptr
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        auto value_status = scalar_to_value_string(
-            *column_ref.column, row_idx, &field_value);
+        auto value_status = append_scalar_to_value(
+            *column_ref.column, row_idx, row_value);
         if (profile) {
             profile->materialize_ns += std::chrono::steady_clock::now() - materialize_start;
             ++profile->materialized_cells;
@@ -911,9 +990,6 @@ static Status build_joined_row_value(
             return Status::InvalidArg(
                 "Cell skipped (" + std::string(row_key) + "/" +
                 std::string(column_ref.name) + "): " + value_status.message());
-        }
-        if (!field_value.empty()) {
-            row_value->append(field_value);
         }
     }
     return Status::OK();
@@ -926,6 +1002,7 @@ static Status append_row_value_cell(
         std::string_view                    row_key,
         const std::string&                  cf,
         int64_t                             default_ts,
+        std::string*                        row_value,
         int64_t*                            kv_written,
         int64_t*                            kv_skipped,
         Pass2Profile*                       profile = nullptr) {
@@ -934,9 +1011,8 @@ static Status append_row_value_cell(
                 : std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::system_clock::now().time_since_epoch()).count();
 
-    std::string row_value;
     HFILE_RETURN_IF_ERROR(build_joined_row_value(
-        columns, row_idx, row_key, &row_value, profile));
+        columns, row_idx, row_key, row_value, profile));
 
     auto row_bytes = as_bytes(row_key);
     auto cf_bytes = as_bytes(cf);
@@ -946,7 +1022,7 @@ static Status append_row_value_cell(
     kv.qualifier = {kEmptyQualifierBytes.data(), 0};
     kv.timestamp = ts;
     kv.key_type = KeyType::Put;
-    kv.value = as_bytes(row_value);
+    kv.value = as_bytes(*row_value);
 
     const auto append_start = profile != nullptr
         ? std::chrono::steady_clock::now()
@@ -1060,19 +1136,48 @@ ConvertResult convert(const ConvertOptions& opts) {
         }
     }
 
-    // Sort by row key (lexicographic = HBase row ordering).  Use the original
-    // scan order as an explicit tie-breaker so duplicate keys keep the same
-    // relative ordering as the previous stable_sort() path.
-    std::sort(sort_index.begin(), sort_index.end(),
-              [](const SortEntry& a, const SortEntry& b) {
-                  if (a.has_numeric_sort_key && b.has_numeric_sort_key &&
-                      a.numeric_sort_key != b.numeric_sort_key) {
-                      return a.numeric_sort_key < b.numeric_sort_key;
-                  }
-                  if (a.row_key != b.row_key) return a.row_key < b.row_key;
-                  if (a.batch_idx != b.batch_idx) return a.batch_idx < b.batch_idx;
-                  return a.row_idx < b.row_idx;
-              });
+    // The common single-numeric-row-key path has no string suffix. A stable
+    // radix sort avoids comparison branches and preserves scan order for equal
+    // keys, which is the duplicate-row "keep first" contract. If the temporary
+    // buffer would exceed MemoryBudget, fall back to the in-place comparator.
+    const bool pure_numeric_sort = used_numeric_sort_path &&
+        std::all_of(sort_index.begin(), sort_index.end(), [](const SortEntry& entry) {
+            return entry.has_numeric_sort_key && entry.row_key.empty();
+        });
+    bool sorted = false;
+    size_t radix_budget_bytes = 0;
+    if (pure_numeric_sort) {
+        radix_budget_bytes = sort_index.size() * sizeof(SortEntry);
+        const bool budget_reserved = !budget ||
+            budget->reserve(radix_budget_bytes).ok();
+        if (budget_reserved) {
+            try {
+                radix_sort_numeric_entries(&sort_index);
+                sorted = true;
+            } catch (const std::bad_alloc&) {
+                // std::sort below is in-place and remains available under
+                // constrained memory.
+            }
+            if (budget && radix_budget_bytes > 0) {
+                budget->release(radix_budget_bytes);
+            }
+        }
+    }
+    if (!sorted) {
+        // Sort by row key (lexicographic = HBase row ordering). Use the original
+        // scan order as an explicit tie-breaker so duplicate keys keep the same
+        // relative ordering as the previous stable_sort() path.
+        std::sort(sort_index.begin(), sort_index.end(),
+                  [](const SortEntry& a, const SortEntry& b) {
+                      if (a.has_numeric_sort_key && b.has_numeric_sort_key &&
+                          a.numeric_sort_key != b.numeric_sort_key) {
+                          return a.numeric_sort_key < b.numeric_sort_key;
+                      }
+                      if (a.row_key != b.row_key) return a.row_key < b.row_key;
+                      if (a.batch_idx != b.batch_idx) return a.batch_idx < b.batch_idx;
+                      return a.row_idx < b.row_idx;
+                  });
+    }
 
     result.sort_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - t_sort_start);
@@ -1162,6 +1267,10 @@ ConvertResult convert(const ConvertOptions& opts) {
     Pass2Profile* pass2_profile_ptr =
         hotpath_profiling_enabled() ? &pass2_profile : nullptr;
     std::string numeric_row_key_storage;
+    // The writer consumes the value synchronously into its block buffer, so
+    // retaining this allocation across rows is safe and removes one heap
+    // allocation from every source row.
+    std::string row_value_storage;
     std::vector<std::vector<BatchColumnRef>> natural_batch_columns;
     natural_batch_columns.reserve(batches.size());
     for (const auto& batch : batches)
@@ -1228,6 +1337,7 @@ ConvertResult convert(const ConvertOptions& opts) {
             row_key,
             opts.column_family,
             opts.default_timestamp,
+            &row_value_storage,
             &kv_written,
             &kv_skipped,
             pass2_profile_ptr);

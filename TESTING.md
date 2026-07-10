@@ -240,7 +240,7 @@ strings "$HFILESDK_NATIVE_LIB" | grep -E 'max_memory_bytes|compression_threads|c
 关键参数含义：
 
 - `--jni-sdk-compression-threads`：每个 JNI 转换任务内部的 GZip 数据块后台压缩线程数。`0` 表示同步压缩，通常不是 GZip 最高性能。
-- `--jni-sdk-compression-queue-depth`：每个转换任务允许排队的未写出压缩块数量。`0` 表示 SDK 自动使用 `max(2, compression_threads * 2)`。
+- `--jni-sdk-compression-queue-depth`：每个转换任务允许排队的未写出压缩块数量。`0` 表示 SDK 自动使用 `clamp(compression_threads * 4, 4, 64)`。
 - `--jni-sdk-max-memory-mb`：C++ SDK 内部 soft budget。纯性能压测且机器内存足够时可设 `0` 表示不限制，避免预算检查和误限流；生产演练建议设为进程内存上限扣除 JVM heap/direct 后的 `60%~70%`。
 - `--process-memory-mb`：worker 进程 OS 级硬限制。性能压测时不要贴满物理内存，至少给 Linux page cache、文件系统和系统守护进程预留 `20%~30%`。
 
@@ -257,7 +257,7 @@ strings "$HFILESDK_NATIVE_LIB" | grep -E 'max_memory_bytes|compression_threads|c
 
 - 单文件场景只有一个 Arrow 文件，`--parallelism` 固定为 `1`，主要增加 `--jni-sdk-compression-threads`；通常从物理核数的 `1/2` 起步，超过 `8~16` 后收益会逐步变小。
 - 目录场景会同时跑多个转换任务，总线程数大致是 `parallelism * (1 + compression_threads)`；建议先让这个值不超过绑定核数的 `75%~90%`，再逐步上调。
-- `compression_queue_depth=0` 是推荐起点，因为 SDK 会自动设置成 `2 * compression_threads`；如果看到压缩线程有空闲、磁盘很快且平均耗时仍随队列增加下降，可以试 `threads*3` 或 `threads*4`。
+- `compression_queue_depth=0` 是推荐起点，因为 SDK 会自动设置成 `clamp(4 * compression_threads, 4, 64)`；只有需要复现实验时才显式指定。如果看到 RSS 增长但平均耗时不再下降，应减少线程数，而不是继续加深队列。
 - `--jni-sdk-max-memory-mb 0` 通常是纯性能压测最快口径；如果需要避免 OOM kill，则设为 `process_memory_mb - jni_xmx_mb - jni_direct_memory_mb - 4096` 的 `60%~70%`，并确认 `report.json` 里的 `sdk_tracked_memory_peak_bytes` 不贴近预算。
 - `--java-xmx-mb` 和 `--java-direct-memory-mb` 不影响 JNI C++ hot path，但会影响纯 Java 对比实现是否被堆或 direct memory 限制；为了公平，Java 侧也要给足内存。
 - `--compression NONE` 下压缩线程和队列不会启用；只有 `--compression GZ` 或兼容别名 `gzip` 时这些参数才影响性能。

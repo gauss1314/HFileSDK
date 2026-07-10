@@ -320,7 +320,7 @@ TEST(HFileWriter, CompressionPipelineMatchesSynchronousOutput) {
             .set_block_size(512)
             .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
             .set_compression_threads(compression_threads)
-            .set_compression_queue_depth(compression_threads == 0 ? 0 : 4)
+            .set_compression_queue_depth(0)
             .build();
     };
 
