@@ -225,6 +225,54 @@ TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow) {
     fs::remove_all(dir);
 }
 
+
+TEST(ArrowConverter, ConvertBuildsValueInArrowColumnOrder) {
+    arrow::StringBuilder b_builder;
+    arrow::StringBuilder a_builder;
+    arrow::StringBuilder c_builder;
+
+    ARROW_EXPECT_OK(b_builder.Append("row-1"));
+    ARROW_EXPECT_OK(a_builder.Append("alpha"));
+    ARROW_EXPECT_OK(c_builder.Append("gamma"));
+
+    std::shared_ptr<arrow::Array> b_arr, a_arr, c_arr;
+    ARROW_EXPECT_OK(b_builder.Finish(&b_arr));
+    ARROW_EXPECT_OK(a_builder.Finish(&a_arr));
+    ARROW_EXPECT_OK(c_builder.Finish(&c_arr));
+
+    auto schema = arrow::schema({
+        arrow::field("b", arrow::utf8()),
+        arrow::field("a", arrow::utf8()),
+        arrow::field("c", arrow::utf8()),
+    });
+    auto batch = arrow::RecordBatch::Make(schema, 1, {b_arr, a_arr, c_arr});
+
+    auto dir = make_temp_dir();
+    auto arrow_path = dir / "input.arrow";
+    auto hfile_path = dir / "output.hfile";
+    write_ipc_stream(*batch, arrow_path);
+
+    ConvertOptions opts;
+    opts.arrow_path = arrow_path.string();
+    opts.hfile_path = hfile_path.string();
+    opts.table_name = "t";
+    opts.row_key_rule = "B,0,false,0";
+    opts.column_family = "cf";
+    opts.default_timestamp = 1;
+    opts.writer_opts.column_family = "cf";
+    opts.writer_opts.compression = Compression::None;
+    opts.writer_opts.bloom_type = BloomType::None;
+
+    auto result = convert(opts);
+    ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
+
+    auto cells = decode_data_block_cells(read_file(hfile_path));
+    ASSERT_EQ(cells.size(), 1);
+    EXPECT_EQ(cells[0].value, "row-1|alpha|gamma");
+
+    fs::remove_all(dir);
+}
+
 TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
     arrow::StringBuilder rk_builder;
     arrow::Int64Builder age_builder;

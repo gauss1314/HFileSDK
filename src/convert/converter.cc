@@ -873,29 +873,15 @@ static Status build_sort_index(
     return Status::OK();
 }
 
-static std::vector<BatchColumnRef> build_sorted_columns(
-        const std::shared_ptr<arrow::RecordBatch>& batch,
-        std::span<const int> sorted_column_order) {
+static std::vector<BatchColumnRef> build_natural_columns(
+        const std::shared_ptr<arrow::RecordBatch>& batch) {
     std::vector<BatchColumnRef> refs;
-    refs.reserve(static_cast<size_t>(sorted_column_order.size()));
+    refs.reserve(static_cast<size_t>(batch->num_columns()));
     auto schema = batch->schema();
-    for (int col_idx : sorted_column_order) {
+    for (int col_idx = 0; col_idx < batch->num_columns(); ++col_idx) {
         refs.push_back({schema->field(col_idx)->name(), batch->column(col_idx).get()});
     }
     return refs;
-}
-
-static std::vector<int> build_sorted_column_order(
-        const std::shared_ptr<arrow::Schema>& schema) {
-    std::vector<int> order(static_cast<size_t>(schema->num_fields()));
-    for (int c = 0; c < schema->num_fields(); ++c) {
-        order[static_cast<size_t>(c)] = c;
-    }
-    std::sort(order.begin(), order.end(),
-              [schema](int a, int b) {
-                  return schema->field(a)->name() < schema->field(b)->name();
-              });
-    return order;
 }
 
 static Status build_joined_row_value(
@@ -1176,14 +1162,10 @@ ConvertResult convert(const ConvertOptions& opts) {
     Pass2Profile* pass2_profile_ptr =
         hotpath_profiling_enabled() ? &pass2_profile : nullptr;
     std::string numeric_row_key_storage;
-    std::vector<std::vector<BatchColumnRef>> sorted_batch_columns;
-    sorted_batch_columns.reserve(batches.size());
-    std::vector<int> sorted_column_order;
-    if (!batches.empty()) {
-        sorted_column_order = build_sorted_column_order(batches.front()->schema());
-    }
+    std::vector<std::vector<BatchColumnRef>> natural_batch_columns;
+    natural_batch_columns.reserve(batches.size());
     for (const auto& batch : batches)
-        sorted_batch_columns.push_back(build_sorted_columns(batch, sorted_column_order));
+        natural_batch_columns.push_back(build_natural_columns(batch));
 
     for (size_t i = 0; i < sort_index.size();) {
         std::string_view row_key;
@@ -1241,7 +1223,7 @@ ConvertResult convert(const ConvertOptions& opts) {
         const auto& entry = sort_index[i];
         Status s = append_row_value_cell(
             *writer,
-            sorted_batch_columns[static_cast<size_t>(entry.batch_idx)],
+            natural_batch_columns[static_cast<size_t>(entry.batch_idx)],
             entry.row_idx,
             row_key,
             opts.column_family,
