@@ -5,16 +5,46 @@
 #undef private
 
 #include <hfile/types.h>
+#include "metrics/metrics_registry.h"
 
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 
 using namespace hfile;
 
-namespace {
+namespace
+{
 
-Status passthrough_error(Status s) {
+TEST(MetricsBestEffort, ConvertsInstrumentationExceptionsToFallbacks)
+{
+    EXPECT_TRUE(metrics_detail::invoke_best_effort(
+        []()
+        {
+        }));
+    EXPECT_FALSE(metrics_detail::invoke_best_effort(
+        []()
+        {
+            throw std::runtime_error("injected metrics failure");
+        }));
+
+    EXPECT_EQ(42,
+              metrics_detail::invoke_or<int>(-1,
+                                             []()
+                                             {
+                                                 return 42;
+                                             }));
+    EXPECT_EQ(-1,
+              metrics_detail::invoke_or<int>(-1,
+                                             []() -> int
+                                             {
+                                                 throw std::runtime_error("injected metrics failure");
+                                             }));
+}
+
+Status passthrough_error(Status s)
+{
     HFILE_RETURN_IF_ERROR(s);
     return Status::OK();
 }
@@ -24,7 +54,8 @@ KeyValue make_kv(std::vector<uint8_t>& row,
                  std::vector<uint8_t>& qualifier,
                  std::vector<uint8_t>& value,
                  int64_t timestamp,
-                 KeyType type) {
+                 KeyType type)
+{
     KeyValue kv;
     kv.row = row;
     kv.family = family;
@@ -35,9 +66,10 @@ KeyValue make_kv(std::vector<uint8_t>& row,
     return kv;
 }
 
-}  // namespace
+} // namespace
 
-TEST(StatusExtra, ToStringCoversAllNamedCodes) {
+TEST(StatusExtra, ToStringCoversAllNamedCodes)
+{
     EXPECT_EQ(Status().to_string(), "OK");
     EXPECT_EQ(Status(Status::Code::OutOfRange, "oor").to_string(), "OutOfRange: oor");
     EXPECT_EQ(Status(Status::Code::NotFound, "missing").to_string(), "NotFound: missing");
@@ -47,7 +79,8 @@ TEST(StatusExtra, ToStringCoversAllNamedCodes) {
     EXPECT_EQ(Status::Corruption("bad").to_string(), "Corruption: bad");
 }
 
-TEST(StatusExtra, ReturnIfErrorMacroPropagatesFailures) {
+TEST(StatusExtra, ReturnIfErrorMacroPropagatesFailures)
+{
     auto ok = passthrough_error(Status::OK());
     EXPECT_TRUE(ok.ok());
 
@@ -57,7 +90,8 @@ TEST(StatusExtra, ReturnIfErrorMacroPropagatesFailures) {
     EXPECT_EQ(err.message(), "bad arg");
 }
 
-TEST(TypesExtra, VarintRoundTripAndMalformedDecode) {
+TEST(TypesExtra, VarintRoundTripAndMalformedDecode)
+{
     std::array<uint64_t, 5> values = {
         0u,
         1u,
@@ -66,7 +100,8 @@ TEST(TypesExtra, VarintRoundTripAndMalformedDecode) {
         0xFEDCBA9876543210ULL,
     };
 
-    for (uint64_t value : values) {
+    for (uint64_t value : values)
+    {
         uint8_t buf[16] = {};
         int n = encode_varint64(buf, value);
         ASSERT_GT(n, 0);
@@ -81,7 +116,8 @@ TEST(TypesExtra, VarintRoundTripAndMalformedDecode) {
     EXPECT_EQ(decode_varint64(malformed.data(), partial), -1);
 }
 
-TEST(TypesExtra, WritableVintRoundTripsSignedValues) {
+TEST(TypesExtra, WritableVintRoundTripsSignedValues)
+{
     std::array<int64_t, 6> values = {
         -113,
         -1,
@@ -91,7 +127,8 @@ TEST(TypesExtra, WritableVintRoundTripsSignedValues) {
         0x102030405060708LL,
     };
 
-    for (int64_t value : values) {
+    for (int64_t value : values)
+    {
         uint8_t buf[16] = {};
         int n = encode_writable_vint(buf, value);
         ASSERT_EQ(n, writable_vint_size(value));
@@ -101,7 +138,8 @@ TEST(TypesExtra, WritableVintRoundTripsSignedValues) {
     }
 }
 
-TEST(TypesExtra, KeyValueEncodingSizeAndOwnedView) {
+TEST(TypesExtra, KeyValueEncodingSizeAndOwnedView)
+{
     std::vector<uint8_t> row = {'r', '1'};
     std::vector<uint8_t> family = {'c', 'f'};
     std::vector<uint8_t> qualifier = {'q', '1'};
@@ -129,11 +167,11 @@ TEST(TypesExtra, KeyValueEncodingSizeAndOwnedView) {
     EXPECT_TRUE(view.has_memstore_ts);
     EXPECT_EQ(view.key_length(), 2u + 2u + 1u + 2u + 2u + 8u + 1u);
     EXPECT_EQ(view.encoded_size(),
-              4u + 4u + view.key_length() + 3u + 2u + 2u
-                  + static_cast<size_t>(writable_vint_size(300)));
+              4u + 4u + view.key_length() + 3u + 2u + 2u + static_cast<size_t>(writable_vint_size(300)));
 }
 
-TEST(TypesExtra, CompareKeysCoversFamilyQualifierAndEqualityBranches) {
+TEST(TypesExtra, CompareKeysCoversFamilyQualifierAndEqualityBranches)
+{
     std::vector<uint8_t> row = {'r'};
     std::vector<uint8_t> family_a = {'a'};
     std::vector<uint8_t> family_b = {'b'};

@@ -9,15 +9,18 @@
 using namespace hfile;
 using namespace hfile::codec;
 
-namespace {
+namespace
+{
 
-std::vector<uint8_t> to_bytes(std::string_view s) {
+std::vector<uint8_t> to_bytes(std::string_view s)
+{
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-}  // namespace
+} // namespace
 
-TEST(CompressorErrorPaths, NoneCodecRejectsSmallBuffers) {
+TEST(CompressorErrorPaths, NoneCodecRejectsSmallBuffers)
+{
     auto codec = Compressor::create(Compression::None);
     ASSERT_NE(codec, nullptr);
 
@@ -31,7 +34,8 @@ TEST(CompressorErrorPaths, NoneCodecRejectsSmallBuffers) {
     EXPECT_EQ(status.code(), Status::Code::InvalidArg);
 }
 
-TEST(CompressorErrorPaths, GzipCoversDefaultLevelAndErrorBranches) {
+TEST(CompressorErrorPaths, GzipCoversDefaultLevelAndErrorBranches)
+{
     auto codec = Compressor::create(Compression::GZip, 0);
     ASSERT_NE(codec, nullptr);
 

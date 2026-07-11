@@ -8,11 +8,13 @@
 #include <string>
 #include <span>
 
-namespace hfile {
+namespace hfile
+{
 
-class HFileWriterImpl;  // forward declaration of impl
+class HFileWriterImpl; // forward declaration of impl
 
-struct WriterStats {
+struct WriterStats
+{
     std::chrono::nanoseconds data_block_encode_ns{0};
     std::chrono::nanoseconds data_block_compress_ns{0};
     std::chrono::nanoseconds data_block_write_ns{0};
@@ -29,33 +31,35 @@ struct WriterStats {
 };
 
 /// Single-file, single-CF HFile v3 writer.
-/// Thread safety: NOT thread-safe. Use one writer per thread or serialize access.
-class HFileWriter {
+/// Thread safety: NOT thread-safe. Use one writer per thread or serialize
+/// access.
+class HFileWriter
+{
 public:
     ~HFileWriter();
 
     // Non-copyable, movable
-    HFileWriter(const HFileWriter&)            = delete;
+    HFileWriter(const HFileWriter&) = delete;
     HFileWriter& operator=(const HFileWriter&) = delete;
     HFileWriter(HFileWriter&&) noexcept;
     HFileWriter& operator=(HFileWriter&&) noexcept;
 
     /// Append a single KeyValue cell.
     /// KVs must be appended in strictly ascending HBase key order
-    /// (Row ASC → Family ASC → Qualifier ASC → Timestamp DESC → Type DESC).
+    /// (Row ASC → Family ASC → Qualifier ASC → Timestamp DESC →
+    /// Type DESC).
     /// Returns an error if the sort invariant is violated (in Verified mode).
     Status append(const KeyValue& kv);
 
     /// Convenience overload with individual fields.
-    Status append(
-        std::span<const uint8_t> row,
-        std::span<const uint8_t> family,
-        std::span<const uint8_t> qualifier,
-        int64_t                  timestamp,
-        std::span<const uint8_t> value,
-        KeyType                  key_type   = KeyType::Put,
-        std::span<const uint8_t> tags       = {},
-        uint64_t                 memstore_ts = 0);
+    Status append(std::span<const uint8_t> row,
+                  std::span<const uint8_t> family,
+                  std::span<const uint8_t> qualifier,
+                  int64_t timestamp,
+                  std::span<const uint8_t> value,
+                  KeyType key_type = KeyType::Put,
+                  std::span<const uint8_t> tags = {},
+                  uint64_t memstore_ts = 0);
 
     /// Fast path for callers that already guarantee:
     /// - row/family/value size validity
@@ -75,37 +79,35 @@ public:
     Status append_trusted_same_row(const KeyValue& kv);
 
     /// Convenience overload for the trusted fast path.
-    Status append_trusted(
-        std::span<const uint8_t> row,
-        std::span<const uint8_t> family,
-        std::span<const uint8_t> qualifier,
-        int64_t                  timestamp,
-        std::span<const uint8_t> value,
-        KeyType                  key_type   = KeyType::Put,
-        std::span<const uint8_t> tags       = {},
-        uint64_t                 memstore_ts = 0);
+    Status append_trusted(std::span<const uint8_t> row,
+                          std::span<const uint8_t> family,
+                          std::span<const uint8_t> qualifier,
+                          int64_t timestamp,
+                          std::span<const uint8_t> value,
+                          KeyType key_type = KeyType::Put,
+                          std::span<const uint8_t> tags = {},
+                          uint64_t memstore_ts = 0);
 
-    Status append_trusted_new_row(
-        std::span<const uint8_t> row,
-        std::span<const uint8_t> family,
-        std::span<const uint8_t> qualifier,
-        int64_t                  timestamp,
-        std::span<const uint8_t> value,
-        KeyType                  key_type   = KeyType::Put,
-        std::span<const uint8_t> tags       = {},
-        uint64_t                 memstore_ts = 0);
+    Status append_trusted_new_row(std::span<const uint8_t> row,
+                                  std::span<const uint8_t> family,
+                                  std::span<const uint8_t> qualifier,
+                                  int64_t timestamp,
+                                  std::span<const uint8_t> value,
+                                  KeyType key_type = KeyType::Put,
+                                  std::span<const uint8_t> tags = {},
+                                  uint64_t memstore_ts = 0);
 
-    Status append_trusted_same_row(
-        std::span<const uint8_t> row,
-        std::span<const uint8_t> family,
-        std::span<const uint8_t> qualifier,
-        int64_t                  timestamp,
-        std::span<const uint8_t> value,
-        KeyType                  key_type   = KeyType::Put,
-        std::span<const uint8_t> tags       = {},
-        uint64_t                 memstore_ts = 0);
+    Status append_trusted_same_row(std::span<const uint8_t> row,
+                                   std::span<const uint8_t> family,
+                                   std::span<const uint8_t> qualifier,
+                                   int64_t timestamp,
+                                   std::span<const uint8_t> value,
+                                   KeyType key_type = KeyType::Put,
+                                   std::span<const uint8_t> tags = {},
+                                   uint64_t memstore_ts = 0);
 
-    /// Finalise the file (flush remaining block, write index/bloom/fileinfo/trailer).
+    /// Finalise the file (flush remaining block, write
+    /// index/bloom/fileinfo/trailer).
     Status finish();
 
     /// Current file offset (bytes written so far).
@@ -117,8 +119,9 @@ public:
     /// Internal write-path timing and block counters.
     WriterStats stats() const noexcept;
 
-    // ─── Builder ─────────────────────────────────────────────────────────────
-    class Builder {
+    // --- Builder ----
+    class Builder
+    {
     public:
         Builder& set_path(std::string path);
         Builder& set_column_family(std::string cf);
@@ -134,7 +137,7 @@ public:
         Builder& set_include_tags(bool v);
         Builder& set_include_mvcc(bool v);
 
-        // ── Production setters ───────────────────────────────────────────────
+        // -- Production setters ----
         Builder& set_fsync_policy(FsyncPolicy p);
         Builder& set_error_policy(ErrorPolicy p);
         Builder& set_max_error_count(uint64_t n);
@@ -151,18 +154,21 @@ public:
         /// Build and open the writer. Returns error if path can't be opened.
         /// When provided, failure_stats captures reservations made before an
         /// initialization failure for production diagnostics.
-        std::pair<std::unique_ptr<HFileWriter>, Status> build(
-            WriterStats* failure_stats = nullptr);
+        std::pair<std::unique_ptr<HFileWriter>, Status> build(WriterStats* failure_stats = nullptr);
 
     private:
-        std::string    path_;
-        WriterOptions  opts_;
+        std::string path_;
+        WriterOptions opts_;
     };
 
-    static Builder builder() { return Builder{}; }
+    static Builder builder()
+    {
+        return Builder{};
+    }
 
 private:
     explicit HFileWriter(std::unique_ptr<HFileWriterImpl> impl);
+    static std::unique_ptr<HFileWriter> create(std::unique_ptr<HFileWriterImpl> impl);
     std::unique_ptr<HFileWriterImpl> impl_;
 };
 

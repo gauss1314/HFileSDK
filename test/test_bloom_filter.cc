@@ -8,17 +8,19 @@
 using namespace hfile;
 using namespace hfile::bloom;
 
-static std::vector<uint8_t> make_key(const std::string& s) {
+static std::vector<uint8_t> make_key(const std::string& s)
+{
     return std::vector<uint8_t>(s.begin(), s.end());
 }
 
-static std::span<const uint8_t> block_payload(const std::vector<uint8_t>& block) {
-    const auto payload_size =
-        static_cast<size_t>(read_be32(block.data() + 29)) - kBlockHeaderSize;
+static std::span<const uint8_t> block_payload(const std::vector<uint8_t>& block)
+{
+    const auto payload_size = static_cast<size_t>(read_be32(block.data() + 29)) - kBlockHeaderSize;
     return {block.data() + kBlockHeaderSize, payload_size};
 }
 
-TEST(BloomFilter, EmptyBloom) {
+TEST(BloomFilter, EmptyBloom)
+{
     CompoundBloomFilterWriter bf(BloomType::None);
     std::vector<uint8_t> meta;
     auto result = bf.finish(meta, 0);
@@ -26,18 +28,22 @@ TEST(BloomFilter, EmptyBloom) {
     EXPECT_TRUE(meta.empty());
 }
 
-TEST(BloomFilter, BasicAdd) {
+TEST(BloomFilter, BasicAdd)
+{
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 1000);
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 100; ++i)
+    {
         auto k = make_key("row_" + std::to_string(i));
         bf.add(k);
     }
     EXPECT_EQ(bf.bloom_type(), BloomType::Row);
 }
 
-TEST(BloomFilter, FinishProducesBlocks) {
+TEST(BloomFilter, FinishProducesBlocks)
+{
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 100);
-    for (int i = 0; i < 50; ++i) {
+    for (int i = 0; i < 50; ++i)
+    {
         auto k = make_key("row_" + std::to_string(i));
         bf.add(k);
     }
@@ -50,7 +56,8 @@ TEST(BloomFilter, FinishProducesBlocks) {
     EXPECT_EQ(meta[0], 'B');
 }
 
-TEST(BloomFilter, MurmurHash) {
+TEST(BloomFilter, MurmurHash)
+{
     // Verify murmur3 is stable across calls
     const uint8_t data[] = {0x01, 0x02, 0x03};
     uint32_t h1 = static_cast<uint32_t>(murmur_hash(data, 3, 0));
@@ -62,41 +69,34 @@ TEST(BloomFilter, MurmurHash) {
     EXPECT_EQ(h1, 0x3aa63325u);
 
     const auto row = make_key("row_0");
-    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(row.data(), row.size(), 0)),
-              0xb06bb73au);
-    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(
-                  row.data(), row.size(), -123456789)),
-              0x3ad85e04u);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(row.data(), row.size(), 0)), 0xb06bb73au);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(row.data(), row.size(), -123456789)), 0x3ad85e04u);
 
     // HBase HashKey.get() returns a signed Java byte.  Tail bytes are not
     // masked in MurmurHash.java, so these vectors catch zero-extension bugs.
     const uint8_t high_tail[] = {0x80};
     const int32_t high_h1 = murmur_hash(high_tail, 1, 0);
     EXPECT_EQ(static_cast<uint32_t>(high_h1), 0xfdab6e14u);
-    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(high_tail, 1, high_h1)),
-              0x97cfe73au);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(high_tail, 1, high_h1)), 0x97cfe73au);
 
     const uint8_t utf8_e_acute[] = {0xc3, 0xa9};
     const int32_t utf8_h1 = murmur_hash(utf8_e_acute, 2, 0);
     EXPECT_EQ(static_cast<uint32_t>(utf8_h1), 0x20a5a987u);
-    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(
-                  utf8_e_acute, 2, utf8_h1)),
-              0x47b788b2u);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash(utf8_e_acute, 2, utf8_h1)), 0x47b788b2u);
 }
 
-TEST(BloomFilter, RowColHashMatchesHBaseLogicalKey) {
+TEST(BloomFilter, RowColHashMatchesHBaseLogicalKey)
+{
     const auto row = make_key("row");
     const auto qualifier = make_key("q");
     const int32_t h1 = murmur_hash_row_col(row, qualifier, 0);
     EXPECT_EQ(static_cast<uint32_t>(h1), 0x9350b067u);
-    EXPECT_EQ(static_cast<uint32_t>(murmur_hash_row_col(row, qualifier, h1)),
-              0xf1a34ec0u);
+    EXPECT_EQ(static_cast<uint32_t>(murmur_hash_row_col(row, qualifier, h1)), 0xf1a34ec0u);
 
     std::vector<uint8_t> logical_key;
     serialize_row_col_bloom_key(row, qualifier, &logical_key);
-    const std::vector<uint8_t> expected = {
-        0x00, 0x03, 'r', 'o', 'w', 0x00, 'q',
-        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    const std::vector<uint8_t> expected
+        = {0x00, 0x03, 'r', 'o', 'w', 0x00, 'q', 0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     EXPECT_EQ(logical_key, expected);
 
     CompoundBloomFilterWriter writer(BloomType::RowCol, 0.01, 10);
@@ -106,13 +106,18 @@ TEST(BloomFilter, RowColHashMatchesHBaseLogicalKey) {
     EXPECT_TRUE(result.enabled);
 }
 
-TEST(BloomFilter, ChunkBoundary) {
+TEST(BloomFilter, ChunkBoundary)
+{
     // Add many keys to force chunk rollover
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 10);
-    for (int i = 0; i < 200; ++i) {
+    for (int i = 0; i < 200; ++i)
+    {
         auto k = make_key("key_" + std::to_string(i));
         bf.add(k);
-        if (i > 0 && i % 10 == 0) bf.finish_chunk();
+        if (i > 0 && i % 10 == 0)
+        {
+            bf.finish_chunk();
+        }
     }
     std::vector<uint8_t> meta;
     auto result = bf.finish(meta, 0);
@@ -120,18 +125,19 @@ TEST(BloomFilter, ChunkBoundary) {
     EXPECT_GT(meta.size(), 0u);
 }
 
-// ─── B-12 regression: finish_data_blocks / finish_meta_block API ─────────────
+// --- B-12 regression: finish_data_blocks / finish_meta_block API ----
 
-TEST(BloomFilter, FinishDataBlocksProducesOnlyChunkBlocks) {
+TEST(BloomFilter, FinishDataBlocksProducesOnlyChunkBlocks)
+{
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 30; ++i)
+    {
         auto k = make_key("key_" + std::to_string(i));
         bf.add(k);
     }
     std::vector<uint8_t> chunk_buf;
     BloomWriteResult result;
-    bool has_data = bf.finish_data_blocks(
-        chunk_buf, /*file_offset=*/0, /*prev_block_offset=*/-1, &result);
+    bool has_data = bf.finish_data_blocks(chunk_buf, /*file_offset=*/0, /*prev_block_offset=*/-1, &result);
     EXPECT_TRUE(has_data);
     EXPECT_FALSE(chunk_buf.empty());
     // chunk_buf must start with BLMFBLK2 magic
@@ -142,9 +148,11 @@ TEST(BloomFilter, FinishDataBlocksProducesOnlyChunkBlocks) {
     EXPECT_EQ(content.find("BLMFMET2"), std::string::npos);
 }
 
-TEST(BloomFilter, FinishMetaBlockProducesOnlyMetaBlock) {
+TEST(BloomFilter, FinishMetaBlockProducesOnlyMetaBlock)
+{
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 30; ++i)
+    {
         auto k = make_key("key_" + std::to_string(i));
         bf.add(k);
     }
@@ -160,7 +168,8 @@ TEST(BloomFilter, FinishMetaBlockProducesOnlyMetaBlock) {
     EXPECT_EQ(std::string(meta_buf.begin(), meta_buf.begin() + 8), "BLMFMET2");
 }
 
-TEST(BloomFilter, IsEnabledAndHasData) {
+TEST(BloomFilter, IsEnabledAndHasData)
+{
     CompoundBloomFilterWriter enabled(BloomType::Row, 0.01);
     CompoundBloomFilterWriter disabled(BloomType::None);
     EXPECT_TRUE(enabled.is_enabled());
@@ -171,11 +180,13 @@ TEST(BloomFilter, IsEnabledAndHasData) {
     EXPECT_TRUE(enabled.has_data());
 }
 
-TEST(BloomFilter, DataBlocksAndMetaSeparated) {
+TEST(BloomFilter, DataBlocksAndMetaSeparated)
+{
     // Simulate the correct layout: chunk blocks written before load-on-open,
     // meta block written after FileInfo.
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 10; ++i)
+    {
         auto k = make_key("r" + std::to_string(i));
         bf.add(k);
     }
@@ -197,9 +208,11 @@ TEST(BloomFilter, DataBlocksAndMetaSeparated) {
     EXPECT_EQ(meta_str.find("BLMFBLK2"), std::string::npos);
 }
 
-TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
+TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat)
+{
     CompoundBloomFilterWriter bf(BloomType::Row, 0.01, 50);
-    for (int i = 0; i < 30; ++i) {
+    for (int i = 0; i < 30; ++i)
+    {
         auto k = make_key("row_" + std::to_string(i));
         bf.add(k);
     }
@@ -215,19 +228,26 @@ TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
     const uint8_t* end = meta.data() + meta.size();
 
     ASSERT_LE(p + 4, end);
-    EXPECT_EQ(read_be32(p), 3u); p += 4; // version
+    EXPECT_EQ(read_be32(p), 3u);
+    p += 4; // version
     ASSERT_LE(p + 8, end);
-    EXPECT_GT(read_be64(p), 0u); p += 8; // total byte size
+    EXPECT_GT(read_be64(p), 0u);
+    p += 8; // total byte size
     ASSERT_LE(p + 4, end);
-    EXPECT_GT(read_be32(p), 0u); p += 4; // hash count
+    EXPECT_GT(read_be32(p), 0u);
+    p += 4; // hash count
     ASSERT_LE(p + 4, end);
-    EXPECT_EQ(read_be32(p), 1u); p += 4; // hash type (murmur)
+    EXPECT_EQ(read_be32(p), 1u);
+    p += 4; // hash type (murmur)
     ASSERT_LE(p + 8, end);
-    EXPECT_EQ(read_be64(p), 30u); p += 8; // total key count
+    EXPECT_EQ(read_be64(p), 30u);
+    p += 8; // total key count
     ASSERT_LE(p + 8, end);
-    EXPECT_GE(read_be64(p), 30u); p += 8; // total max keys
+    EXPECT_GE(read_be64(p), 30u);
+    p += 8; // total max keys
     ASSERT_LE(p + 4, end);
-    const uint32_t num_chunks = read_be32(p); p += 4;
+    const uint32_t num_chunks = read_be32(p);
+    p += 4;
     EXPECT_GT(num_chunks, 0u);
 
     int64_t comparator_len = 0;
@@ -236,7 +256,8 @@ TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
     p += len_bytes;
     EXPECT_EQ(comparator_len, 0); // ROW bloom has null comparator
 
-    for (uint32_t i = 0; i < num_chunks; ++i) {
+    for (uint32_t i = 0; i < num_chunks; ++i)
+    {
         ASSERT_LE(p + 12, end);
         EXPECT_GE(read_be64(p), 4096u);
         p += 8;
@@ -254,10 +275,12 @@ TEST(BloomFilter, MetaPayloadMatchesHBaseCompoundBloomFormat) {
     }
 }
 
-TEST(BloomFilter, GZipCompressedBlocksRoundTrip) {
+TEST(BloomFilter, GZipCompressedBlocksRoundTrip)
+{
     CompoundBloomFilterWriter raw(BloomType::Row, 0.01, 1024);
     CompoundBloomFilterWriter compressed(BloomType::Row, 0.01, 1024);
-    for (int i = 0; i < 64; ++i) {
+    for (int i = 0; i < 64; ++i)
+    {
         auto key = make_key("row_" + std::to_string(i));
         raw.add(key);
         compressed.add(key);
@@ -275,8 +298,7 @@ TEST(BloomFilter, GZipCompressedBlocksRoundTrip) {
 
     ASSERT_TRUE(raw.finish_data_blocks(raw_chunk, 8192, -1, &raw_result));
     raw.finish_meta_block(raw_meta, -1, &raw_result);
-    ASSERT_TRUE(compressed.finish_data_blocks(
-        compressed_chunk, 8192, -1, &compressed_result, gzip.get()));
+    ASSERT_TRUE(compressed.finish_data_blocks(compressed_chunk, 8192, -1, &compressed_result, gzip.get()));
     compressed.finish_meta_block(compressed_meta, -1, &compressed_result, gzip.get());
 
     ASSERT_EQ(std::string(raw_chunk.begin(), raw_chunk.begin() + 8), "BLMFBLK2");
@@ -285,27 +307,40 @@ TEST(BloomFilter, GZipCompressedBlocksRoundTrip) {
     ASSERT_EQ(std::string(compressed_meta.begin(), compressed_meta.begin() + 8), "BLMFMET2");
 
     std::vector<uint8_t> decompressed_chunk(read_be32(compressed_chunk.data() + 12));
-    auto chunk_status = gzip->decompress(
-        block_payload(compressed_chunk), decompressed_chunk.data(), decompressed_chunk.size());
+    auto chunk_status
+        = gzip->decompress(block_payload(compressed_chunk), decompressed_chunk.data(), decompressed_chunk.size());
     ASSERT_TRUE(chunk_status.ok()) << chunk_status.message();
     auto raw_chunk_payload = block_payload(raw_chunk);
     EXPECT_EQ(decompressed_chunk.size(), raw_chunk_payload.size());
-    EXPECT_TRUE(std::equal(decompressed_chunk.begin(), decompressed_chunk.end(),
-                           raw_chunk_payload.begin()));
+    EXPECT_TRUE(std::equal(decompressed_chunk.begin(), decompressed_chunk.end(), raw_chunk_payload.begin()));
 
     std::vector<uint8_t> decompressed_meta(read_be32(compressed_meta.data() + 12));
-    auto meta_status = gzip->decompress(
-        block_payload(compressed_meta), decompressed_meta.data(), decompressed_meta.size());
+    auto meta_status
+        = gzip->decompress(block_payload(compressed_meta), decompressed_meta.data(), decompressed_meta.size());
     ASSERT_TRUE(meta_status.ok()) << meta_status.message();
     auto raw_meta_payload = block_payload(raw_meta);
     ASSERT_EQ(decompressed_meta.size(), raw_meta_payload.size());
     const uint8_t* raw_meta_ptr = raw_meta_payload.data();
     const uint8_t* compressed_meta_ptr = decompressed_meta.data();
-    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr)); raw_meta_ptr += 4; compressed_meta_ptr += 4;
-    EXPECT_EQ(read_be64(raw_meta_ptr), read_be64(compressed_meta_ptr)); raw_meta_ptr += 8; compressed_meta_ptr += 8;
-    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr)); raw_meta_ptr += 4; compressed_meta_ptr += 4;
-    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr)); raw_meta_ptr += 4; compressed_meta_ptr += 4;
-    EXPECT_EQ(read_be64(raw_meta_ptr), read_be64(compressed_meta_ptr)); raw_meta_ptr += 8; compressed_meta_ptr += 8;
-    EXPECT_EQ(read_be64(raw_meta_ptr), read_be64(compressed_meta_ptr)); raw_meta_ptr += 8; compressed_meta_ptr += 8;
-    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr)); raw_meta_ptr += 4; compressed_meta_ptr += 4;
+    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr));
+    raw_meta_ptr += 4;
+    compressed_meta_ptr += 4;
+    EXPECT_EQ(read_be64(raw_meta_ptr), read_be64(compressed_meta_ptr));
+    raw_meta_ptr += 8;
+    compressed_meta_ptr += 8;
+    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr));
+    raw_meta_ptr += 4;
+    compressed_meta_ptr += 4;
+    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr));
+    raw_meta_ptr += 4;
+    compressed_meta_ptr += 4;
+    EXPECT_EQ(read_be64(raw_meta_ptr), read_be64(compressed_meta_ptr));
+    raw_meta_ptr += 8;
+    compressed_meta_ptr += 8;
+    EXPECT_EQ(read_be64(raw_meta_ptr), read_be64(compressed_meta_ptr));
+    raw_meta_ptr += 8;
+    compressed_meta_ptr += 8;
+    EXPECT_EQ(read_be32(raw_meta_ptr), read_be32(compressed_meta_ptr));
+    raw_meta_ptr += 4;
+    compressed_meta_ptr += 4;
 }

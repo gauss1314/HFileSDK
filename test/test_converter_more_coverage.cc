@@ -15,9 +15,11 @@
 using namespace hfile;
 namespace fs = std::filesystem;
 
-namespace {
+namespace
+{
 
-fs::path temp_dir(const std::string& name) {
+fs::path temp_dir(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("converter_more_" + name);
     std::error_code ec;
     fs::remove_all(path, ec);
@@ -25,8 +27,8 @@ fs::path temp_dir(const std::string& name) {
     return path;
 }
 
-void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch,
-                      const fs::path& path) {
+void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch, const fs::path& path)
+{
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
     auto sink = *sink_result;
@@ -39,12 +41,13 @@ void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch,
     ASSERT_TRUE(sink->Close().ok());
 }
 
-std::shared_ptr<arrow::RecordBatch> make_string_payload_batch(
-        const std::shared_ptr<arrow::Array>& id_array,
-        const std::shared_ptr<arrow::DataType>& id_type,
-        const std::vector<std::string>& payloads) {
+std::shared_ptr<arrow::RecordBatch> make_string_payload_batch(const std::shared_ptr<arrow::Array>& id_array,
+                                                              const std::shared_ptr<arrow::DataType>& id_type,
+                                                              const std::vector<std::string>& payloads)
+{
     arrow::StringBuilder payload_builder;
-    for (const auto& payload : payloads) {
+    for (const auto& payload : payloads)
+    {
         EXPECT_TRUE(payload_builder.Append(payload).ok());
     }
 
@@ -55,12 +58,13 @@ std::shared_ptr<arrow::RecordBatch> make_string_payload_batch(
         arrow::field("id", id_type),
         arrow::field("payload", arrow::utf8()),
     });
-    return arrow::RecordBatch::Make(
-        schema, id_array->length(), {id_array, payload_array});
+    return arrow::RecordBatch::Make(schema, id_array->length(), {id_array, payload_array});
 }
 
-std::shared_ptr<arrow::RecordBatch> make_wide_scalar_batch() {
-    auto require_ok = [](const arrow::Status& status) {
+std::shared_ptr<arrow::RecordBatch> make_wide_scalar_batch()
+{
+    auto require_ok = [](const arrow::Status& status)
+    {
         EXPECT_TRUE(status.ok()) << status.ToString();
         return status.ok();
     };
@@ -78,61 +82,177 @@ std::shared_ptr<arrow::RecordBatch> make_wide_scalar_batch() {
     arrow::FloatBuilder f32_builder;
     arrow::DoubleBuilder f64_builder;
     arrow::BooleanBuilder bool_builder;
-    arrow::TimestampBuilder ts_s_builder(
-        arrow::timestamp(arrow::TimeUnit::SECOND), arrow::default_memory_pool());
-    arrow::TimestampBuilder ts_ms_builder(
-        arrow::timestamp(arrow::TimeUnit::MILLI), arrow::default_memory_pool());
-    arrow::TimestampBuilder ts_us_builder(
-        arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
-    arrow::TimestampBuilder ts_ns_builder(
-        arrow::timestamp(arrow::TimeUnit::NANO), arrow::default_memory_pool());
+    arrow::TimestampBuilder ts_s_builder(arrow::timestamp(arrow::TimeUnit::SECOND), arrow::default_memory_pool());
+    arrow::TimestampBuilder ts_ms_builder(arrow::timestamp(arrow::TimeUnit::MILLI), arrow::default_memory_pool());
+    arrow::TimestampBuilder ts_us_builder(arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
+    arrow::TimestampBuilder ts_ns_builder(arrow::timestamp(arrow::TimeUnit::NANO), arrow::default_memory_pool());
     arrow::BinaryBuilder bin_builder;
     arrow::LargeBinaryBuilder lbin_builder;
     arrow::Date32Builder date_builder;
 
-    if (!require_ok(s_builder.Append("s"))) return nullptr;
-    if (!require_ok(ls_builder.Append("large"))) return nullptr;
-    if (!require_ok(i8_builder.Append(-8))) return nullptr;
-    if (!require_ok(i16_builder.Append(-16))) return nullptr;
-    if (!require_ok(i32_builder.Append(-32))) return nullptr;
-    if (!require_ok(i64_builder.Append(64))) return nullptr;
-    if (!require_ok(u8_builder.Append(8))) return nullptr;
-    if (!require_ok(u16_builder.Append(16))) return nullptr;
-    if (!require_ok(u32_builder.Append(32))) return nullptr;
-    if (!require_ok(u64_builder.Append(64))) return nullptr;
-    if (!require_ok(f32_builder.Append(1.25f))) return nullptr;
-    if (!require_ok(f64_builder.Append(2.5))) return nullptr;
-    if (!require_ok(bool_builder.Append(true))) return nullptr;
-    if (!require_ok(ts_s_builder.Append(3))) return nullptr;
-    if (!require_ok(ts_ms_builder.Append(4000))) return nullptr;
-    if (!require_ok(ts_us_builder.Append(5000))) return nullptr;
-    if (!require_ok(ts_ns_builder.Append(6000000))) return nullptr;
-    if (!require_ok(bin_builder.Append(reinterpret_cast<const uint8_t*>("ab"), 2))) return nullptr;
-    if (!require_ok(lbin_builder.Append(reinterpret_cast<const uint8_t*>("cde"), 3))) return nullptr;
-    if (!require_ok(date_builder.Append(1))) return nullptr;
+    if (!require_ok(s_builder.Append("s")))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ls_builder.Append("large")))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i8_builder.Append(-8)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i16_builder.Append(-16)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i32_builder.Append(-32)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i64_builder.Append(64)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u8_builder.Append(8)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u16_builder.Append(16)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u32_builder.Append(32)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u64_builder.Append(64)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(f32_builder.Append(1.25f)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(f64_builder.Append(2.5)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(bool_builder.Append(true)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_s_builder.Append(3)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_ms_builder.Append(4000)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_us_builder.Append(5000)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_ns_builder.Append(6000000)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(bin_builder.Append(reinterpret_cast<const uint8_t*>("ab"), 2)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(lbin_builder.Append(reinterpret_cast<const uint8_t*>("cde"), 3)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(date_builder.Append(1)))
+    {
+        return nullptr;
+    }
 
     std::shared_ptr<arrow::Array> s, ls, i8, i16, i32, i64, u8, u16, u32, u64;
     std::shared_ptr<arrow::Array> f32, f64, b, ts_s, ts_ms, ts_us, ts_ns, bin, lbin, date32;
-    if (!require_ok(s_builder.Finish(&s))) return nullptr;
-    if (!require_ok(ls_builder.Finish(&ls))) return nullptr;
-    if (!require_ok(i8_builder.Finish(&i8))) return nullptr;
-    if (!require_ok(i16_builder.Finish(&i16))) return nullptr;
-    if (!require_ok(i32_builder.Finish(&i32))) return nullptr;
-    if (!require_ok(i64_builder.Finish(&i64))) return nullptr;
-    if (!require_ok(u8_builder.Finish(&u8))) return nullptr;
-    if (!require_ok(u16_builder.Finish(&u16))) return nullptr;
-    if (!require_ok(u32_builder.Finish(&u32))) return nullptr;
-    if (!require_ok(u64_builder.Finish(&u64))) return nullptr;
-    if (!require_ok(f32_builder.Finish(&f32))) return nullptr;
-    if (!require_ok(f64_builder.Finish(&f64))) return nullptr;
-    if (!require_ok(bool_builder.Finish(&b))) return nullptr;
-    if (!require_ok(ts_s_builder.Finish(&ts_s))) return nullptr;
-    if (!require_ok(ts_ms_builder.Finish(&ts_ms))) return nullptr;
-    if (!require_ok(ts_us_builder.Finish(&ts_us))) return nullptr;
-    if (!require_ok(ts_ns_builder.Finish(&ts_ns))) return nullptr;
-    if (!require_ok(bin_builder.Finish(&bin))) return nullptr;
-    if (!require_ok(lbin_builder.Finish(&lbin))) return nullptr;
-    if (!require_ok(date_builder.Finish(&date32))) return nullptr;
+    if (!require_ok(s_builder.Finish(&s)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ls_builder.Finish(&ls)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i8_builder.Finish(&i8)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i16_builder.Finish(&i16)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i32_builder.Finish(&i32)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(i64_builder.Finish(&i64)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u8_builder.Finish(&u8)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u16_builder.Finish(&u16)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u32_builder.Finish(&u32)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(u64_builder.Finish(&u64)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(f32_builder.Finish(&f32)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(f64_builder.Finish(&f64)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(bool_builder.Finish(&b)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_s_builder.Finish(&ts_s)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_ms_builder.Finish(&ts_ms)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_us_builder.Finish(&ts_us)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_ns_builder.Finish(&ts_ns)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(bin_builder.Finish(&bin)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(lbin_builder.Finish(&lbin)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(date_builder.Finish(&date32)))
+    {
+        return nullptr;
+    }
 
     auto schema = arrow::schema({
         arrow::field("s", arrow::utf8()),
@@ -156,16 +276,12 @@ std::shared_ptr<arrow::RecordBatch> make_wide_scalar_batch() {
         arrow::field("lbin", arrow::large_binary()),
         arrow::field("date32", arrow::date32()),
     });
-    return arrow::RecordBatch::Make(
-        schema,
-        1,
-        {s, ls, i8, i16, i32, i64, u8, u16, u32, u64,
-         f32, f64, b, ts_s, ts_ms, ts_us, ts_ns, bin, lbin, date32});
+    return arrow::RecordBatch::Make(schema, 1, {s,   ls,  i8, i16,  i32,   i64,   u8,    u16, u32,  u64,
+                                                f32, f64, b,  ts_s, ts_ms, ts_us, ts_ns, bin, lbin, date32});
 }
 
-ConvertOptions make_base_opts(const fs::path& arrow_path,
-                              const fs::path& hfile_path,
-                              const std::string& row_key_rule) {
+ConvertOptions make_base_opts(const fs::path& arrow_path, const fs::path& hfile_path, const std::string& row_key_rule)
+{
     ConvertOptions opts;
     opts.arrow_path = arrow_path.string();
     opts.hfile_path = hfile_path.string();
@@ -177,9 +293,10 @@ ConvertOptions make_base_opts(const fs::path& arrow_path,
     return opts;
 }
 
-}  // namespace
+} // namespace
 
-TEST(ConverterMoreCoverage, ConvertCoversWideScalarTypesAndFallbackValues) {
+TEST(ConverterMoreCoverage, ConvertCoversWideScalarTypesAndFallbackValues)
+{
     auto dir = temp_dir("wide_types");
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";
@@ -188,13 +305,12 @@ TEST(ConverterMoreCoverage, ConvertCoversWideScalarTypesAndFallbackValues) {
     ASSERT_NE(batch, nullptr);
     write_ipc_stream(batch, arrow_path);
 
-    auto opts = make_base_opts(
-        arrow_path,
-        hfile_path,
-        "C0,0,false,0#C1,1,false,0#C2,2,false,0#C3,3,false,0#C4,4,false,0"
-        "#C5,5,false,0#C6,6,false,0#C7,7,false,0#C8,8,false,0#C9,9,false,0"
-        "#C10,10,false,0#C11,11,false,0#C12,12,false,0#C13,13,false,0"
-        "#C14,14,false,0#C15,15,false,0#C16,16,false,0");
+    auto opts = make_base_opts(arrow_path,
+                               hfile_path,
+                               "C0,0,false,0#C1,1,false,0#C2,2,false,0#C3,3,false,0#C4,4,false,0"
+                               "#C5,5,false,0#C6,6,false,0#C7,7,false,0#C8,8,false,0#C9,9,false,0"
+                               "#C10,10,false,0#C11,11,false,0#C12,12,false,0#C13,13,false,0"
+                               "#C14,14,false,0#C15,15,false,0#C16,16,false,0");
     opts.default_timestamp = 0;
 
     auto result = convert(opts);
@@ -206,7 +322,8 @@ TEST(ConverterMoreCoverage, ConvertCoversWideScalarTypesAndFallbackValues) {
     fs::remove_all(dir);
 }
 
-TEST(ConverterMoreCoverage, ConvertDirectLargeStringFastPathSkipsNullAndEmptyRows) {
+TEST(ConverterMoreCoverage, ConvertDirectLargeStringFastPathSkipsNullAndEmptyRows)
+{
     auto dir = temp_dir("large_string_direct");
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";
@@ -225,13 +342,12 @@ TEST(ConverterMoreCoverage, ConvertDirectLargeStringFastPathSkipsNullAndEmptyRow
     ASSERT_TRUE(id_builder.Finish(&id_array).ok());
     ASSERT_TRUE(payload_builder.Finish(&payload_array).ok());
 
-    auto batch = arrow::RecordBatch::Make(
-        arrow::schema({
-            arrow::field("id", arrow::large_utf8()),
-            arrow::field("payload", arrow::utf8()),
-        }),
-        3,
-        {id_array, payload_array});
+    auto batch = arrow::RecordBatch::Make(arrow::schema({
+                                              arrow::field("id", arrow::large_utf8()),
+                                              arrow::field("payload", arrow::utf8()),
+                                          }),
+                                          3,
+                                          {id_array, payload_array});
     write_ipc_stream(batch, arrow_path);
 
     auto opts = make_base_opts(arrow_path, hfile_path, "ID,0,false,0");
@@ -246,7 +362,8 @@ TEST(ConverterMoreCoverage, ConvertDirectLargeStringFastPathSkipsNullAndEmptyRow
     fs::remove_all(dir);
 }
 
-TEST(ConverterMoreCoverage, NumericFastPathOnRejectsIneligibleRule) {
+TEST(ConverterMoreCoverage, NumericFastPathOnRejectsIneligibleRule)
+{
     auto dir = temp_dir("numeric_on_reject");
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";
@@ -269,7 +386,8 @@ TEST(ConverterMoreCoverage, NumericFastPathOnRejectsIneligibleRule) {
     fs::remove_all(dir);
 }
 
-TEST(ConverterMoreCoverage, NumericFastPathCoversBoolUint64AndTimestamp) {
+TEST(ConverterMoreCoverage, NumericFastPathCoversBoolUint64AndTimestamp)
+{
     auto dir = temp_dir("numeric_extra_types");
 
     {
@@ -315,13 +433,11 @@ TEST(ConverterMoreCoverage, NumericFastPathCoversBoolUint64AndTimestamp) {
     }
 
     {
-        arrow::TimestampBuilder builder(
-            arrow::timestamp(arrow::TimeUnit::SECOND), arrow::default_memory_pool());
+        arrow::TimestampBuilder builder(arrow::timestamp(arrow::TimeUnit::SECOND), arrow::default_memory_pool());
         ASSERT_TRUE(builder.Append(1234).ok());
         std::shared_ptr<arrow::Array> id_array;
         ASSERT_TRUE(builder.Finish(&id_array).ok());
-        auto batch = make_string_payload_batch(
-            id_array, arrow::timestamp(arrow::TimeUnit::SECOND), {"payload"});
+        auto batch = make_string_payload_batch(id_array, arrow::timestamp(arrow::TimeUnit::SECOND), {"payload"});
         auto arrow_path = dir / "ts.arrow";
         auto off_hfile = dir / "ts_off.hfile";
         auto auto_hfile = dir / "ts_auto.hfile";
@@ -340,7 +456,8 @@ TEST(ConverterMoreCoverage, NumericFastPathCoversBoolUint64AndTimestamp) {
     fs::remove_all(dir);
 }
 
-TEST(ConverterMoreCoverage, EncodedSegmentFailureMapsToInvalidRowKeyRule) {
+TEST(ConverterMoreCoverage, EncodedSegmentFailureMapsToInvalidRowKeyRule)
+{
     auto dir = temp_dir("encoded_failure");
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";
@@ -361,7 +478,8 @@ TEST(ConverterMoreCoverage, EncodedSegmentFailureMapsToInvalidRowKeyRule) {
     fs::remove_all(dir);
 }
 
-TEST(ConverterMoreCoverage, FinishDiskExhaustedMapsDedicatedErrorCode) {
+TEST(ConverterMoreCoverage, FinishDiskExhaustedMapsDedicatedErrorCode)
+{
     auto dir = temp_dir("disk_exhausted");
     auto arrow_path = dir / "input.arrow";
     auto hfile_path = dir / "output.hfile";

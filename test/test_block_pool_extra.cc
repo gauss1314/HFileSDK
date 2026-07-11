@@ -6,7 +6,8 @@
 
 using namespace hfile::memory;
 
-TEST(BlockPoolExtra, AcquireReleaseAndExhaustion) {
+TEST(BlockPoolExtra, AcquireReleaseAndExhaustion)
+{
     BlockPool pool(128, 2);
     EXPECT_EQ(pool.buffer_size(), 128u);
     EXPECT_EQ(pool.available(), 2u);

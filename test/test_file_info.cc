@@ -7,11 +7,12 @@
 using namespace hfile;
 using namespace hfile::meta;
 
-TEST(FileInfoBuilder, AllMandatoryFields) {
+TEST(FileInfoBuilder, AllMandatoryFields)
+{
     FileInfoBuilder fib;
 
-    const uint8_t last_key_data[] = {'r','o','w','1'};
-    const uint8_t biggest_key_data[] = {'r','o','w','9'};
+    const uint8_t last_key_data[] = {'r', 'o', 'w', '1'};
+    const uint8_t biggest_key_data[] = {'r', 'o', 'w', '9'};
     fib.set_last_key({last_key_data, 4});
     fib.set_avg_key_len(24);
     fib.set_avg_value_len(100);
@@ -35,7 +36,8 @@ TEST(FileInfoBuilder, AllMandatoryFields) {
     EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
 }
 
-TEST(FileInfoBuilder, EncodingNames) {
+TEST(FileInfoBuilder, EncodingNames)
+{
     FileInfoBuilder fib;
     const uint8_t biggest_key_data[] = {'k'};
     fib.set_last_key({});
@@ -60,7 +62,8 @@ TEST(FileInfoBuilder, EncodingNames) {
     EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 4), "PBUF");
 }
 
-TEST(FileInfoBuilder, ComparatorString) {
+TEST(FileInfoBuilder, ComparatorString)
+{
     FileInfoBuilder fib;
     const uint8_t biggest_key_data[] = {'k'};
     fib.set_comparator(kCellComparator);
@@ -88,7 +91,8 @@ TEST(FileInfoBuilder, ComparatorString) {
     EXPECT_NE(haystack.find(expected), std::string::npos);
 }
 
-TEST(FileInfoBuilder, RejectsMissingMandatoryFields) {
+TEST(FileInfoBuilder, RejectsMissingMandatoryFields)
+{
     FileInfoBuilder fib;
     fib.set_last_key({});
     fib.set_avg_key_len(0);

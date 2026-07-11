@@ -6,7 +6,8 @@
 using namespace hfile;
 using namespace hfile::meta;
 
-TEST(TrailerBuilder, SerializesCorrectVersions) {
+TEST(TrailerBuilder, SerializesCorrectVersions)
+{
     TrailerBuilder tb;
     tb.set_file_info_offset(1024);
     tb.set_load_on_open_offset(512);
@@ -21,12 +22,11 @@ TEST(TrailerBuilder, SerializesCorrectVersions) {
     ASSERT_EQ(out.size(), kTrailerFixedSize);
     EXPECT_EQ(std::string(reinterpret_cast<const char*>(out.data()), 8), "TRABLK\"$");
     uint32_t version = read_be32(out.data() + out.size() - kTrailerVersionSize);
-    EXPECT_EQ(version,
-              (static_cast<uint32_t>(kHFileMinorVersion) << 24) |
-              static_cast<uint32_t>(kHFileMajorVersion));
+    EXPECT_EQ(version, (static_cast<uint32_t>(kHFileMinorVersion) << 24) | static_cast<uint32_t>(kHFileMajorVersion));
 }
 
-TEST(TrailerBuilder, ProtobufDeserializable) {
+TEST(TrailerBuilder, ProtobufDeserializable)
+{
     TrailerBuilder tb;
     tb.set_file_info_offset(8192);
     tb.set_load_on_open_offset(4096);

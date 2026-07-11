@@ -1,0 +1,43 @@
+---
+Language: Cpp
+BasedOnStyle: LLVM
+
+# C/C++ coding standard: four spaces, no tabs, and a 120-column limit.
+IndentWidth: 4
+ContinuationIndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ColumnLimit: 120
+
+# Braces delimit every control-flow body and start on their own line.
+BreakBeforeBraces: Allman
+InsertBraces: true
+AllowShortBlocksOnASingleLine: Never
+AllowShortCaseLabelsOnASingleLine: false
+AllowShortEnumsOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: None
+AllowShortLoopsOnASingleLine: false
+
+# Keep wrapped expressions readable and place binary operators first.
+BreakBeforeBinaryOperators: All
+BinPackArguments: false
+BinPackParameters: false
+AlignAfterOpenBracket: Align
+
+# Preserve intentional include grouping and namespace indentation.
+SortIncludes: Never
+IncludeBlocks: Preserve
+NamespaceIndentation: None
+IndentCaseLabels: true
+IndentCaseBlocks: true
+AccessModifierOffset: -4
+
+# Match the project's established pointer/reference spelling.
+DerivePointerAlignment: false
+PointerAlignment: Left
+ReferenceAlignment: Pointer
+SpaceBeforeParens: ControlStatements
+SpacesInParentheses: false
+...

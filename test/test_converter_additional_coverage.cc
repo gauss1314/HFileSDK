@@ -16,22 +16,30 @@
 namespace fs = std::filesystem;
 using namespace hfile;
 
-namespace {
+namespace
+{
 
-struct ScopedEnvVar {
-    explicit ScopedEnvVar(const char* value) {
+struct ScopedEnvVar
+{
+    explicit ScopedEnvVar(const char* value)
+    {
         const char* current = std::getenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
-        if (current != nullptr) {
+        if (current != nullptr)
+        {
             had_old_ = true;
             old_ = current;
         }
         setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", value, 1);
     }
 
-    ~ScopedEnvVar() {
-        if (had_old_) {
+    ~ScopedEnvVar()
+    {
+        if (had_old_)
+        {
             setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", old_.c_str(), 1);
-        } else {
+        }
+        else
+        {
             unsetenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
         }
     }
@@ -40,7 +48,8 @@ struct ScopedEnvVar {
     std::string old_;
 };
 
-fs::path temp_dir(const std::string& name) {
+fs::path temp_dir(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("converter_extra_" + name);
     std::error_code ec;
     fs::remove_all(path, ec);
@@ -48,8 +57,8 @@ fs::path temp_dir(const std::string& name) {
     return path;
 }
 
-void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch,
-                      const fs::path& path) {
+void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch, const fs::path& path)
+{
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
     auto sink = *sink_result;
@@ -62,7 +71,8 @@ void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch,
     ASSERT_TRUE(sink->Close().ok());
 }
 
-std::shared_ptr<arrow::RecordBatch> make_wide_types_batch() {
+std::shared_ptr<arrow::RecordBatch> make_wide_types_batch()
+{
     arrow::StringBuilder row_builder;
     arrow::Int8Builder int8_builder;
     arrow::Int16Builder int16_builder;
@@ -75,36 +85,103 @@ std::shared_ptr<arrow::RecordBatch> make_wide_types_batch() {
     arrow::LargeStringBuilder large_string_builder;
     arrow::TimestampBuilder ts_builder(arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
 
-    auto require_ok = [](const arrow::Status& status) {
+    auto require_ok = [](const arrow::Status& status)
+    {
         EXPECT_TRUE(status.ok()) << status.ToString();
         return status.ok();
     };
 
-    if (!require_ok(row_builder.Append("row01"))) return nullptr;
-    if (!require_ok(int8_builder.Append(-7))) return nullptr;
-    if (!require_ok(int16_builder.Append(-1024))) return nullptr;
-    if (!require_ok(uint8_builder.Append(7))) return nullptr;
-    if (!require_ok(uint16_builder.Append(1024))) return nullptr;
-    if (!require_ok(uint32_builder.Append(65536))) return nullptr;
-    if (!require_ok(uint64_builder.Append(123456789ULL))) return nullptr;
-    if (!require_ok(double_builder.Append(3.5))) return nullptr;
-    if (!require_ok(binary_builder.Append(reinterpret_cast<const uint8_t*>("bin"), 3))) return nullptr;
-    if (!require_ok(large_string_builder.Append("large-string"))) return nullptr;
-    if (!require_ok(ts_builder.Append(1234567))) return nullptr;
+    if (!require_ok(row_builder.Append("row01")))
+    {
+        return nullptr;
+    }
+    if (!require_ok(int8_builder.Append(-7)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(int16_builder.Append(-1024)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint8_builder.Append(7)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint16_builder.Append(1024)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint32_builder.Append(65536)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint64_builder.Append(123456789ULL)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(double_builder.Append(3.5)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(binary_builder.Append(reinterpret_cast<const uint8_t*>("bin"), 3)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(large_string_builder.Append("large-string")))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_builder.Append(1234567)))
+    {
+        return nullptr;
+    }
 
     std::shared_ptr<arrow::Array> row_arr, int8_arr, int16_arr, uint8_arr, uint16_arr;
     std::shared_ptr<arrow::Array> uint32_arr, uint64_arr, double_arr, binary_arr, large_string_arr, ts_arr;
-    if (!require_ok(row_builder.Finish(&row_arr))) return nullptr;
-    if (!require_ok(int8_builder.Finish(&int8_arr))) return nullptr;
-    if (!require_ok(int16_builder.Finish(&int16_arr))) return nullptr;
-    if (!require_ok(uint8_builder.Finish(&uint8_arr))) return nullptr;
-    if (!require_ok(uint16_builder.Finish(&uint16_arr))) return nullptr;
-    if (!require_ok(uint32_builder.Finish(&uint32_arr))) return nullptr;
-    if (!require_ok(uint64_builder.Finish(&uint64_arr))) return nullptr;
-    if (!require_ok(double_builder.Finish(&double_arr))) return nullptr;
-    if (!require_ok(binary_builder.Finish(&binary_arr))) return nullptr;
-    if (!require_ok(large_string_builder.Finish(&large_string_arr))) return nullptr;
-    if (!require_ok(ts_builder.Finish(&ts_arr))) return nullptr;
+    if (!require_ok(row_builder.Finish(&row_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(int8_builder.Finish(&int8_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(int16_builder.Finish(&int16_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint8_builder.Finish(&uint8_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint16_builder.Finish(&uint16_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint32_builder.Finish(&uint32_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(uint64_builder.Finish(&uint64_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(double_builder.Finish(&double_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(binary_builder.Finish(&binary_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(large_string_builder.Finish(&large_string_arr)))
+    {
+        return nullptr;
+    }
+    if (!require_ok(ts_builder.Finish(&ts_arr)))
+    {
+        return nullptr;
+    }
 
     auto schema = arrow::schema({
         arrow::field("__row_key__", arrow::utf8()),
@@ -119,17 +196,27 @@ std::shared_ptr<arrow::RecordBatch> make_wide_types_batch() {
         arrow::field("ls", arrow::large_utf8()),
         arrow::field("ts", arrow::timestamp(arrow::TimeUnit::MICRO)),
     });
-    return arrow::RecordBatch::Make(
-        schema, 1,
-        {row_arr, int8_arr, int16_arr, uint8_arr, uint16_arr,
-         uint32_arr, uint64_arr, double_arr, binary_arr, large_string_arr, ts_arr});
+    return arrow::RecordBatch::Make(schema,
+                                    1,
+                                    {row_arr,
+                                     int8_arr,
+                                     int16_arr,
+                                     uint8_arr,
+                                     uint16_arr,
+                                     uint32_arr,
+                                     uint64_arr,
+                                     double_arr,
+                                     binary_arr,
+                                     large_string_arr,
+                                     ts_arr});
 }
 
 template <typename BuilderT, typename ValueT>
 fs::path write_single_numeric_arrow(const fs::path& dir,
                                     const std::string& name,
                                     const std::shared_ptr<arrow::DataType>& type,
-                                    ValueT value) {
+                                    ValueT value)
+{
     arrow::StringBuilder payload_builder;
     BuilderT key_builder;
     EXPECT_TRUE(payload_builder.Append("payload").ok());
@@ -150,9 +237,10 @@ fs::path write_single_numeric_arrow(const fs::path& dir,
     return path;
 }
 
-}  // namespace
+} // namespace
 
-TEST(ConverterAdditionalCoverage, ConvertRejectsEmptyHFilePathAndInvalidOutputParent) {
+TEST(ConverterAdditionalCoverage, ConvertRejectsEmptyHFilePathAndInvalidOutputParent)
+{
     ConvertOptions empty_path;
     empty_path.arrow_path = "/tmp/does-not-matter.arrow";
     empty_path.hfile_path = "";
@@ -186,7 +274,8 @@ TEST(ConverterAdditionalCoverage, ConvertRejectsEmptyHFilePathAndInvalidOutputPa
     fs::remove_all(dir);
 }
 
-TEST(ConverterAdditionalCoverage, ConvertWithHotPathAndCompressionPipelineSucceeds) {
+TEST(ConverterAdditionalCoverage, ConvertWithHotPathAndCompressionPipelineSucceeds)
+{
     ScopedEnvVar profiling("1");
     auto dir = temp_dir("hotpath");
     auto arrow_path = dir / "input.arrow";
@@ -220,36 +309,63 @@ TEST(ConverterAdditionalCoverage, ConvertWithHotPathAndCompressionPipelineSuccee
     fs::remove_all(dir);
 }
 
-TEST(ConverterAdditionalCoverage, NumericFastPathCoversMultipleIntegralTypes) {
+TEST(ConverterAdditionalCoverage, NumericFastPathCoversMultipleIntegralTypes)
+{
     auto dir = temp_dir("numeric_fast_path_types");
 
-    struct Case {
+    struct Case
+    {
         std::string name;
         std::shared_ptr<arrow::DataType> type;
         std::function<fs::path()> write_input;
     };
 
     std::vector<Case> cases;
-    cases.push_back({"int8", arrow::int8(), [&] {
-        return write_single_numeric_arrow<arrow::Int8Builder>(dir, "int8", arrow::int8(), static_cast<int8_t>(7));
-    }});
-    cases.push_back({"int16", arrow::int16(), [&] {
-        return write_single_numeric_arrow<arrow::Int16Builder>(dir, "int16", arrow::int16(), static_cast<int16_t>(42));
-    }});
-    cases.push_back({"int32", arrow::int32(), [&] {
-        return write_single_numeric_arrow<arrow::Int32Builder>(dir, "int32", arrow::int32(), static_cast<int32_t>(321));
-    }});
-    cases.push_back({"uint8", arrow::uint8(), [&] {
-        return write_single_numeric_arrow<arrow::UInt8Builder>(dir, "uint8", arrow::uint8(), static_cast<uint8_t>(9));
-    }});
-    cases.push_back({"uint16", arrow::uint16(), [&] {
-        return write_single_numeric_arrow<arrow::UInt16Builder>(dir, "uint16", arrow::uint16(), static_cast<uint16_t>(77));
-    }});
-    cases.push_back({"uint32", arrow::uint32(), [&] {
-        return write_single_numeric_arrow<arrow::UInt32Builder>(dir, "uint32", arrow::uint32(), static_cast<uint32_t>(999));
-    }});
+    cases.push_back({"int8",
+                     arrow::int8(),
+                     [&]
+                     {
+                         return write_single_numeric_arrow<arrow::Int8Builder>(
+                             dir, "int8", arrow::int8(), static_cast<int8_t>(7));
+                     }});
+    cases.push_back({"int16",
+                     arrow::int16(),
+                     [&]
+                     {
+                         return write_single_numeric_arrow<arrow::Int16Builder>(
+                             dir, "int16", arrow::int16(), static_cast<int16_t>(42));
+                     }});
+    cases.push_back({"int32",
+                     arrow::int32(),
+                     [&]
+                     {
+                         return write_single_numeric_arrow<arrow::Int32Builder>(
+                             dir, "int32", arrow::int32(), static_cast<int32_t>(321));
+                     }});
+    cases.push_back({"uint8",
+                     arrow::uint8(),
+                     [&]
+                     {
+                         return write_single_numeric_arrow<arrow::UInt8Builder>(
+                             dir, "uint8", arrow::uint8(), static_cast<uint8_t>(9));
+                     }});
+    cases.push_back({"uint16",
+                     arrow::uint16(),
+                     [&]
+                     {
+                         return write_single_numeric_arrow<arrow::UInt16Builder>(
+                             dir, "uint16", arrow::uint16(), static_cast<uint16_t>(77));
+                     }});
+    cases.push_back({"uint32",
+                     arrow::uint32(),
+                     [&]
+                     {
+                         return write_single_numeric_arrow<arrow::UInt32Builder>(
+                             dir, "uint32", arrow::uint32(), static_cast<uint32_t>(999));
+                     }});
 
-    for (const auto& test_case : cases) {
+    for (const auto& test_case : cases)
+    {
         auto arrow_path = test_case.write_input();
         auto hfile_path_off = dir / (test_case.name + "_off.hfile");
         auto hfile_path_on = dir / (test_case.name + "_on.hfile");
@@ -267,8 +383,7 @@ TEST(ConverterAdditionalCoverage, NumericFastPathCoversMultipleIntegralTypes) {
         off_opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
 
         auto off_result = convert(off_opts);
-        EXPECT_EQ(off_result.error_code, ErrorCode::OK)
-            << test_case.name << " off: " << off_result.error_message;
+        EXPECT_EQ(off_result.error_code, ErrorCode::OK) << test_case.name << " off: " << off_result.error_message;
         EXPECT_EQ(off_result.numeric_sort_fast_path_mode, NumericSortFastPathMode::Off);
         EXPECT_FALSE(off_result.numeric_sort_fast_path_used) << test_case.name << " off";
         EXPECT_TRUE(fs::exists(hfile_path_off));
@@ -278,8 +393,7 @@ TEST(ConverterAdditionalCoverage, NumericFastPathCoversMultipleIntegralTypes) {
         on_opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
 
         auto on_result = convert(on_opts);
-        EXPECT_EQ(on_result.error_code, ErrorCode::OK)
-            << test_case.name << " on: " << on_result.error_message;
+        EXPECT_EQ(on_result.error_code, ErrorCode::OK) << test_case.name << " on: " << on_result.error_message;
         EXPECT_EQ(on_result.numeric_sort_fast_path_mode, NumericSortFastPathMode::On);
         EXPECT_TRUE(on_result.numeric_sort_fast_path_used) << test_case.name << " on";
         EXPECT_TRUE(fs::exists(hfile_path_on));

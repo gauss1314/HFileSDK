@@ -8,34 +8,37 @@ using namespace hfile;
 using namespace hfile::index;
 
 // Helper: call finish() and return only the root payload (ignores intermed)
-static IndexWriteResult finish_simple(BlockIndexWriter& w,
-                                       std::vector<uint8_t>& root_out) {
+static IndexWriteResult finish_simple(BlockIndexWriter& w, std::vector<uint8_t>& root_out)
+{
     std::vector<uint8_t> intermed;
     return w.finish(0, intermed, root_out);
 }
 
-struct ParsedRootEntry {
+struct ParsedRootEntry
+{
     int64_t offset;
     uint32_t data_size;
     std::string key;
     size_t bytes;
 };
 
-static ParsedRootEntry parse_root_entry(const std::vector<uint8_t>& root, size_t off) {
+static ParsedRootEntry parse_root_entry(const std::vector<uint8_t>& root, size_t off)
+{
     ParsedRootEntry out;
     out.offset = static_cast<int64_t>(read_be64(root.data() + off));
     out.data_size = read_be32(root.data() + off + 8);
     int64_t key_len = 0;
     int vint_size = decode_writable_vint(root.data() + off + 12, key_len);
-    out.key.assign(reinterpret_cast<const char*>(root.data() + off + 12 + vint_size),
-                   static_cast<size_t>(key_len));
+    out.key.assign(reinterpret_cast<const char*>(root.data() + off + 12 + vint_size), static_cast<size_t>(key_len));
     out.bytes = 12 + static_cast<size_t>(vint_size) + static_cast<size_t>(key_len);
     return out;
 }
 
-// ─── 1-level (inline root) ────────────────────────────────────────────────────
+// --- 1-level (inline root)
+// ----
 
-TEST(BlockIndexWriter, EmptyOneLevel) {
+TEST(BlockIndexWriter, EmptyOneLevel)
+{
     BlockIndexWriter w(128);
     std::vector<uint8_t> root;
     auto r = finish_simple(w, root);
@@ -44,9 +47,10 @@ TEST(BlockIndexWriter, EmptyOneLevel) {
     EXPECT_TRUE(root.empty());
 }
 
-TEST(BlockIndexWriter, SingleEntryOneLevel) {
+TEST(BlockIndexWriter, SingleEntryOneLevel)
+{
     BlockIndexWriter w(128);
-    const uint8_t key[] = {'r','o','w','1'};
+    const uint8_t key[] = {'r', 'o', 'w', '1'};
     w.add_entry({key, 4}, /*offset=*/33, /*data_size=*/65536);
 
     std::vector<uint8_t> root;
@@ -61,9 +65,11 @@ TEST(BlockIndexWriter, SingleEntryOneLevel) {
     EXPECT_EQ(root.size(), entry.bytes);
 }
 
-TEST(BlockIndexWriter, BelowThresholdIsOneLevel) {
-    BlockIndexWriter w(128);  // threshold = 128
-    for (int i = 0; i < 100; ++i) {
+TEST(BlockIndexWriter, BelowThresholdIsOneLevel)
+{
+    BlockIndexWriter w(128); // threshold = 128
+    for (int i = 0; i < 100; ++i)
+    {
         std::string k = "key" + std::to_string(i);
         std::vector<uint8_t> kb(k.begin(), k.end());
         w.add_entry(kb, i * 65536, 65536);
@@ -73,7 +79,8 @@ TEST(BlockIndexWriter, BelowThresholdIsOneLevel) {
     EXPECT_EQ(r.num_levels, 1);
     EXPECT_EQ(r.num_root_entries, 100u);
     size_t off = 0;
-    for (int i = 0; i < 100; ++i) {
+    for (int i = 0; i < 100; ++i)
+    {
         auto entry = parse_root_entry(root, off);
         EXPECT_EQ(entry.offset, static_cast<int64_t>(i * 65536));
         EXPECT_EQ(entry.data_size, 65536u);
@@ -82,14 +89,16 @@ TEST(BlockIndexWriter, BelowThresholdIsOneLevel) {
     EXPECT_EQ(off, root.size());
 }
 
-// ─── 2-level (intermediate + root) ───────────────────────────────────────────
+// --- 2-level (intermediate + root) ----
 
-TEST(BlockIndexWriter, ExceedsThresholdIsTwoLevel) {
+TEST(BlockIndexWriter, ExceedsThresholdIsTwoLevel)
+{
     const size_t threshold = 10;
     BlockIndexWriter w(threshold);
 
     // 25 entries → ceil(25/10) = 3 intermediate blocks → 3 root entries
-    for (int i = 0; i < 25; ++i) {
+    for (int i = 0; i < 25; ++i)
+    {
         std::string k = "row" + std::to_string(i);
         std::vector<uint8_t> kb(k.begin(), k.end());
         w.add_entry(kb, static_cast<int64_t>(i) * 65536, 65536);
@@ -100,7 +109,7 @@ TEST(BlockIndexWriter, ExceedsThresholdIsTwoLevel) {
     auto r = w.finish(0, intermed, root);
 
     EXPECT_EQ(r.num_levels, 2);
-    EXPECT_EQ(r.num_root_entries, 3u);          // 3 intermediate blocks
+    EXPECT_EQ(r.num_root_entries, 3u); // 3 intermediate blocks
 
     // Intermediate buffer must be non-empty
     EXPECT_GT(intermed.size(), 0u);
@@ -113,15 +122,16 @@ TEST(BlockIndexWriter, ExceedsThresholdIsTwoLevel) {
     EXPECT_EQ(entry2.key, "row20");
 
     // First intermediate block should start with IDXINTE2 magic
-    EXPECT_EQ(std::memcmp(intermed.data(),
-                           kIntermedIdxMagic.data(), 8), 0);
+    EXPECT_EQ(std::memcmp(intermed.data(), kIntermedIdxMagic.data(), 8), 0);
 }
 
-TEST(BlockIndexWriter, TwoLevelIntermediateOffsets) {
+TEST(BlockIndexWriter, TwoLevelIntermediateOffsets)
+{
     const size_t threshold = 4;
     BlockIndexWriter w(threshold);
 
-    for (int i = 0; i < 8; ++i) {
+    for (int i = 0; i < 8; ++i)
+    {
         std::string k = std::string(4, static_cast<char>('a' + i));
         std::vector<uint8_t> kb(k.begin(), k.end());
         w.add_entry(kb, static_cast<int64_t>(i * 1000), 512);
@@ -134,7 +144,7 @@ TEST(BlockIndexWriter, TwoLevelIntermediateOffsets) {
     auto r = w.finish(intermed_start, intermed, root);
 
     EXPECT_EQ(r.num_levels, 2);
-    EXPECT_EQ(r.num_root_entries, 2u);  // ceil(8/4) = 2 blocks
+    EXPECT_EQ(r.num_root_entries, 2u); // ceil(8/4) = 2 blocks
 
     auto entry0 = parse_root_entry(root, 0);
     auto entry1 = parse_root_entry(root, entry0.bytes);
@@ -152,13 +162,15 @@ TEST(BlockIndexWriter, TwoLevelIntermediateOffsets) {
     EXPECT_EQ(read_be32(payload + 20), 64u);
 }
 
-TEST(BlockIndexWriter, TwoLevelFirstKeysCorrect) {
+TEST(BlockIndexWriter, TwoLevelFirstKeysCorrect)
+{
     const size_t threshold = 3;
     BlockIndexWriter w(threshold);
 
     // Keys: "aaa","bbb","ccc","ddd","eee","fff"  → 2 intermediate blocks
-    const char* keys[] = {"aaa","bbb","ccc","ddd","eee","fff"};
-    for (int i = 0; i < 6; ++i) {
+    const char* keys[] = {"aaa", "bbb", "ccc", "ddd", "eee", "fff"};
+    for (int i = 0; i < 6; ++i)
+    {
         std::vector<uint8_t> kb(keys[i], keys[i] + 3);
         w.add_entry(kb, i * 100, 100);
     }

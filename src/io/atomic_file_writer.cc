@@ -8,32 +8,35 @@
 #include <iomanip>
 
 #if !defined(_WIN32) && !defined(_WIN64)
-#  include <unistd.h>   // fsync, open
-#  include <fcntl.h>
+#include <unistd.h> // fsync, open
+#include <fcntl.h>
 #else
-#  include <windows.h>
+#include <windows.h>
 #endif
 
-namespace hfile {
-namespace io {
+namespace hfile
+{
+namespace io
+{
 
 namespace fs = std::filesystem;
 
-// ─── Temp path generation ─────────────────────────────────────────────────────
+// --- Temp path generation
+// ----
 
-static std::string generate_uuid_hex() {
+static std::string generate_uuid_hex()
+{
     // 16 random bytes → 32 hex chars, good enough for a unique temp suffix
     std::random_device rd;
-    std::mt19937_64    rng(rd());
+    std::mt19937_64 rng(rd());
     uint64_t hi = rng(), lo = rng();
     std::ostringstream oss;
-    oss << std::hex << std::setfill('0')
-        << std::setw(16) << hi
-        << std::setw(16) << lo;
+    oss << std::hex << std::setfill('0') << std::setw(16) << hi << std::setw(16) << lo;
     return oss.str();
 }
 
-std::string AtomicFileWriter::make_temp_path(const std::string& final_path) {
+std::string AtomicFileWriter::make_temp_path(const std::string& final_path)
+{
     fs::path fp{final_path};
     fs::path tmp_dir = fp.parent_path() / ".tmp";
     std::error_code ec;
@@ -43,46 +46,63 @@ std::string AtomicFileWriter::make_temp_path(const std::string& final_path) {
     return (tmp_dir / tmp_name).string();
 }
 
-// ─── Constructor / Destructor ─────────────────────────────────────────────────
+// --- Constructor / Destructor
+// ----
 
-AtomicFileWriter::AtomicFileWriter(const std::string& final_path,
-                                    size_t buffer_size)
-    : final_path_{final_path}
-    , temp_path_{make_temp_path(final_path)} {
+AtomicFileWriter::AtomicFileWriter(const std::string& final_path, size_t buffer_size)
+    : final_path_{final_path}, temp_path_{make_temp_path(final_path)}
+{
     inner_ = std::make_unique<BufferedFileWriter>(temp_path_, buffer_size);
 }
 
-AtomicFileWriter::~AtomicFileWriter() {
-    if (!committed_ && !closed_) {
+AtomicFileWriter::~AtomicFileWriter()
+{
+    if (!committed_ && !closed_)
+    {
         abort();
     }
 }
 
-// ─── BlockWriter interface ────────────────────────────────────────────────────
+// --- BlockWriter interface
+// ----
 
-Status AtomicFileWriter::write(std::span<const uint8_t> data) {
+Status AtomicFileWriter::write(std::span<const uint8_t> data)
+{
     return inner_->write(data);
 }
 
-Status AtomicFileWriter::flush() {
+Status AtomicFileWriter::flush()
+{
     return inner_->flush();
 }
 
-Status AtomicFileWriter::close() {
-    if (closed_) return Status::OK();
+Status AtomicFileWriter::close()
+{
+    if (closed_)
+    {
+        return Status::OK();
+    }
     auto s = inner_->close();
-    if (s.ok()) closed_ = true;
+    if (s.ok())
+    {
+        closed_ = true;
+    }
     return s;
 }
 
-int64_t AtomicFileWriter::position() const noexcept {
+int64_t AtomicFileWriter::position() const noexcept
+{
     return inner_ ? inner_->position() : 0;
 }
 
-// ─── commit ──────────────────────────────────────────────────────────────────
+// --- commit ----
 
-Status AtomicFileWriter::commit() {
-    if (committed_) return Status::OK();
+Status AtomicFileWriter::commit()
+{
+    if (committed_)
+    {
+        return Status::OK();
+    }
 
     // 1. Flush app buffer → OS buffer, then fsync temp file
     HFILE_RETURN_IF_ERROR(inner_->flush());
@@ -97,8 +117,9 @@ Status AtomicFileWriter::commit() {
     std::error_code ec;
     fs::rename(temp_path_, final_path_, ec);
     if (ec)
-        return Status::IoError("rename failed: " + temp_path_ + " -> " +
-                               final_path_ + ": " + ec.message());
+    {
+        return Status::IoError("rename failed: " + temp_path_ + " -> " + final_path_ + ": " + ec.message());
+    }
 
     // 4. fsync the final directory so the rename persists
     fs::path final_dir = fs::path(final_path_).parent_path();
@@ -108,52 +129,67 @@ Status AtomicFileWriter::commit() {
     return Status::OK();
 }
 
-// ─── abort ───────────────────────────────────────────────────────────────────
+// --- abort ----
 
-void AtomicFileWriter::abort() noexcept {
-    if (!closed_) {
+void AtomicFileWriter::abort() noexcept
+{
+    if (!closed_)
+    {
         auto s = inner_->close();
         if (!s.ok())
+        {
             std::fprintf(stderr, "[ERROR] atomic_file_writer: %s\n", s.message().c_str());
-        if (s.ok()) closed_ = true;
+        }
+        if (s.ok())
+        {
+            closed_ = true;
+        }
     }
     std::error_code ec;
-    fs::remove(temp_path_, ec);  // best-effort delete of temp file
+    fs::remove(temp_path_, ec); // best-effort delete of temp file
     if (ec)
-        std::fprintf(stderr, "[ERROR] atomic_file_writer: remove failed: %s: %s\n",
-                     temp_path_.c_str(), ec.message().c_str());
+    {
+        std::fprintf(
+            stderr, "[ERROR] atomic_file_writer: remove failed: %s: %s\n", temp_path_.c_str(), ec.message().c_str());
+    }
 }
 
-// ─── fsync directory helper ───────────────────────────────────────────────────
+// --- fsync directory helper
+// ----
 
-Status AtomicFileWriter::fsync_directory(const fs::path& dir) noexcept {
+Status AtomicFileWriter::fsync_directory(const fs::path& dir) noexcept
+{
 #if defined(_WIN32) || defined(_WIN64)
     auto wide = dir.wstring();
-    HANDLE handle = ::CreateFileW(
-        wide.c_str(),
-        GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr,
-        OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS,
-        nullptr);
+    HANDLE handle = ::CreateFileW(wide.c_str(),
+                                  GENERIC_READ,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr,
+                                  OPEN_EXISTING,
+                                  FILE_FLAG_BACKUP_SEMANTICS,
+                                  nullptr);
     if (handle == INVALID_HANDLE_VALUE)
+    {
         return Status::IoError("open dir for flush failed: " + dir.string());
+    }
     BOOL ok = ::FlushFileBuffers(handle);
     ::CloseHandle(handle);
     if (!ok)
+    {
         return Status::IoError("flush dir failed: " + dir.string());
+    }
     return Status::OK();
 #else
     int fd = ::open(dir.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
-        return Status::IoError(std::string("open dir for fsync: ") +
-                               dir.string() + ": " + std::strerror(errno));
-    if (::fsync(fd) < 0) {
+    {
+        return Status::IoError(std::string("open dir for fsync: ") + dir.string() + ": " + std::strerror(errno));
+    }
+    if (::fsync(fd) < 0)
+    {
         int saved = errno;
         ::close(fd);
-        return Status::IoError(std::string("fsync dir: ") +
-                               dir.string() + ": " + std::strerror(saved));
+        return Status::IoError(std::string("fsync dir: ") + dir.string() + ": " + std::strerror(saved));
     }
     ::close(fd);
     return Status::OK();

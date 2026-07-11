@@ -2,7 +2,8 @@
 
 #include "convert_options.h"
 
-namespace hfile {
+namespace hfile
+{
 
 /// Convert an Arrow IPC Stream file to a single HFile v3 file.
 ///

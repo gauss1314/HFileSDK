@@ -14,22 +14,30 @@
 using namespace hfile;
 namespace fs = std::filesystem;
 
-namespace {
+namespace
+{
 
-struct ScopedEnvVar {
-    explicit ScopedEnvVar(const char* value) {
+struct ScopedEnvVar
+{
+    explicit ScopedEnvVar(const char* value)
+    {
         const char* current = std::getenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
-        if (current != nullptr) {
+        if (current != nullptr)
+        {
             had_old_ = true;
             old_ = current;
         }
         setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", value, 1);
     }
 
-    ~ScopedEnvVar() {
-        if (had_old_) {
+    ~ScopedEnvVar()
+    {
+        if (had_old_)
+        {
             setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", old_.c_str(), 1);
-        } else {
+        }
+        else
+        {
             unsetenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
         }
     }
@@ -38,7 +46,8 @@ struct ScopedEnvVar {
     std::string old_;
 };
 
-fs::path temp_dir(const std::string& name) {
+fs::path temp_dir(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("converter_hotpath_" + name);
     std::error_code ec;
     fs::remove_all(path, ec);
@@ -46,8 +55,8 @@ fs::path temp_dir(const std::string& name) {
     return path;
 }
 
-void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch,
-                      const fs::path& path) {
+void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch, const fs::path& path)
+{
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
     auto sink = *sink_result;
@@ -60,9 +69,10 @@ void write_ipc_stream(const std::shared_ptr<arrow::RecordBatch>& batch,
     ASSERT_TRUE(sink->Close().ok());
 }
 
-}  // namespace
+} // namespace
 
-TEST(ConverterHotPathGrouped, DuplicateRowsUseGroupedWriterPathWithProfiling) {
+TEST(ConverterHotPathGrouped, DuplicateRowsUseGroupedWriterPathWithProfiling)
+{
     ScopedEnvVar profiling("1");
 
     auto dir = temp_dir("grouped_rows");
@@ -86,14 +96,13 @@ TEST(ConverterHotPathGrouped, DuplicateRowsUseGroupedWriterPathWithProfiling) {
     ASSERT_TRUE(age_builder.Finish(&age_array).ok());
     ASSERT_TRUE(name_builder.Finish(&name_array).ok());
 
-    auto batch = arrow::RecordBatch::Make(
-        arrow::schema({
-            arrow::field("id", arrow::utf8()),
-            arrow::field("age", arrow::int64()),
-            arrow::field("name", arrow::utf8()),
-        }),
-        2,
-        {id_array, age_array, name_array});
+    auto batch = arrow::RecordBatch::Make(arrow::schema({
+                                              arrow::field("id", arrow::utf8()),
+                                              arrow::field("age", arrow::int64()),
+                                              arrow::field("name", arrow::utf8()),
+                                          }),
+                                          2,
+                                          {id_array, age_array, name_array});
     write_ipc_stream(batch, arrow_path);
 
     ConvertOptions opts;

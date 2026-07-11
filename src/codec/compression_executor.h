@@ -9,7 +9,8 @@
 #include <thread>
 #include <vector>
 
-namespace hfile::codec {
+namespace hfile::codec
+{
 
 /// Process-wide bounded executor for independent HFile block compression.
 ///
@@ -18,24 +19,26 @@ namespace hfile::codec {
 /// worker-local Compressor instances.  Tasks are intentionally represented by
 /// a function pointer plus context pointer so submitting a block never
 /// allocates a std::function closure.
-class CompressionExecutor final {
+class CompressionExecutor final
+{
 public:
     // compressor is null if worker-local codec initialization failed.  The
     // callback must translate that condition into the owning writer's normal
     // error channel; exceptions must never escape a background thread.
-    using TaskFn = void (*)(void *context, Compressor *compressor) noexcept;
+    using TaskFn = void (*)(void* context, Compressor* compressor) noexcept;
 
-    struct Task {
+    struct Task
+    {
         TaskFn run{nullptr};
-        void *context{nullptr};
+        void* context{nullptr};
         Compression compression{Compression::GZip};
         int compression_level{1};
     };
 
-    static CompressionExecutor &instance();
+    static CompressionExecutor& instance();
 
-    CompressionExecutor(const CompressionExecutor &) = delete;
-    CompressionExecutor &operator=(const CompressionExecutor &) = delete;
+    CompressionExecutor(const CompressionExecutor&) = delete;
+    CompressionExecutor& operator=(const CompressionExecutor&) = delete;
 
     /// Ensure the process-wide pool has at least `count` workers.  The pool may
     /// grow when a later writer requests more parallelism, but never shrinks
@@ -48,7 +51,10 @@ public:
     bool submit(Task task);
 
     size_t worker_count() const noexcept;
-    uint32_t worker_limit() const noexcept { return worker_limit_; }
+    uint32_t worker_limit() const noexcept
+    {
+        return worker_limit_;
+    }
 
 private:
     static constexpr size_t kQueueCapacity = 4096;

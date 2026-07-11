@@ -23,14 +23,16 @@
 using namespace hfile;
 namespace fs = std::filesystem;
 
-// ─── Helpers to build Arrow batches ──────────────────────────────────────────
+// --- Helpers to build Arrow batches ----
 
-static std::shared_ptr<arrow::RecordBatch> make_wide_batch(int n_rows = 3) {
+static std::shared_ptr<arrow::RecordBatch> make_wide_batch(int n_rows = 3)
+{
     arrow::StringBuilder rk_builder;
-    arrow::Int64Builder  int_builder;
+    arrow::Int64Builder int_builder;
     arrow::StringBuilder str_builder;
 
-    for (int i = 0; i < n_rows; ++i) {
+    for (int i = 0; i < n_rows; ++i)
+    {
         ARROW_EXPECT_OK(rk_builder.Append("row_" + std::to_string(i)));
         ARROW_EXPECT_OK(int_builder.Append(i * 100));
         ARROW_EXPECT_OK(str_builder.Append("val_" + std::to_string(i)));
@@ -43,21 +45,23 @@ static std::shared_ptr<arrow::RecordBatch> make_wide_batch(int n_rows = 3) {
 
     auto schema = arrow::schema({
         arrow::field("__row_key__", arrow::utf8()),
-        arrow::field("age",         arrow::int64()),
-        arrow::field("name",        arrow::utf8()),
+        arrow::field("age", arrow::int64()),
+        arrow::field("name", arrow::utf8()),
     });
 
     return arrow::RecordBatch::Make(schema, n_rows, {rk_arr, int_arr, str_arr});
 }
 
-static fs::path make_temp_dir() {
+static fs::path make_temp_dir()
+{
     auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     fs::path dir = fs::temp_directory_path() / ("hfilesdk_test_" + std::to_string(now));
     fs::create_directories(dir);
     return dir;
 }
 
-static void write_ipc_stream(const arrow::RecordBatch& batch, const fs::path& path) {
+static void write_ipc_stream(const arrow::RecordBatch& batch, const fs::path& path)
+{
     auto sink_result = arrow::io::FileOutputStream::Open(path.string());
     ASSERT_TRUE(sink_result.ok()) << sink_result.status().ToString();
     auto sink = *sink_result;
@@ -70,20 +74,23 @@ static void write_ipc_stream(const arrow::RecordBatch& batch, const fs::path& pa
     ARROW_EXPECT_OK(sink->Close());
 }
 
-static void write_bytes(const fs::path& path, std::string_view bytes) {
+static void write_bytes(const fs::path& path, std::string_view bytes)
+{
     std::ofstream out(path, std::ios::binary);
     ASSERT_TRUE(out.is_open());
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
     out.close();
 }
 
-struct BlockView {
+struct BlockView
+{
     std::string magic;
     uint32_t uncompressed_size;
     std::span<const uint8_t> payload;
 };
 
-struct DecodedCell {
+struct DecodedCell
+{
     std::string row;
     std::string family;
     std::string qualifier;
@@ -91,22 +98,22 @@ struct DecodedCell {
     std::string value;
 };
 
-static std::vector<uint8_t> read_file(const fs::path& path) {
+static std::vector<uint8_t> read_file(const fs::path& path)
+{
     std::ifstream in(path, std::ios::binary);
-    return std::vector<uint8_t>(
-        std::istreambuf_iterator<char>(in),
-        std::istreambuf_iterator<char>());
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
+static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data)
+{
     std::vector<BlockView> blocks;
     const size_t limit = data.size() - kTrailerFixedSize;
     size_t offset = 0;
-    while (offset + kBlockHeaderSize <= limit) {
+    while (offset + kBlockHeaderSize <= limit)
+    {
         const auto on_disk_size_without_header = read_be32(data.data() + offset + 8);
         const auto on_disk_data_with_header = read_be32(data.data() + offset + 29);
-        const auto payload_size =
-            static_cast<size_t>(on_disk_data_with_header) - kBlockHeaderSize;
+        const auto payload_size = static_cast<size_t>(on_disk_data_with_header) - kBlockHeaderSize;
         blocks.push_back(BlockView{
             std::string(reinterpret_cast<const char*>(data.data() + offset), 8),
             read_be32(data.data() + offset + 12),
@@ -117,27 +124,35 @@ static std::vector<BlockView> scan_blocks(const std::vector<uint8_t>& data) {
     return blocks;
 }
 
-static std::vector<DecodedCell> decode_data_block_cells(const std::vector<uint8_t>& data) {
+static std::vector<DecodedCell> decode_data_block_cells(const std::vector<uint8_t>& data)
+{
     std::vector<DecodedCell> cells;
-    for (const auto& block : scan_blocks(data)) {
-        if (block.magic != "DATABLK*") continue;
+    for (const auto& block : scan_blocks(data))
+    {
+        if (block.magic != "DATABLK*")
+        {
+            continue;
+        }
 
         const uint8_t* p = block.payload.data();
         const uint8_t* end = p + block.payload.size();
-        while (p + 8 <= end) {
+        while (p + 8 <= end)
+        {
             const uint32_t key_len = read_be32(p);
             const uint32_t value_len = read_be32(p + 4);
             const uint8_t* key = p + 8;
             const uint8_t* value = key + key_len;
-            if (value + value_len + 2 > end) break;
+            if (value + value_len + 2 > end)
+            {
+                break;
+            }
 
             const uint16_t row_len = read_be16(key);
             const uint8_t* row = key + 2;
             const uint8_t family_len = *(row + row_len);
             const uint8_t* family = row + row_len + 1;
             const uint8_t* qualifier = family + family_len;
-            const size_t qualifier_len =
-                key_len - 2 - row_len - 1 - family_len - 8 - 1;
+            const size_t qualifier_len = key_len - 2 - row_len - 1 - family_len - 8 - 1;
             const uint8_t* timestamp = qualifier + qualifier_len;
 
             DecodedCell cell;
@@ -155,7 +170,8 @@ static std::vector<DecodedCell> decode_data_block_cells(const std::vector<uint8_
     return cells;
 }
 
-TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow) {
+TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow)
+{
     arrow::Int64Builder bit_map_builder;
     arrow::Int64Builder refid_builder;
     arrow::StringBuilder sigstore_builder;
@@ -183,8 +199,7 @@ TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow) {
         arrow::field("SIGSTORE", arrow::utf8()),
         arrow::field("TIME", arrow::int64()),
     });
-    auto batch = arrow::RecordBatch::Make(
-        schema, 2, {bit_map_arr, refid_arr, sigstore_arr, time_arr});
+    auto batch = arrow::RecordBatch::Make(schema, 2, {bit_map_arr, refid_arr, sigstore_arr, time_arr});
 
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -213,8 +228,7 @@ TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow) {
     EXPECT_EQ(cells[0].family, "value");
     EXPECT_TRUE(cells[0].qualifier.empty());
     EXPECT_EQ(cells[0].timestamp, 1715678900123LL);
-    EXPECT_EQ(cells[0].value,
-              "4|87580202874|dfx_hbase_sigstor-47820208578|1783451782");
+    EXPECT_EQ(cells[0].value, "4|87580202874|dfx_hbase_sigstor-47820208578|1783451782");
 
     EXPECT_EQ(cells[1].row, "87580202875");
     EXPECT_EQ(cells[1].family, "value");
@@ -225,8 +239,8 @@ TEST(ArrowConverter, ConvertWritesSinglePipeJoinedValueCellPerRow) {
     fs::remove_all(dir);
 }
 
-
-TEST(ArrowConverter, ConvertBuildsValueInArrowColumnOrder) {
+TEST(ArrowConverter, ConvertBuildsValueInArrowColumnOrder)
+{
     arrow::StringBuilder b_builder;
     arrow::StringBuilder a_builder;
     arrow::StringBuilder c_builder;
@@ -273,15 +287,15 @@ TEST(ArrowConverter, ConvertBuildsValueInArrowColumnOrder) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertPreservesJoinedValueTextFormatting) {
+TEST(ArrowConverter, ConvertPreservesJoinedValueTextFormatting)
+{
     arrow::StringBuilder id_builder;
     arrow::Int64Builder signed_builder;
     arrow::UInt64Builder unsigned_builder;
     arrow::BooleanBuilder bool_builder;
     arrow::FloatBuilder float_builder;
     arrow::DoubleBuilder double_builder;
-    arrow::TimestampBuilder timestamp_builder(
-        arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
+    arrow::TimestampBuilder timestamp_builder(arrow::timestamp(arrow::TimeUnit::MICRO), arrow::default_memory_pool());
     arrow::BinaryBuilder binary_builder;
 
     ARROW_EXPECT_OK(id_builder.Append("row"));
@@ -291,8 +305,7 @@ TEST(ArrowConverter, ConvertPreservesJoinedValueTextFormatting) {
     ARROW_EXPECT_OK(float_builder.Append(1.25F));
     ARROW_EXPECT_OK(double_builder.Append(-2.5));
     ARROW_EXPECT_OK(timestamp_builder.Append(1234567));
-    ARROW_EXPECT_OK(binary_builder.Append(
-        reinterpret_cast<const uint8_t*>("bin"), 3));
+    ARROW_EXPECT_OK(binary_builder.Append(reinterpret_cast<const uint8_t*>("bin"), 3));
 
     std::shared_ptr<arrow::Array> id_arr, signed_arr, unsigned_arr, bool_arr;
     std::shared_ptr<arrow::Array> float_arr, double_arr, timestamp_arr, binary_arr;
@@ -316,9 +329,7 @@ TEST(ArrowConverter, ConvertPreservesJoinedValueTextFormatting) {
         arrow::field("binary", arrow::binary()),
     });
     auto batch = arrow::RecordBatch::Make(
-        schema, 1,
-        {id_arr, signed_arr, unsigned_arr, bool_arr, float_arr, double_arr,
-         timestamp_arr, binary_arr});
+        schema, 1, {id_arr, signed_arr, unsigned_arr, bool_arr, float_arr, double_arr, timestamp_arr, binary_arr});
 
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -341,13 +352,13 @@ TEST(ArrowConverter, ConvertPreservesJoinedValueTextFormatting) {
 
     auto cells = decode_data_block_cells(read_file(hfile_path));
     ASSERT_EQ(cells.size(), 1);
-    EXPECT_EQ(cells[0].value,
-              "row|-42|18446744073709551615|1|1.250000|-2.500000|1234|Ymlu");
+    EXPECT_EQ(cells[0].value, "row|-42|18446744073709551615|1|1.250000|-2.500000|1234|Ymlu");
 
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
+TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey)
+{
     arrow::StringBuilder rk_builder;
     arrow::Int64Builder age_builder;
     arrow::StringBuilder name_builder;
@@ -396,7 +407,8 @@ TEST(ArrowConverter, ConvertRejectsDuplicateRowsWithSameGeneratedRowKey) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, NumericRadixSortKeepsFirstDuplicateSourceRow) {
+TEST(ArrowConverter, NumericRadixSortKeepsFirstDuplicateSourceRow)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder value_builder;
 
@@ -450,7 +462,8 @@ TEST(ArrowConverter, NumericRadixSortKeepsFirstDuplicateSourceRow) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, NumericRadixSortOrdersAllUint64Bits) {
+TEST(ArrowConverter, NumericRadixSortOrdersAllUint64Bits)
+{
     arrow::UInt64Builder id_builder;
 
     ARROW_EXPECT_OK(id_builder.Append(UINT64_MAX));
@@ -494,12 +507,14 @@ TEST(ArrowConverter, NumericRadixSortOrdersAllUint64Bits) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, CompactNumericAndStringSortPathsWriteIdenticalBytes) {
+TEST(ArrowConverter, CompactNumericAndStringSortPathsWriteIdenticalBytes)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder value_builder;
 
     for (const auto& [id, value] : std::vector<std::pair<int64_t, std::string>>{
-             {10, "ten"}, {2, "first-two"}, {999, "last"}, {2, "duplicate-two"}}) {
+             {10, "ten"}, {2, "first-two"}, {999, "last"}, {2, "duplicate-two"}})
+    {
         ARROW_EXPECT_OK(id_builder.Append(id));
         ARROW_EXPECT_OK(value_builder.Append(value));
     }
@@ -531,16 +546,14 @@ TEST(ArrowConverter, CompactNumericAndStringSortPathsWriteIdenticalBytes) {
     opts.numeric_sort_fast_path = NumericSortFastPathMode::On;
 
     auto numeric_result = convert(opts);
-    ASSERT_EQ(numeric_result.error_code, ErrorCode::OK)
-        << numeric_result.error_message;
+    ASSERT_EQ(numeric_result.error_code, ErrorCode::OK) << numeric_result.error_message;
     EXPECT_TRUE(numeric_result.numeric_sort_fast_path_used);
     EXPECT_EQ(numeric_result.duplicate_key_count, 1);
 
     opts.hfile_path = string_path.string();
     opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
     auto string_result = convert(opts);
-    ASSERT_EQ(string_result.error_code, ErrorCode::OK)
-        << string_result.error_message;
+    ASSERT_EQ(string_result.error_code, ErrorCode::OK) << string_result.error_message;
     EXPECT_FALSE(string_result.numeric_sort_fast_path_used);
     EXPECT_EQ(string_result.duplicate_key_count, 1);
 
@@ -553,7 +566,8 @@ TEST(ArrowConverter, CompactNumericAndStringSortPathsWriteIdenticalBytes) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey) {
+TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey)
+{
     arrow::StringBuilder rk_builder;
     arrow::Int64Builder age_builder;
     arrow::StringBuilder name_builder;
@@ -601,7 +615,8 @@ TEST(ArrowConverter, ConvertRejectsDuplicateCellsWithinSameRowKey) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertSupportsLargeStringColumns) {
+TEST(ArrowConverter, ConvertSupportsLargeStringColumns)
+{
     arrow::StringBuilder rk_builder;
     arrow::LargeStringBuilder payload_builder;
 
@@ -639,7 +654,8 @@ TEST(ArrowConverter, ConvertSupportsLargeStringColumns) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsEmptyArrowPath) {
+TEST(ArrowConverter, ConvertRejectsEmptyArrowPath)
+{
     ConvertOptions opts;
     opts.hfile_path = "/tmp/out.hfile";
     opts.row_key_rule = "ID,0,false,0";
@@ -649,7 +665,8 @@ TEST(ArrowConverter, ConvertRejectsEmptyArrowPath) {
     EXPECT_NE(result.error_message.find("arrow_path is empty"), std::string::npos);
 }
 
-TEST(ArrowConverter, ConvertRejectsMissingArrowFile) {
+TEST(ArrowConverter, ConvertRejectsMissingArrowFile)
+{
     auto dir = make_temp_dir();
     ConvertOptions opts;
     opts.arrow_path = (dir / "missing.arrow").string();
@@ -662,7 +679,8 @@ TEST(ArrowConverter, ConvertRejectsMissingArrowFile) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsInvalidRowKeyRule) {
+TEST(ArrowConverter, ConvertRejectsInvalidRowKeyRule)
+{
     auto batch = make_wide_batch(1);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -680,7 +698,8 @@ TEST(ArrowConverter, ConvertRejectsInvalidRowKeyRule) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsSchemaMismatchWhenRowKeyColumnMissing) {
+TEST(ArrowConverter, ConvertRejectsSchemaMismatchWhenRowKeyColumnMissing)
+{
     auto batch = make_wide_batch(1);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -698,7 +717,8 @@ TEST(ArrowConverter, ConvertRejectsSchemaMismatchWhenRowKeyColumnMissing) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsUnsupportedBinaryRowKeyField) {
+TEST(ArrowConverter, ConvertRejectsUnsupportedBinaryRowKeyField)
+{
     arrow::BinaryBuilder key_builder;
     arrow::StringBuilder payload_builder;
     ARROW_EXPECT_OK(key_builder.Append("row1", 4));
@@ -730,7 +750,8 @@ TEST(ArrowConverter, ConvertRejectsUnsupportedBinaryRowKeyField) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertAcceptsLongHashRowKeyRule) {
+TEST(ArrowConverter, ConvertAcceptsLongHashRowKeyRule)
+{
     arrow::StringBuilder id_builder;
     arrow::StringBuilder value_builder;
 
@@ -770,7 +791,8 @@ TEST(ArrowConverter, ConvertAcceptsLongHashRowKeyRule) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertAllowsUnusedUnsupportedColumnsBeforeReferencedIndex) {
+TEST(ArrowConverter, ConvertAllowsUnusedUnsupportedColumnsBeforeReferencedIndex)
+{
     arrow::BinaryBuilder c0_builder;
     arrow::StringBuilder c1_builder;
     arrow::StringBuilder c2_builder;
@@ -823,7 +845,8 @@ TEST(ArrowConverter, ConvertAllowsUnusedUnsupportedColumnsBeforeReferencedIndex)
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertSupportsExcludedColumnPrefixes) {
+TEST(ArrowConverter, ConvertSupportsExcludedColumnPrefixes)
+{
     arrow::StringBuilder meta_builder;
     arrow::StringBuilder id_builder;
     arrow::StringBuilder payload_builder;
@@ -869,7 +892,8 @@ TEST(ArrowConverter, ConvertSupportsExcludedColumnPrefixes) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
+TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression)
+{
     arrow::StringBuilder meta_builder;
     arrow::StringBuilder id_builder;
     arrow::StringBuilder payload_builder;
@@ -896,8 +920,7 @@ TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
         arrow::field("payload", arrow::utf8()),
         arrow::field("city", arrow::utf8()),
     });
-    auto batch = arrow::RecordBatch::Make(
-        schema, 2, {meta_arr, id_arr, payload_arr, city_arr});
+    auto batch = arrow::RecordBatch::Make(schema, 2, {meta_arr, id_arr, payload_arr, city_arr});
 
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -927,23 +950,21 @@ TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
 
     std::map<std::string, int> counts;
     std::string decompressed_data_blocks;
-    for (const auto& block : blocks) {
-        if (block.magic != "DATABLK*" &&
-            block.magic != "BLMFBLK2" &&
-            block.magic != "BLMFMET2" &&
-            block.magic != "FILEINF2" &&
-            block.magic != "IDXROOT2") {
+    for (const auto& block : blocks)
+    {
+        if (block.magic != "DATABLK*" && block.magic != "BLMFBLK2" && block.magic != "BLMFMET2"
+            && block.magic != "FILEINF2" && block.magic != "IDXROOT2")
+        {
             continue;
         }
 
         std::vector<uint8_t> decompressed(block.uncompressed_size);
-        auto status = gzip->decompress(
-            block.payload, decompressed.data(), decompressed.size());
+        auto status = gzip->decompress(block.payload, decompressed.data(), decompressed.size());
         ASSERT_TRUE(status.ok()) << block.magic << " " << status.message();
         counts[block.magic]++;
-        if (block.magic == "DATABLK*") {
-            decompressed_data_blocks.append(
-                reinterpret_cast<const char*>(decompressed.data()), decompressed.size());
+        if (block.magic == "DATABLK*")
+        {
+            decompressed_data_blocks.append(reinterpret_cast<const char*>(decompressed.data()), decompressed.size());
         }
     }
 
@@ -968,7 +989,8 @@ TEST(ArrowConverter, ConvertCombinesSortingExclusionAndGZipCompression) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertSupportsZeroLeftPaddedNumericRowKey) {
+TEST(ArrowConverter, ConvertSupportsZeroLeftPaddedNumericRowKey)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder city_builder;
 
@@ -1013,11 +1035,13 @@ TEST(ArrowConverter, ConvertSupportsZeroLeftPaddedNumericRowKey) {
     auto blocks = scan_blocks(file_bytes);
 
     std::string data_blocks;
-    for (const auto& block : blocks) {
-        if (block.magic != "DATABLK*") continue;
-        data_blocks.append(
-            reinterpret_cast<const char*>(block.payload.data()),
-            block.payload.size());
+    for (const auto& block : blocks)
+    {
+        if (block.magic != "DATABLK*")
+        {
+            continue;
+        }
+        data_blocks.append(reinterpret_cast<const char*>(block.payload.data()), block.payload.size());
     }
 
     auto row2_pos = data_blocks.find("00002");
@@ -1029,7 +1053,8 @@ TEST(ArrowConverter, ConvertSupportsZeroLeftPaddedNumericRowKey) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey) {
+TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder city_builder;
 
@@ -1077,11 +1102,13 @@ TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey) {
     auto blocks = scan_blocks(file_bytes);
 
     std::string data_blocks;
-    for (const auto& block : blocks) {
-        if (block.magic != "DATABLK*") continue;
-        data_blocks.append(
-            reinterpret_cast<const char*>(block.payload.data()),
-            block.payload.size());
+    for (const auto& block : blocks)
+    {
+        if (block.magic != "DATABLK*")
+        {
+            continue;
+        }
+        data_blocks.append(reinterpret_cast<const char*>(block.payload.data()), block.payload.size());
     }
 
     auto row2aa_pos = data_blocks.find("00002aa");
@@ -1096,14 +1123,14 @@ TEST(ArrowConverter, ConvertSupportsNumericPrefixFastPathForCompositeRowKey) {
     opts.hfile_path = reference_hfile_path.string();
     opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
     auto reference_result = convert(opts);
-    ASSERT_EQ(reference_result.error_code, ErrorCode::OK)
-        << reference_result.error_message;
+    ASSERT_EQ(reference_result.error_code, ErrorCode::OK) << reference_result.error_message;
     EXPECT_EQ(read_file(hfile_path), read_file(reference_hfile_path));
 
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertFallsBackForNegativeNumericRowKeyValues) {
+TEST(ArrowConverter, ConvertFallsBackForNegativeNumericRowKeyValues)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder city_builder;
 
@@ -1149,11 +1176,13 @@ TEST(ArrowConverter, ConvertFallsBackForNegativeNumericRowKeyValues) {
     auto blocks = scan_blocks(file_bytes);
 
     std::string data_blocks;
-    for (const auto& block : blocks) {
-        if (block.magic != "DATABLK*") continue;
-        data_blocks.append(
-            reinterpret_cast<const char*>(block.payload.data()),
-            block.payload.size());
+    for (const auto& block : blocks)
+    {
+        if (block.magic != "DATABLK*")
+        {
+            continue;
+        }
+        data_blocks.append(reinterpret_cast<const char*>(block.payload.data()), block.payload.size());
     }
 
     auto row_neg10_pos = data_blocks.find("00-10");
@@ -1168,7 +1197,8 @@ TEST(ArrowConverter, ConvertFallsBackForNegativeNumericRowKeyValues) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, LateNumericFallbackFitsGenericStringIndexBudget) {
+TEST(ArrowConverter, LateNumericFallbackFitsGenericStringIndexBudget)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder value_builder;
     ARROW_EXPECT_OK(id_builder.Append(12));
@@ -1206,33 +1236,29 @@ TEST(ArrowConverter, LateNumericFallbackFitsGenericStringIndexBudget) {
     generic_opts.numeric_sort_fast_path = NumericSortFastPathMode::Off;
 
     auto generic_result = convert(generic_opts);
-    ASSERT_EQ(generic_result.error_code, ErrorCode::OK)
-        << generic_result.error_message;
+    ASSERT_EQ(generic_result.error_code, ErrorCode::OK) << generic_result.error_message;
     ASSERT_GT(generic_result.tracked_memory_peak_bytes, 0);
 
     ConvertOptions fallback_opts = generic_opts;
     fallback_opts.hfile_path = fallback_path.string();
     // Keep the aggregate converter+writer limit tight while still covering the
     // writer's fixed synchronous block buffers.
-    const uint64_t writer_buffer_floor =
-        static_cast<uint64_t>(generic_opts.writer_opts.block_size) + 65536u;
-    fallback_opts.writer_opts.max_memory_bytes =
-        static_cast<size_t>(std::max<uint64_t>(
-            generic_result.tracked_memory_peak_bytes, writer_buffer_floor));
+    const uint64_t writer_buffer_floor = static_cast<uint64_t>(generic_opts.writer_opts.block_size) + 65536u;
+    fallback_opts.writer_opts.max_memory_bytes
+        = static_cast<size_t>(std::max<uint64_t>(generic_result.tracked_memory_peak_bytes, writer_buffer_floor));
     fallback_opts.numeric_sort_fast_path = NumericSortFastPathMode::Auto;
 
     auto fallback_result = convert(fallback_opts);
-    ASSERT_EQ(fallback_result.error_code, ErrorCode::OK)
-        << fallback_result.error_message;
+    ASSERT_EQ(fallback_result.error_code, ErrorCode::OK) << fallback_result.error_message;
     EXPECT_FALSE(fallback_result.numeric_sort_fast_path_used);
-    EXPECT_LE(fallback_result.tracked_memory_peak_bytes,
-              generic_result.tracked_memory_peak_bytes);
+    EXPECT_LE(fallback_result.tracked_memory_peak_bytes, generic_result.tracked_memory_peak_bytes);
     EXPECT_EQ(read_file(generic_path), read_file(fallback_path));
 
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertFallsBackWhenNumericValueExceedsPadLength) {
+TEST(ArrowConverter, ConvertFallsBackWhenNumericValueExceedsPadLength)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder city_builder;
 
@@ -1278,11 +1304,13 @@ TEST(ArrowConverter, ConvertFallsBackWhenNumericValueExceedsPadLength) {
     auto blocks = scan_blocks(file_bytes);
 
     std::string data_blocks;
-    for (const auto& block : blocks) {
-        if (block.magic != "DATABLK*") continue;
-        data_blocks.append(
-            reinterpret_cast<const char*>(block.payload.data()),
-            block.payload.size());
+    for (const auto& block : blocks)
+    {
+        if (block.magic != "DATABLK*")
+        {
+            continue;
+        }
+        data_blocks.append(reinterpret_cast<const char*>(block.payload.data()), block.payload.size());
     }
 
     auto row2_pos = data_blocks.find("002");
@@ -1297,7 +1325,8 @@ TEST(ArrowConverter, ConvertFallsBackWhenNumericValueExceedsPadLength) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValuesAreNegative) {
+TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValuesAreNegative)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder city_builder;
 
@@ -1339,7 +1368,8 @@ TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValuesAreNegativ
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValueExceedsPadLength) {
+TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValueExceedsPadLength)
+{
     arrow::Int64Builder id_builder;
     arrow::StringBuilder city_builder;
 
@@ -1381,7 +1411,8 @@ TEST(ArrowConverter, ConvertRejectsForcedNumericSortFastPathWhenValueExceedsPadL
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream) {
+TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream)
+{
     auto dir = make_temp_dir();
     auto arrow_path = dir / "broken.arrow";
     auto hfile_path = dir / "out.hfile";
@@ -1398,7 +1429,8 @@ TEST(ArrowConverter, ConvertRejectsCorruptedArrowStream) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertReportsProgress) {
+TEST(ArrowConverter, ConvertReportsProgress)
+{
     auto batch = make_wide_batch(5);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -1417,7 +1449,8 @@ TEST(ArrowConverter, ConvertReportsProgress) {
     opts.column_family = "cf";
     opts.default_timestamp = 1234;
     opts.writer_opts.column_family = "cf";
-    opts.progress_cb = [&](int64_t rows_done, int64_t total_rows) {
+    opts.progress_cb = [&](int64_t rows_done, int64_t total_rows)
+    {
         ++callback_count;
         last_rows_done = rows_done;
         last_total_rows = total_rows;
@@ -1431,7 +1464,8 @@ TEST(ArrowConverter, ConvertReportsProgress) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertWritesEmptyHFileWhenAllRowKeysAreEmpty) {
+TEST(ArrowConverter, ConvertWritesEmptyHFileWhenAllRowKeysAreEmpty)
+{
     arrow::StringBuilder id_builder;
     arrow::StringBuilder value_builder;
     ARROW_EXPECT_OK(id_builder.Append(""));
@@ -1469,7 +1503,8 @@ TEST(ArrowConverter, ConvertWritesEmptyHFileWhenAllRowKeysAreEmpty) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall) {
+TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall)
+{
     auto batch = make_wide_batch(1);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -1493,7 +1528,8 @@ TEST(ArrowConverter, ConvertReturnsMemoryExhaustedWhenBudgetTooSmall) {
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, WriterOpenFailureReportsAggregateTrackedPeak) {
+TEST(ArrowConverter, WriterOpenFailureReportsAggregateTrackedPeak)
+{
     auto batch = make_wide_batch(1);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -1515,14 +1551,14 @@ TEST(ArrowConverter, WriterOpenFailureReportsAggregateTrackedPeak) {
     EXPECT_EQ(result.error_code, ErrorCode::MEMORY_EXHAUSTED);
     // Pass 1 plus the successfully reserved encoder must be visible even
     // though the subsequent Bloom reservation prevents writer construction.
-    EXPECT_GT(result.tracked_memory_peak_bytes,
-              static_cast<int64_t>(opts.writer_opts.block_size));
+    EXPECT_GT(result.tracked_memory_peak_bytes, static_cast<int64_t>(opts.writer_opts.block_size));
     EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
     EXPECT_FALSE(fs::exists(hfile_path));
     fs::remove_all(dir);
 }
 
-TEST(ArrowConverter, ConvertTracksAggregateConverterAndWriterMemoryWithinBudget) {
+TEST(ArrowConverter, ConvertTracksAggregateConverterAndWriterMemoryWithinBudget)
+{
     auto batch = make_wide_batch(64);
     auto dir = make_temp_dir();
     auto arrow_path = dir / "input.arrow";
@@ -1543,8 +1579,7 @@ TEST(ArrowConverter, ConvertTracksAggregateConverterAndWriterMemoryWithinBudget)
     ASSERT_EQ(result.error_code, ErrorCode::OK) << result.error_message;
     // This is larger than the retained Arrow/sort data alone and proves the
     // synchronous writer's encoder/compression buffers are included.
-    EXPECT_GT(result.tracked_memory_peak_bytes,
-              static_cast<int64_t>(opts.writer_opts.block_size * 2));
+    EXPECT_GT(result.tracked_memory_peak_bytes, static_cast<int64_t>(opts.writer_opts.block_size * 2));
     EXPECT_LE(result.tracked_memory_peak_bytes, result.memory_budget_bytes);
 
     fs::remove_all(dir);

@@ -12,29 +12,38 @@
 namespace fs = std::filesystem;
 using namespace hfile;
 
-namespace {
+namespace
+{
 
-fs::path temp_path(const std::string& name) {
+fs::path temp_path(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("hfile_writer_extra_" + name + ".hfile");
     std::error_code ec;
     fs::remove(path, ec);
     return path;
 }
 
-struct ScopedEnvVar {
-    explicit ScopedEnvVar(const char* value) {
+struct ScopedEnvVar
+{
+    explicit ScopedEnvVar(const char* value)
+    {
         const char* current = std::getenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
-        if (current != nullptr) {
+        if (current != nullptr)
+        {
             had_old_ = true;
             old_ = current;
         }
         setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", value, 1);
     }
 
-    ~ScopedEnvVar() {
-        if (had_old_) {
+    ~ScopedEnvVar()
+    {
+        if (had_old_)
+        {
             setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", old_.c_str(), 1);
-        } else {
+        }
+        else
+        {
             unsetenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
         }
     }
@@ -50,7 +59,8 @@ KeyValue make_kv(std::vector<uint8_t>& row,
                  std::string_view row_text,
                  std::string_view qualifier_text,
                  int64_t ts,
-                 std::string_view value_text) {
+                 std::string_view value_text)
+{
     row.assign(row_text.begin(), row_text.end());
     family = {'c', 'f'};
     qualifier.assign(qualifier_text.begin(), qualifier_text.end());
@@ -66,24 +76,27 @@ KeyValue make_kv(std::vector<uint8_t>& row,
     return kv;
 }
 
-}  // namespace
+} // namespace
 
-TEST(HFileWriterAdditionalCoverage, SkipPoliciesAndMaxErrorCountAreExercised) {
+TEST(HFileWriterAdditionalCoverage, SkipPoliciesAndMaxErrorCountAreExercised)
+{
     auto path_skip_row = temp_path("skip_row");
     std::vector<std::string> callback_messages;
     auto [skip_row_writer, skip_row_status] = HFileWriter::builder()
-        .set_path(path_skip_row.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
-        .set_error_policy(ErrorPolicy::SkipRow)
-        .set_max_error_count(1)
-        .set_error_callback([&](const RowError& error) {
-            callback_messages.push_back(error.message);
-        })
-        .build();
+                                                  .set_path(path_skip_row.string())
+                                                  .set_column_family("cf")
+                                                  .set_compression(Compression::None)
+                                                  .set_data_block_encoding(Encoding::None)
+                                                  .set_bloom_type(BloomType::None)
+                                                  .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
+                                                  .set_error_policy(ErrorPolicy::SkipRow)
+                                                  .set_max_error_count(1)
+                                                  .set_error_callback(
+                                                      [&](const RowError& error)
+                                                      {
+                                                          callback_messages.push_back(error.message);
+                                                      })
+                                                  .build();
     ASSERT_TRUE(skip_row_status.ok()) << skip_row_status.message();
 
     KeyValue invalid{};
@@ -99,14 +112,14 @@ TEST(HFileWriterAdditionalCoverage, SkipPoliciesAndMaxErrorCountAreExercised) {
 
     auto path_skip_batch = temp_path("skip_batch");
     auto [skip_batch_writer, skip_batch_status] = HFileWriter::builder()
-        .set_path(path_skip_batch.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
-        .set_error_policy(ErrorPolicy::SkipBatch)
-        .build();
+                                                      .set_path(path_skip_batch.string())
+                                                      .set_column_family("cf")
+                                                      .set_compression(Compression::None)
+                                                      .set_data_block_encoding(Encoding::None)
+                                                      .set_bloom_type(BloomType::None)
+                                                      .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
+                                                      .set_error_policy(ErrorPolicy::SkipBatch)
+                                                      .build();
     ASSERT_TRUE(skip_batch_status.ok()) << skip_batch_status.message();
     auto skip_batch = skip_batch_writer->append(invalid);
     EXPECT_FALSE(skip_batch.ok());
@@ -115,25 +128,26 @@ TEST(HFileWriterAdditionalCoverage, SkipPoliciesAndMaxErrorCountAreExercised) {
     fs::remove(path_skip_batch);
 }
 
-TEST(HFileWriterAdditionalCoverage, HotPathPipelineRowColBloomAndTrustedVariants) {
+TEST(HFileWriterAdditionalCoverage, HotPathPipelineRowColBloomAndTrustedVariants)
+{
     ScopedEnvVar profiling("1");
     auto path = temp_path("hotpath_rowcol");
 
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::GZip)
-        .set_compression_level(1)
-        .set_block_size(128)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::RowCol)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
-        .set_include_tags(false)
-        .set_include_mvcc(false)
-        .set_fsync_policy(FsyncPolicy::Paranoid)
-        .set_compression_threads(1)
-        .set_compression_queue_depth(0)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::GZip)
+                                .set_compression_level(1)
+                                .set_block_size(128)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::RowCol)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+                                .set_include_tags(false)
+                                .set_include_mvcc(false)
+                                .set_fsync_policy(FsyncPolicy::Paranoid)
+                                .set_compression_threads(1)
+                                .set_compression_queue_depth(0)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
 
     std::vector<uint8_t> row, family, qualifier, value;
@@ -154,17 +168,18 @@ TEST(HFileWriterAdditionalCoverage, HotPathPipelineRowColBloomAndTrustedVariants
     fs::remove(path);
 }
 
-TEST(HFileWriterAdditionalCoverage, MoveAndSpanTrustedOverloadsWork) {
+TEST(HFileWriterAdditionalCoverage, MoveAndSpanTrustedOverloadsWork)
+{
     auto path = temp_path("move_and_span");
 
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::None)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::None)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
     EXPECT_EQ(writer->position(), 0);
 

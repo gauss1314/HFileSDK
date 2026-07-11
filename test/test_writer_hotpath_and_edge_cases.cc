@@ -12,22 +12,30 @@
 using namespace hfile;
 namespace fs = std::filesystem;
 
-namespace {
+namespace
+{
 
-struct ScopedEnvVar {
-    explicit ScopedEnvVar(const char* value) {
+struct ScopedEnvVar
+{
+    explicit ScopedEnvVar(const char* value)
+    {
         const char* current = std::getenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
-        if (current != nullptr) {
+        if (current != nullptr)
+        {
             had_old_ = true;
             old_ = current;
         }
         setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", value, 1);
     }
 
-    ~ScopedEnvVar() {
-        if (had_old_) {
+    ~ScopedEnvVar()
+    {
+        if (had_old_)
+        {
             setenv("HFILESDK_ENABLE_HOTPATH_PROFILING", old_.c_str(), 1);
-        } else {
+        }
+        else
+        {
             unsetenv("HFILESDK_ENABLE_HOTPATH_PROFILING");
         }
     }
@@ -36,17 +44,16 @@ struct ScopedEnvVar {
     std::string old_;
 };
 
-fs::path temp_path(const std::string& name) {
+fs::path temp_path(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("writer_edge_" + name + ".hfile");
     std::error_code ec;
     fs::remove(path, ec);
     return path;
 }
 
-OwnedKeyValue make_owned_kv(std::string_view row,
-                            std::string_view qualifier,
-                            int64_t timestamp,
-                            std::string_view value) {
+OwnedKeyValue make_owned_kv(std::string_view row, std::string_view qualifier, int64_t timestamp, std::string_view value)
+{
     OwnedKeyValue kv;
     kv.row.assign(row.begin(), row.end());
     kv.family = {'c', 'f'};
@@ -57,15 +64,15 @@ OwnedKeyValue make_owned_kv(std::string_view row,
     return kv;
 }
 
-}  // namespace
+} // namespace
 
-TEST(HFileWriterEdgeCases, HotpathEnabledParanoidFlushAndDiskChecks) {
+TEST(HFileWriterEdgeCases, HotpathEnabledParanoidFlushAndDiskChecks)
+{
     ScopedEnvVar profiling("1");
     auto path = temp_path("hotpath_paranoid");
 
     auto builder = HFileWriter::builder();
-    builder
-        .set_path(path.string())
+    builder.set_path(path.string())
         .set_column_family("cf")
         .set_compression(Compression::None)
         .set_data_block_encoding(Encoding::None)
@@ -91,12 +98,12 @@ TEST(HFileWriterEdgeCases, HotpathEnabledParanoidFlushAndDiskChecks) {
     fs::remove(path);
 }
 
-TEST(HFileWriterEdgeCases, BuilderRejectsZeroBytesPerChecksum) {
+TEST(HFileWriterEdgeCases, BuilderRejectsZeroBytesPerChecksum)
+{
     auto path = temp_path("zero_checksum_bytes");
 
     auto builder = HFileWriter::builder();
-    builder
-        .set_path(path.string())
+    builder.set_path(path.string())
         .set_column_family("cf")
         .set_compression(Compression::None)
         .set_data_block_encoding(Encoding::None)
@@ -109,13 +116,12 @@ TEST(HFileWriterEdgeCases, BuilderRejectsZeroBytesPerChecksum) {
     EXPECT_NE(status.message().find("bytes_per_checksum"), std::string::npos);
 }
 
-TEST(HFileWriterEdgeCases, BuilderRejectsInvalidCompressionAndEncodingValues) {
+TEST(HFileWriterEdgeCases, BuilderRejectsInvalidCompressionAndEncodingValues)
+{
     auto path = temp_path("invalid_builder_values");
 
     auto compression_builder = HFileWriter::builder();
-    compression_builder
-        .set_path(path.string())
-        .set_column_family("cf");
+    compression_builder.set_path(path.string()).set_column_family("cf");
     compression_builder.opts_.compression = static_cast<Compression>(99);
 
     auto [compression_writer, compression_status] = compression_builder.build();
@@ -124,9 +130,7 @@ TEST(HFileWriterEdgeCases, BuilderRejectsInvalidCompressionAndEncodingValues) {
     EXPECT_NE(compression_status.message().find("compression=NONE or GZ"), std::string::npos);
 
     auto encoding_builder = HFileWriter::builder();
-    encoding_builder
-        .set_path(path.string())
-        .set_column_family("cf");
+    encoding_builder.set_path(path.string()).set_column_family("cf");
     encoding_builder.opts_.data_block_encoding = static_cast<Encoding>(99);
 
     auto [encoding_writer, encoding_status] = encoding_builder.build();
@@ -135,16 +139,17 @@ TEST(HFileWriterEdgeCases, BuilderRejectsInvalidCompressionAndEncodingValues) {
     EXPECT_NE(encoding_status.message().find("data_block_encoding=NONE"), std::string::npos);
 }
 
-TEST(HFileWriterEdgeCases, AppendVariantsRejectAfterFinishAndAutoSortTrustedPathsWork) {
+TEST(HFileWriterEdgeCases, AppendVariantsRejectAfterFinishAndAutoSortTrustedPathsWork)
+{
     auto path = temp_path("append_after_finish");
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::None)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::None)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
 
     auto kv = make_owned_kv("row", "q", 1, "value");
@@ -159,13 +164,13 @@ TEST(HFileWriterEdgeCases, AppendVariantsRejectAfterFinishAndAutoSortTrustedPath
 
     auto autosort_path = temp_path("autosort_trusted");
     auto [autosort_writer, autosort_status] = HFileWriter::builder()
-        .set_path(autosort_path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_sort_mode(WriterOptions::SortMode::AutoSort)
-        .build();
+                                                  .set_path(autosort_path.string())
+                                                  .set_column_family("cf")
+                                                  .set_compression(Compression::None)
+                                                  .set_data_block_encoding(Encoding::None)
+                                                  .set_bloom_type(BloomType::None)
+                                                  .set_sort_mode(WriterOptions::SortMode::AutoSort)
+                                                  .build();
     ASSERT_TRUE(autosort_status.ok()) << autosort_status.message();
 
     auto kv_b = make_owned_kv("row-b", "q", 1, "vb");
@@ -179,18 +184,19 @@ TEST(HFileWriterEdgeCases, AppendVariantsRejectAfterFinishAndAutoSortTrustedPath
     fs::remove(autosort_path);
 }
 
-TEST(HFileWriterEdgeCases, AppendDropsTagsAndMvccWhenDisabled) {
+TEST(HFileWriterEdgeCases, AppendDropsTagsAndMvccWhenDisabled)
+{
     auto path = temp_path("append_flags");
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
-        .set_include_tags(false)
-        .set_include_mvcc(false)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::None)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::None)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedVerified)
+                                .set_include_tags(false)
+                                .set_include_mvcc(false)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
 
     auto kv = make_owned_kv("row", "q", 1, "value");
@@ -203,17 +209,18 @@ TEST(HFileWriterEdgeCases, AppendDropsTagsAndMvccWhenDisabled) {
     fs::remove(path);
 }
 
-TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnDescendingRow) {
+TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnDescendingRow)
+{
     auto path = temp_path("descending_midpoint");
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_block_size(32)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::None)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::None)
+                                .set_block_size(32)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
 
     auto first = make_owned_kv("b", "q", 2, std::string(256, 'a'));
@@ -230,17 +237,18 @@ TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnDe
     EXPECT_FALSE(fs::exists(path));
 }
 
-TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnShorterPrefix) {
+TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnShorterPrefix)
+{
     auto path = temp_path("prefix_midpoint");
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_block_size(32)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::None)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::None)
+                                .set_block_size(32)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
 
     auto first = make_owned_kv("ab", "q", 2, std::string(256, 'a'));
@@ -257,17 +265,18 @@ TEST(HFileWriterEdgeCases, TrustedOutOfOrderAcrossBlocksReturnsTerminalErrorOnSh
     EXPECT_FALSE(fs::exists(path));
 }
 
-TEST(HFileWriterEdgeCases, TrustedDuplicateKeysAcrossBlocksCanStillFinish) {
+TEST(HFileWriterEdgeCases, TrustedDuplicateKeysAcrossBlocksCanStillFinish)
+{
     auto path = temp_path("duplicate_key_fallback");
     auto [writer, status] = HFileWriter::builder()
-        .set_path(path.string())
-        .set_column_family("cf")
-        .set_compression(Compression::None)
-        .set_data_block_encoding(Encoding::None)
-        .set_bloom_type(BloomType::None)
-        .set_block_size(32)
-        .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
-        .build();
+                                .set_path(path.string())
+                                .set_column_family("cf")
+                                .set_compression(Compression::None)
+                                .set_data_block_encoding(Encoding::None)
+                                .set_bloom_type(BloomType::None)
+                                .set_block_size(32)
+                                .set_sort_mode(WriterOptions::SortMode::PreSortedTrusted)
+                                .build();
     ASSERT_TRUE(status.ok()) << status.message();
 
     auto first = make_owned_kv("dup", "q", 2, std::string(256, 'a'));
@@ -280,17 +289,18 @@ TEST(HFileWriterEdgeCases, TrustedDuplicateKeysAcrossBlocksCanStillFinish) {
     fs::remove(path);
 }
 
-TEST(HFileWriterEdgeCases, UnfinishedPlainWriterRemovesPartialFile) {
+TEST(HFileWriterEdgeCases, UnfinishedPlainWriterRemovesPartialFile)
+{
     auto path = temp_path("plain_cleanup");
     {
         auto [writer, status] = HFileWriter::builder()
-            .set_path(path.string())
-            .set_column_family("cf")
-            .set_compression(Compression::None)
-            .set_data_block_encoding(Encoding::None)
-            .set_bloom_type(BloomType::None)
-            .set_fsync_policy(FsyncPolicy::Paranoid)
-            .build();
+                                    .set_path(path.string())
+                                    .set_column_family("cf")
+                                    .set_compression(Compression::None)
+                                    .set_data_block_encoding(Encoding::None)
+                                    .set_bloom_type(BloomType::None)
+                                    .set_fsync_policy(FsyncPolicy::Paranoid)
+                                    .build();
         ASSERT_TRUE(status.ok()) << status.message();
         EXPECT_TRUE(fs::exists(path));
     }

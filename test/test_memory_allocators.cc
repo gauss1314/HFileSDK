@@ -10,7 +10,8 @@
 
 using namespace hfile::memory;
 
-TEST(MemoryBudget, ReserveReleaseAndPeakTracking) {
+TEST(MemoryBudget, ReserveReleaseAndPeakTracking)
+{
     MemoryBudget budget(128);
     EXPECT_EQ(budget.used(), 0u);
     EXPECT_EQ(budget.peak(), 0u);
@@ -24,7 +25,8 @@ TEST(MemoryBudget, ReserveReleaseAndPeakTracking) {
     EXPECT_EQ(budget.peak(), 96u);
 }
 
-TEST(MemoryBudget, GuardAndOverLimitBehavior) {
+TEST(MemoryBudget, GuardAndOverLimitBehavior)
+{
     MemoryBudget budget(64);
     {
         MemoryBudget::Guard guard(budget, 48);
@@ -36,7 +38,8 @@ TEST(MemoryBudget, GuardAndOverLimitBehavior) {
     EXPECT_EQ(budget.used(), 0u);
 }
 
-TEST(MemoryBudget, CheckedAdditionRejectsSizeTOverflow) {
+TEST(MemoryBudget, CheckedAdditionRejectsSizeTOverflow)
+{
     MemoryBudget budget(std::numeric_limits<size_t>::max());
     const size_t first = std::numeric_limits<size_t>::max() - 8;
     ASSERT_TRUE(budget.reserve(first).ok());
@@ -46,7 +49,8 @@ TEST(MemoryBudget, CheckedAdditionRejectsSizeTOverflow) {
     EXPECT_EQ(budget.used(), 0u);
 }
 
-TEST(ArenaAllocator, AlignsAllocationsAndCopiesData) {
+TEST(ArenaAllocator, AlignsAllocationsAndCopiesData)
+{
     ArenaAllocator arena(64);
     auto* aligned = arena.allocate(8, 32);
     ASSERT_NE(aligned, nullptr);
@@ -59,7 +63,8 @@ TEST(ArenaAllocator, AlignsAllocationsAndCopiesData) {
     EXPECT_GT(arena.bytes_used(), 0u);
 }
 
-TEST(ArenaAllocator, ResetReusesFirstChunkAndHandlesLargeAllocations) {
+TEST(ArenaAllocator, ResetReusesFirstChunkAndHandlesLargeAllocations)
+{
     ArenaAllocator arena(32);
     auto* first = arena.allocate(16, 8);
     auto* second = arena.allocate(64, 16);
@@ -72,6 +77,5 @@ TEST(ArenaAllocator, ResetReusesFirstChunkAndHandlesLargeAllocations) {
     EXPECT_EQ(arena.bytes_used(), 0u);
     auto* after_reset = arena.allocate(16, 8);
     ASSERT_NE(after_reset, nullptr);
-    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(after_reset),
-              reinterpret_cast<std::uintptr_t>(first));
+    EXPECT_EQ(reinterpret_cast<std::uintptr_t>(after_reset), reinterpret_cast<std::uintptr_t>(first));
 }

@@ -14,9 +14,11 @@ using namespace hfile;
 using namespace hfile::io;
 namespace fs = std::filesystem;
 
-namespace {
+namespace
+{
 
-fs::path temp_file(const std::string& name) {
+fs::path temp_file(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("io_writer_extra_" + name + ".bin");
     std::error_code ec;
     fs::remove(path, ec);
@@ -24,7 +26,8 @@ fs::path temp_file(const std::string& name) {
     return path;
 }
 
-fs::path temp_dir(const std::string& name) {
+fs::path temp_dir(const std::string& name)
+{
     auto dir = fs::temp_directory_path() / ("io_writer_extra_dir_" + name);
     std::error_code ec;
     fs::remove_all(dir, ec);
@@ -32,26 +35,23 @@ fs::path temp_dir(const std::string& name) {
     return dir;
 }
 
-std::vector<uint8_t> read_all(const fs::path& path) {
+std::vector<uint8_t> read_all(const fs::path& path)
+{
     std::ifstream in(path, std::ios::binary);
-    return std::vector<uint8_t>(
-        std::istreambuf_iterator<char>(in),
-        std::istreambuf_iterator<char>());
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-}  // namespace
+} // namespace
 
-TEST(IOWritersExtra, BufferedWriterRejectsDirectoryPath) {
+TEST(IOWritersExtra, BufferedWriterRejectsDirectoryPath)
+{
     auto dir = temp_dir("ctor_dir");
-    EXPECT_THROW(
-        {
-            BufferedFileWriter writer(dir.string(), 16);
-        },
-        std::runtime_error);
+    EXPECT_THROW({ BufferedFileWriter writer(dir.string(), 16); }, std::runtime_error);
     fs::remove_all(dir);
 }
 
-TEST(IOWritersExtra, AtomicWriterFlushAndCommitAreIdempotent) {
+TEST(IOWritersExtra, AtomicWriterFlushAndCommitAreIdempotent)
+{
     auto path = temp_file("flush_commit");
     AtomicFileWriter writer(path.string(), 8);
 
@@ -66,7 +66,8 @@ TEST(IOWritersExtra, AtomicWriterFlushAndCommitAreIdempotent) {
     fs::remove(path);
 }
 
-TEST(IOWritersExtra, AtomicWriterCloseIsIdempotent) {
+TEST(IOWritersExtra, AtomicWriterCloseIsIdempotent)
+{
     auto path = temp_file("close");
     AtomicFileWriter writer(path.string(), 8);
 
@@ -83,7 +84,8 @@ TEST(IOWritersExtra, AtomicWriterCloseIsIdempotent) {
     fs::remove_all(path.parent_path() / ".tmp", ec);
 }
 
-TEST(IOWritersExtra, AtomicWriterCommitReportsRenameFailure) {
+TEST(IOWritersExtra, AtomicWriterCommitReportsRenameFailure)
+{
     auto dir = temp_dir("rename_failure");
     auto final_dir = dir / "already_a_directory";
     std::error_code ec;
@@ -103,7 +105,8 @@ TEST(IOWritersExtra, AtomicWriterCommitReportsRenameFailure) {
     fs::remove_all(dir, ec);
 }
 
-TEST(IOWritersExtra, FsyncDirectoryReportsMissingDirectory) {
+TEST(IOWritersExtra, FsyncDirectoryReportsMissingDirectory)
+{
     auto dir = temp_dir("missing_dir");
     auto missing = dir / "does_not_exist";
 

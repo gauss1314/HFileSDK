@@ -10,23 +10,23 @@
 using namespace hfile;
 using namespace hfile::codec;
 
-struct CompressTestParam {
+struct CompressTestParam
+{
     Compression type;
     const char* name;
 };
 
-class CompressorTest : public ::testing::TestWithParam<CompressTestParam> {};
+class CompressorTest : public ::testing::TestWithParam<CompressTestParam>
+{
+};
 
-static std::vector<uint8_t> gzip_reference_oneshot(std::span<const uint8_t> input, int level) {
-    static constexpr uint8_t kGzipHeader[10] = {
-        0x1f, 0x8b, 0x08, 0x00,
-        0x00, 0x00, 0x00, 0x00,
-        0x00, 0xff
-    };
+static std::vector<uint8_t> gzip_reference_oneshot(std::span<const uint8_t> input, int level)
+{
+    static constexpr uint8_t kGzipHeader[10] = {0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff};
 
     z_stream strm{};
-    int rc = deflateInit2(&strm, level <= 0 ? Z_DEFAULT_COMPRESSION : level,
-                          Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
+    int rc = deflateInit2(
+        &strm, level <= 0 ? Z_DEFAULT_COMPRESSION : level, Z_DEFLATED, -MAX_WBITS, 8, Z_DEFAULT_STRATEGY);
     EXPECT_EQ(rc, Z_OK);
 
     std::vector<uint8_t> out(compressBound(static_cast<uLong>(input.size())) + 18);
@@ -37,11 +37,13 @@ static std::vector<uint8_t> gzip_reference_oneshot(std::span<const uint8_t> inpu
     strm.next_out = reinterpret_cast<Bytef*>(out.data() + sizeof(kGzipHeader));
     strm.avail_out = static_cast<uInt>(out.size() - sizeof(kGzipHeader) - 8);
 
-    while (strm.avail_in > 0) {
+    while (strm.avail_in > 0)
+    {
         rc = deflate(&strm, Z_NO_FLUSH);
         EXPECT_EQ(rc, Z_OK);
     }
-    do {
+    do
+    {
         rc = deflate(&strm, Z_FINISH);
         EXPECT_TRUE(rc == Z_OK || rc == Z_STREAM_END);
     } while (rc != Z_STREAM_END);
@@ -50,8 +52,7 @@ static std::vector<uint8_t> gzip_reference_oneshot(std::span<const uint8_t> inpu
     deflateEnd(&strm);
 
     const uint32_t crc = static_cast<uint32_t>(
-        ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
-                static_cast<uInt>(input.size())));
+        ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()), static_cast<uInt>(input.size())));
     const uint32_t input_size = static_cast<uint32_t>(input.size());
     uint8_t* trailer = out.data() + sizeof(kGzipHeader) + deflated_size;
     trailer[0] = static_cast<uint8_t>(crc & 0xff);
@@ -66,27 +67,30 @@ static std::vector<uint8_t> gzip_reference_oneshot(std::span<const uint8_t> inpu
     return out;
 }
 
-TEST_P(CompressorTest, RoundTrip) {
+TEST_P(CompressorTest, RoundTrip)
+{
     auto c = Compressor::create(GetParam().type);
     ASSERT_NE(c, nullptr);
 
     // Compressible data: repeating pattern
     std::vector<uint8_t> input(4096);
     for (size_t i = 0; i < input.size(); ++i)
+    {
         input[i] = static_cast<uint8_t>(i % 64);
+    }
 
     std::vector<uint8_t> compressed(c->max_compressed_size(input.size()));
     size_t comp_len = c->compress(input, compressed.data(), compressed.size());
     EXPECT_GT(comp_len, 0u);
 
     std::vector<uint8_t> decompressed(input.size());
-    auto s = c->decompress(
-        {compressed.data(), comp_len}, decompressed.data(), decompressed.size());
+    auto s = c->decompress({compressed.data(), comp_len}, decompressed.data(), decompressed.size());
     EXPECT_TRUE(s.ok()) << s.message();
     EXPECT_EQ(decompressed, input);
 }
 
-TEST_P(CompressorTest, EmptyInput) {
+TEST_P(CompressorTest, EmptyInput)
+{
     auto c = Compressor::create(GetParam().type);
     std::vector<uint8_t> output(c->max_compressed_size(0) + 4, 0);
     size_t n = c->compress({}, output.data(), output.size());
@@ -94,13 +98,14 @@ TEST_P(CompressorTest, EmptyInput) {
     (void)n;
 }
 
-TEST_P(CompressorTest, MaxCompressedSizeAdequate) {
+TEST_P(CompressorTest, MaxCompressedSizeAdequate)
+{
     auto c = Compressor::create(GetParam().type);
     std::vector<uint8_t> input(65536);
-    std::iota(input.begin(), input.end(), 0);  // incompressible
+    std::iota(input.begin(), input.end(), 0); // incompressible
 
     size_t max_sz = c->max_compressed_size(input.size());
-    EXPECT_GE(max_sz, input.size());  // must have enough space
+    EXPECT_GE(max_sz, input.size()); // must have enough space
 
     std::vector<uint8_t> out(max_sz);
     size_t n = c->compress(input, out.data(), out.size());
@@ -108,16 +113,20 @@ TEST_P(CompressorTest, MaxCompressedSizeAdequate) {
     EXPECT_LE(n, max_sz);
 }
 
-TEST(CompressorStandalone, GZipCompressionLevelsRoundTrip) {
+TEST(CompressorStandalone, GZipCompressionLevelsRoundTrip)
+{
     std::vector<uint8_t> input(256 * 1024);
     for (size_t i = 0; i < input.size(); ++i)
+    {
         input[i] = static_cast<uint8_t>('a' + (i % 4));
+    }
 
     std::vector<size_t> compressed_sizes;
     compressed_sizes.reserve(9);
     std::set<size_t> unique_sizes;
 
-    for (int level = 1; level <= 9; ++level) {
+    for (int level = 1; level <= 9; ++level)
+    {
         auto c = Compressor::create(Compression::GZip, level);
         ASSERT_NE(c, nullptr);
 
@@ -129,8 +138,7 @@ TEST(CompressorStandalone, GZipCompressionLevelsRoundTrip) {
         EXPECT_EQ(compressed[1], 0x8b);
 
         std::vector<uint8_t> decompressed(input.size());
-        auto s = c->decompress(
-            {compressed.data(), comp_len}, decompressed.data(), decompressed.size());
+        auto s = c->decompress({compressed.data(), comp_len}, decompressed.data(), decompressed.size());
         EXPECT_TRUE(s.ok()) << "level=" << level << " " << s.message();
         EXPECT_EQ(decompressed, input);
 
@@ -142,34 +150,39 @@ TEST(CompressorStandalone, GZipCompressionLevelsRoundTrip) {
     EXPECT_GT(unique_sizes.size(), 1u);
 }
 
-TEST(CompressorStandalone, GZipSingleInstanceCanCompressMultipleBlocks) {
+TEST(CompressorStandalone, GZipSingleInstanceCanCompressMultipleBlocks)
+{
     auto c = Compressor::create(Compression::GZip, 1);
     ASSERT_NE(c, nullptr);
 
     std::vector<uint8_t> input_a(64 * 1024, 'a');
     std::vector<uint8_t> input_b(64 * 1024, 'b');
-    for (int round = 0; round < 4; ++round) {
-        for (const auto* input : {&input_a, &input_b}) {
+    for (int round = 0; round < 4; ++round)
+    {
+        for (const auto* input : {&input_a, &input_b})
+        {
             std::vector<uint8_t> compressed(c->max_compressed_size(input->size()));
             size_t comp_len = c->compress(*input, compressed.data(), compressed.size());
             ASSERT_GT(comp_len, 0u) << "round=" << round;
 
             std::vector<uint8_t> decompressed(input->size());
-            auto s = c->decompress(
-                {compressed.data(), comp_len}, decompressed.data(), decompressed.size());
+            auto s = c->decompress({compressed.data(), comp_len}, decompressed.data(), decompressed.size());
             ASSERT_TRUE(s.ok()) << s.message();
             EXPECT_EQ(decompressed, *input);
         }
     }
 }
 
-TEST(CompressorStandalone, GZipSingleInstanceMatchesFreshInstanceOutput) {
+TEST(CompressorStandalone, GZipSingleInstanceMatchesFreshInstanceOutput)
+{
     auto reused = Compressor::create(Compression::GZip, 1);
     ASSERT_NE(reused, nullptr);
 
     std::vector<uint8_t> input(96 * 1024);
     for (size_t i = 0; i < input.size(); ++i)
+    {
         input[i] = static_cast<uint8_t>('a' + (i % 7));
+    }
 
     std::vector<uint8_t> fresh_a(Compressor::create(Compression::GZip, 1)->max_compressed_size(input.size()));
     std::vector<uint8_t> fresh_b(Compressor::create(Compression::GZip, 1)->max_compressed_size(input.size()));
@@ -201,13 +214,16 @@ TEST(CompressorStandalone, GZipSingleInstanceMatchesFreshInstanceOutput) {
     EXPECT_EQ(fresh_a, reused_b);
 }
 
-TEST(CompressorStandalone, GZipMatchesReferenceOneShotZlib) {
+TEST(CompressorStandalone, GZipMatchesReferenceOneShotZlib)
+{
     auto c = Compressor::create(Compression::GZip, 1);
     ASSERT_NE(c, nullptr);
 
     std::vector<uint8_t> input(96 * 1024);
     for (size_t i = 0; i < input.size(); ++i)
+    {
         input[i] = static_cast<uint8_t>('0' + (i % 10));
+    }
 
     std::vector<uint8_t> actual(c->max_compressed_size(input.size()));
     size_t actual_len = c->compress(input, actual.data(), actual.size());
@@ -218,25 +234,25 @@ TEST(CompressorStandalone, GZipMatchesReferenceOneShotZlib) {
     EXPECT_EQ(expected, actual);
 }
 
-TEST(CompressorStandalone, GZipPrecomputedCrcMatchesDirectCompression) {
+TEST(CompressorStandalone, GZipPrecomputedCrcMatchesDirectCompression)
+{
     auto c = Compressor::create(Compression::GZip, 1);
     ASSERT_NE(c, nullptr);
 
     std::vector<uint8_t> input(96 * 1024);
-    for (size_t i = 0; i < input.size(); ++i) {
+    for (size_t i = 0; i < input.size(); ++i)
+    {
         input[i] = static_cast<uint8_t>('A' + (i % 13));
     }
 
     const uint32_t crc = static_cast<uint32_t>(
-        ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()),
-                static_cast<uInt>(input.size())));
+        ::crc32(0L, reinterpret_cast<const Bytef*>(input.data()), static_cast<uInt>(input.size())));
 
     std::vector<uint8_t> direct(c->max_compressed_size(input.size()));
     std::vector<uint8_t> precomputed(c->max_compressed_size(input.size()));
 
     size_t direct_len = c->compress(input, direct.data(), direct.size());
-    size_t precomputed_len = c->compress_with_crc32(
-        input, precomputed.data(), precomputed.size(), crc);
+    size_t precomputed_len = c->compress_with_crc32(input, precomputed.data(), precomputed.size(), crc);
 
     ASSERT_GT(direct_len, 0u);
     ASSERT_GT(precomputed_len, 0u);
@@ -245,12 +261,11 @@ TEST(CompressorStandalone, GZipPrecomputedCrcMatchesDirectCompression) {
     EXPECT_EQ(direct, precomputed);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    AllCodecs, CompressorTest,
-    ::testing::Values(
-        CompressTestParam{Compression::None,   "None"},
-        CompressTestParam{Compression::GZip,   "GZip"}
-    ),
-    [](const ::testing::TestParamInfo<CompressTestParam>& info) {
-        return info.param.name;
-    });
+INSTANTIATE_TEST_SUITE_P(AllCodecs,
+                         CompressorTest,
+                         ::testing::Values(CompressTestParam{Compression::None, "None"},
+                                           CompressTestParam{Compression::GZip, "GZip"}),
+                         [](const ::testing::TestParamInfo<CompressTestParam>& info)
+                         {
+                             return info.param.name;
+                         });

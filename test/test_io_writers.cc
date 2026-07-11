@@ -11,25 +11,27 @@ using namespace hfile;
 using namespace hfile::io;
 namespace fs = std::filesystem;
 
-namespace {
+namespace
+{
 
-fs::path temp_file(const std::string& name) {
+fs::path temp_file(const std::string& name)
+{
     auto path = fs::temp_directory_path() / ("io_writer_" + name + ".bin");
     std::error_code ec;
     fs::remove(path, ec);
     return path;
 }
 
-std::vector<uint8_t> read_all(const fs::path& path) {
+std::vector<uint8_t> read_all(const fs::path& path)
+{
     std::ifstream in(path, std::ios::binary);
-    return std::vector<uint8_t>(
-        std::istreambuf_iterator<char>(in),
-        std::istreambuf_iterator<char>());
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
 }
 
-}  // namespace
+} // namespace
 
-TEST(IOWriters, BufferedFileWriterFlushesBufferedBytes) {
+TEST(IOWriters, BufferedFileWriterFlushesBufferedBytes)
+{
     auto path = temp_file("flush");
     BufferedFileWriter writer(path.string(), 4);
 
@@ -48,7 +50,8 @@ TEST(IOWriters, BufferedFileWriterFlushesBufferedBytes) {
     fs::remove(path);
 }
 
-TEST(IOWriters, BlockWriterFactoryCreatesWorkingFileWriter) {
+TEST(IOWriters, BlockWriterFactoryCreatesWorkingFileWriter)
+{
     auto path = temp_file("factory");
     auto writer = BlockWriter::open_file(path.string(), 8);
     ASSERT_NE(writer, nullptr);
@@ -63,7 +66,8 @@ TEST(IOWriters, BlockWriterFactoryCreatesWorkingFileWriter) {
     fs::remove(path);
 }
 
-TEST(IOWriters, BufferedWriterCloseIsIdempotent) {
+TEST(IOWriters, BufferedWriterCloseIsIdempotent)
+{
     auto path = temp_file("close_twice");
     BufferedFileWriter writer(path.string(), 16);
     std::vector<uint8_t> payload = {'x'};
@@ -73,7 +77,8 @@ TEST(IOWriters, BufferedWriterCloseIsIdempotent) {
     fs::remove(path);
 }
 
-TEST(IOWriters, AtomicFileWriterCommitPublishesFinalFile) {
+TEST(IOWriters, AtomicFileWriterCommitPublishesFinalFile)
+{
     auto path = temp_file("atomic_commit");
     AtomicFileWriter writer(path.string(), 8);
 
@@ -89,7 +94,8 @@ TEST(IOWriters, AtomicFileWriterCommitPublishesFinalFile) {
     fs::remove(path);
 }
 
-TEST(IOWriters, AtomicFileWriterAbortRemovesTempFile) {
+TEST(IOWriters, AtomicFileWriterAbortRemovesTempFile)
+{
     auto path = temp_file("atomic_abort");
     AtomicFileWriter writer(path.string(), 8);
 

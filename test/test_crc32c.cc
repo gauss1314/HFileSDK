@@ -6,7 +6,8 @@
 
 using namespace hfile::checksum;
 
-TEST(CRC32C, KnownValues) {
+TEST(CRC32C, KnownValues)
+{
     // CRC32C of empty string is 0x00000000
     EXPECT_EQ(crc32c(nullptr, 0), 0x00000000u);
 
@@ -15,19 +16,21 @@ TEST(CRC32C, KnownValues) {
     EXPECT_EQ(crc32c(data, 9), 0xE3069283u);
 }
 
-TEST(CRC32C, Incremental) {
+TEST(CRC32C, Incremental)
+{
     const uint8_t data[] = {0x01, 0x02, 0x03, 0x04, 0x05};
     uint32_t full = crc32c(data, 5);
 
     // Compute incrementally using internal crc with carry
     uint32_t c = 0xFFFFFFFF;
-    c = crc32c(c, data,     3);
+    c = crc32c(c, data, 3);
     c = crc32c(c, data + 3, 2);
     c ^= 0xFFFFFFFF;
     EXPECT_EQ(full, c);
 }
 
-TEST(CRC32C, LargeBuffer) {
+TEST(CRC32C, LargeBuffer)
+{
     std::vector<uint8_t> buf(1024 * 1024);
     std::iota(buf.begin(), buf.end(), 0);
     uint32_t crc = crc32c(buf.data(), buf.size());
@@ -35,19 +38,20 @@ TEST(CRC32C, LargeBuffer) {
     EXPECT_EQ(crc, crc32c(buf.data(), buf.size()));
 }
 
-TEST(CRC32C, SpanOverload) {
+TEST(CRC32C, SpanOverload)
+{
     std::vector<uint8_t> v = {0xDE, 0xAD, 0xBE, 0xEF};
     uint32_t a = crc32c(v.data(), v.size());
     uint32_t b = crc32c(std::span<const uint8_t>{v});
     EXPECT_EQ(a, b);
 }
 
-TEST(CRC32C, ChunkChecksums) {
+TEST(CRC32C, ChunkChecksums)
+{
     std::vector<uint8_t> data(1024, 0xAB);
     // 512-byte chunks → 2 checksums → 8 bytes
     std::vector<uint8_t> out(8);
-    size_t written = compute_hfile_checksums(
-        data.data(), data.size(), 512, out.data());
+    size_t written = compute_hfile_checksums(data.data(), data.size(), 512, out.data());
     EXPECT_EQ(written, 8u);
 
     // Verify each chunk checksum independently
@@ -59,7 +63,8 @@ TEST(CRC32C, ChunkChecksums) {
     EXPECT_EQ(c1, stored1);
 }
 
-TEST(CRC32C, SplitChunkChecksumsMatchContiguous) {
+TEST(CRC32C, SplitChunkChecksumsMatchContiguous)
+{
     std::vector<uint8_t> header(33);
     std::iota(header.begin(), header.end(), 0x11);
     std::vector<uint8_t> payload(4096);
@@ -74,8 +79,7 @@ TEST(CRC32C, SplitChunkChecksumsMatchContiguous) {
     std::vector<uint8_t> expected(checksum_count * 4);
     std::vector<uint8_t> actual(checksum_count * 4);
 
-    EXPECT_EQ(
-        compute_hfile_checksums(contiguous.data(), contiguous.size(), 512, expected.data()),
-        compute_hfile_checksums_split(header, payload, 512, actual.data()));
+    EXPECT_EQ(compute_hfile_checksums(contiguous.data(), contiguous.size(), 512, expected.data()),
+              compute_hfile_checksums_split(header, payload, 512, actual.data()));
     EXPECT_EQ(expected, actual);
 }
