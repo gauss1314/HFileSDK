@@ -6,11 +6,11 @@
 #include "codec/compressor.h"
 #include <vector>
 #include <span>
-#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <cmath>
 #include <limits>
+#include <type_traits>
 
 namespace hfile
 {
@@ -19,6 +19,16 @@ namespace bloom
 
 namespace detail
 {
+
+template <typename To, typename From> inline To bit_cast(const From& from) noexcept
+{
+    static_assert(sizeof(To) == sizeof(From), "bit_cast requires source and destination to have the same size");
+    static_assert(std::is_trivially_copyable_v<To>, "bit_cast destination must be trivially copyable");
+    static_assert(std::is_trivially_copyable_v<From>, "bit_cast source must be trivially copyable");
+    To to;
+    std::memcpy(&to, &from, sizeof(To));
+    return to;
+}
 
 inline constexpr uint32_t java_signed_byte_bits(uint8_t value) noexcept
 {
@@ -71,7 +81,7 @@ template <typename ByteAt> inline int32_t murmur_hash_bytes(size_t len, ByteAt b
     h ^= h >> 13;
     h *= m;
     h ^= h >> 15;
-    return std::bit_cast<int32_t>(h);
+    return bit_cast<int32_t>(h);
 }
 
 struct RowColBloomKeyView
@@ -440,7 +450,7 @@ private:
         for (int i = 0; i < hash_count_; ++i)
         {
             uint32_t bit = 0;
-            const int32_t signed_hash = std::bit_cast<int32_t>(composite_hash);
+            const int32_t signed_hash = detail::bit_cast<int32_t>(composite_hash);
             if (power_of_two) [[likely]]
             {
                 // Equivalent to abs(signed_hash % nbits) for a power-of-two
